@@ -55,14 +55,20 @@ We compare Uni-Agent with existing agent systems on parallel inference and verif
 
 | Model | Benchmark | OpenHands | Uni-Agent (1-Attempt, Avg@4) |
 |-------|:---------:|:---------:|:-----------:|
-| Qwen3-Coder-30B  | SWE-Bench_verified |  -   | 48.8 |
+| Qwen3-Coder-30B  | SWE-Bench_verified |  -   | **48.8** |
 | Qwen3-Coder-480B | SWE-Bench-Verified | 62.4 |  |
-| Qwen3-Coder-Next | SWE-Bench-Verified | 66.6 | 67.7 |
+| Qwen3-Coder-Next | SWE-Bench-Verified | 66.6 | **67.7** |
 
 ### Agent Reinforcement Learning
 
 Uni-Agent supports agent RL training with the same interaction stack used at inference time. A representative recipe is to train [Qwen3-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) on R2E-Gym using **Fully-Asynchronous RL, Partial Rollout, and GSPO**.
 Example training scripts are available in [`examples/agent_train`](examples/agent_train).
+
+| Model                  | Dataset | Train Setup                          | Base | RL   |
+| ---------------------- | ------- | ------------------------------------ | ---- | ---- |
+| Qwen3-30B-A3B-Instruct | R2E-Gym | GSPO + Fully-Async + Partial Rollout | 22.2 | **36.8** |
+| Qwen3-Coder-30B-A3B-Instruct | R2E-Gym | GSPO + Fully-Async + Partial Rollout | 46.2 | **52.0** |
+
 
 ## Roadmap 🗺️
 
