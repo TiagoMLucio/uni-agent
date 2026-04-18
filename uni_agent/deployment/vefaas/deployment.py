@@ -187,6 +187,7 @@ class VefaasDeployment(AbstractDeployment):
             extra_params={"faasInstanceName": self._sandbox_id},
             auth_token=token,
             timeout=self._config.timeout,
+            proxy=self._config.proxy,
         )
         self._runtime = RemoteRuntime.from_config(runtime_config, run_id=self.run_id)
 

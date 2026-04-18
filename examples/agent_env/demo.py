@@ -44,8 +44,7 @@ elif impl == "vefaas":
         "command": "curl -fsSL https://vefaas-swe.tos-cn-beijing.ivolces.com/swe-rex/install_1.4.0.sh | bash -s -- {token}",
         "timeout": 300.0,
         "startup_timeout": 180.0,
-        "function_id": os.getenv("VEFAAS_FUNCTION_ID"),
-        "function_route": os.getenv("VEFAAS_FUNCTION_ROUTE"),
+        # "proxy": "xxxxxx",
     }
 elif impl == "":
     raise ValueError("DEPLOYMENT must be set")
