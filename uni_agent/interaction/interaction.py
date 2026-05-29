@@ -141,7 +141,13 @@ class AgentInteraction:
             )
             self.logger.debug(f"Model Output:\n{model_output}")
         except MaxTokenExceededError as e:
-            self.logger.error(str(e))
+            _msg = (
+                f"[step{step_idx}] MaxTokenExceededError: "
+                f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
+                f"prompt_ids_len={len(self.rollout_cache.get('prompt_ids', []))} "
+                f"detail: {str(e)}"
+            )
+            self.logger.error("{}", _msg)
             step_output.exit_reason = "token_limit"
             step_output.done = True
             return step_output
@@ -183,11 +189,12 @@ class AgentInteraction:
             self.rollout_cache = await self.model.append_messages_to_rollout_cache(error_msgs, self.rollout_cache)
             step_output.exit_reason = "format_error"
             model_output_preview = "\n".join(model_output.splitlines()[:20])
-            self.logger.error(
+            _msg = (
                 f"Fail to parse thought and action from model output.\n"
                 f"Error Message: {str(e)}\n"
                 f"Model Output (first 20 lines): {model_output_preview}"
             )
+            self.logger.error("{}", _msg)
             return step_output
 
         step_output.thought = content
@@ -341,7 +348,12 @@ class AgentInteraction:
                     break
             except Exception as e:
                 # this should not happen, if it happens, we should fix the code
-                self.logger.critical(f"Exit due to unknown error: {str(e)}")
+                _msg = (
+                    f"[step{step_idx}] unknown_error: {type(e).__name__}: {e} "
+                    f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
+                    f"prompt_ids_len={len(self.rollout_cache.get('prompt_ids', []))}"
+                )
+                self.logger.opt(exception=True).critical("{}", _msg)
                 step_output = StepOutput(step_idx=step_idx, exit_reason="unknown_error")
                 self.trajectory.append(step_output)
                 break
