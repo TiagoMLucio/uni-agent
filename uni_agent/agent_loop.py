@@ -21,6 +21,7 @@ from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
+from verl.utils.rollout_trace import rollout_trace_op
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -51,9 +52,14 @@ class UniAgentLoop(AgentLoopBase):
     _routing_replay_shape: tuple[int, int] | None = None
     _routing_replay_resolved: bool = False
 
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    @rollout_trace_op
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> list[AgentLoopOutput]:
         config_dict = self._init_config(sampling_params, **kwargs)
         self.mask_abnormal_exit_traj = config_dict.get("mask_abnormal_exit_traj", False)
+        # When the reward spec emits feedback, keep a consistent ``reward_extra_info``
+        # column (with a ``feedback`` key) on every output so downstream batching
+        # sees uniform keys.
+        self.emit_feedback = bool(((config_dict.get("reward") or {}).get("feedback") or {}).get("enabled", False))
         global_concurrent = config_dict.get("concurrency", 512)
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
         worker_concurrent = max(global_concurrent // num_workers, 1)
@@ -69,6 +75,7 @@ class UniAgentLoop(AgentLoopBase):
             parser=config_dict.get("tool_parser", "qwen3_coder"),
         )
         self.skills_manager = self._init_skills_manager(config_dict.get("skills"))
+        self.condenser, condense_policy = self._init_condense(config_dict.get("condense"))
         self.env = self._init_env(config_dict["env"])
         self.output_dir = Path(config_dict["log_dir"]) / self.run_id
         self.interaction = AgentInteraction(
@@ -78,6 +85,8 @@ class UniAgentLoop(AgentLoopBase):
             tools_manager=self.tools_manager,
             messages=list(kwargs["raw_prompt"]),
             skills_manager=self.skills_manager,
+            condenser=self.condenser,
+            **condense_policy,
             **config_dict["interaction"],
         )
         if config_dict["reward"] is not None:
@@ -116,10 +125,13 @@ class UniAgentLoop(AgentLoopBase):
 
                 # interaction environment should be visible to the reward spec
                 if self.reward_spec is not None:
-                    reward_score, _ = await self.reward_spec.compute_reward(
+                    reward_score, reward_result = await self.reward_spec.compute_reward(
                         interaction_result=interaction_result,
+                        env_config=config_dict["env"],
                     )
                     interaction_result["reward_score"] = reward_score
+                    if isinstance(reward_result, dict):
+                        interaction_result["reward_extra_info"] = reward_result.get("reward_extra_info", {})
                 else:
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
@@ -128,7 +140,7 @@ class UniAgentLoop(AgentLoopBase):
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
                 self.logger.critical(f"Agent loop failed before producing interaction result: {e}")
-                output = await self._build_empty_agent_output(exit_reason="agent_loop_failed")
+                output = [await self._build_empty_agent_output(exit_reason="agent_loop_failed")]
             finally:
                 await self.env.close()
             return output
@@ -156,6 +168,8 @@ class UniAgentLoop(AgentLoopBase):
         # TODO: implement traj_mask in verl
         extra_fields["traj_masked"] = 1
         extra_fields["traj_exit_reason"] = exit_reason
+        if getattr(self, "emit_feedback", False):
+            extra_fields["reward_extra_info"] = {"feedback": None}
         extra_fields["global_steps"] = 0
         extra_fields["min_global_steps"] = 0
         extra_fields["max_global_steps"] = 0
@@ -305,71 +319,164 @@ class UniAgentLoop(AgentLoopBase):
         cfg = SkillsManagerConfig(**skills_config)
         return SkillsManager.from_config(cfg)
 
+    def _init_condense(self, condense_config: dict | None) -> tuple:
+        """Split the per-run ``condense`` config into ``(condenser, policy_kwargs)``.
+
+        Algorithm keys (``name`` + condenser params) build the condenser via the
+        registry; budget/retry policy keys (``max_retries`` / ``chars_per_token`` /
+        ``margin_tokens`` / ``min_chars``) are routed to ``AgentInteraction``. Absent or
+        empty config disables condensation (overflow ends the rollout, as before).
+        """
+        from uni_agent.interaction.condenser import load_condenser
+
+        cfg = dict(condense_config or {})
+        policy_map = {
+            "max_retries": "condense_max_retries",
+            "chars_per_token": "condense_chars_per_token",
+            "margin_tokens": "condense_margin_tokens",
+            "min_chars": "condense_min_chars",
+        }
+        policy = {param: cfg.pop(key) for key, param in policy_map.items() if key in cfg}
+        return load_condenser(cfg), policy
+
     def _init_env(self, config_dict: dict) -> AgentEnv:
         env_config = AgentEnvConfig(**config_dict)
         return AgentEnv(run_id=self.run_id, env_config=env_config)
 
-    async def convert_to_agent_output(self, interaction_result: dict) -> AgentLoopOutput:
-        rollout_cache = interaction_result["rollout_cache"]
+    async def convert_to_agent_output(self, interaction_result: dict) -> list[AgentLoopOutput]:
+        """Convert the interaction result into one AgentLoopOutput per trajectory
+        segment. With no condensation there is a single segment == the whole rollout
+        (identical to the legacy single-output behavior). All segments share the
+        rollout's reward and per-rollout extra fields; each also carries its
+        ``segment_index`` / ``num_segments`` and prompt context.
+        """
         reward_score = interaction_result.get("reward_score", None)
-
-        if len(rollout_cache["response_mask"]) == 0:
-            return await self._build_empty_agent_output(
-                exit_reason="no_response",
-            )
-
-        num_turns = len(interaction_result["trajectory"])
-        self.logger.info(f"num_turns: {num_turns}")
-
-        prompt_ids = rollout_cache["prompt_ids"]
-        traj_exit_reason = interaction_result["trajectory"][-1].exit_reason if num_turns > 0 else "unknown"
+        trajectory = interaction_result.get("trajectory", [])
+        num_turns = len(trajectory)
+        traj_exit_reason = trajectory[-1].exit_reason if num_turns > 0 else "unknown"
         should_mask_traj = self.mask_abnormal_exit_traj and traj_exit_reason != "finished"
-        traj_masked = int(should_mask_traj)
+        metrics = interaction_result.get("metrics", {})
 
-        if should_mask_traj:
-            response_mask = [0] * len(rollout_cache["response_mask"])
-        else:
-            response_mask = rollout_cache["response_mask"]
-        response_logprobs = rollout_cache.get("response_logprobs") or []
+        shared_extra: dict[str, Any] = {
+            "traj_masked": int(should_mask_traj),
+            "traj_exit_reason": traj_exit_reason,
+        }
+        if self.emit_feedback:
+            reward_extra_info = interaction_result.get("reward_extra_info") or {}
+            shared_extra["reward_extra_info"] = {"feedback": reward_extra_info.get("feedback")}
+
+        # Fall back to the single final buffer when no segments were recorded; keep only
+        # segments that actually produced tokens.
+        segments = interaction_result.get("segments")
+        if not segments:
+            segments = [{"rollout_cache": interaction_result["rollout_cache"], "prompt_messages": None}]
+        segments = [seg for seg in segments if len(seg["rollout_cache"].get("response_mask", [])) > 0]
+        if not segments:
+            return [await self._build_empty_agent_output(exit_reason="no_response")]
+
+        num_segments = len(segments)
+        self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
+        outputs = []
+        for seg_idx, seg in enumerate(segments):
+            seg_output = self._segment_to_output(
+                seg,
+                reward_score=reward_score,
+                num_turns=num_turns,
+                should_mask_traj=should_mask_traj,
+                metrics=metrics,
+                shared_extra=shared_extra,
+                seg_idx=seg_idx,
+                num_segments=num_segments,
+            )
+            # Emit one trace span per segment (no-op when tracing is disabled).
+            outputs.append(
+                await self._trace_segment(
+                    seg_output,
+                    segment_index=seg_idx,
+                    num_segments=num_segments,
+                    trajectory_id=self.run_id,
+                )
+            )
+        return outputs
+
+    @rollout_trace_op
+    async def _trace_segment(
+        self,
+        agent_output: AgentLoopOutput,
+        *,
+        segment_index: int,
+        num_segments: int,
+        trajectory_id: str,
+    ) -> AgentLoopOutput:
+        """Emit one rollout-trace span per trajectory segment.
+
+        Pass-through whose sole purpose is the ``@rollout_trace_op`` instrumentation: the
+        configured trace backend records this segment as its own span (a no-op when
+        tracing is off). Nested under the rollout's ``run`` span, so all segments and the
+        per-turn model calls of one trajectory share a ``trace_id``; ``trajectory_id`` (the
+        agent-loop run id, also the run-log dir name) is recorded as a span input for flat
+        grouping/correlation. The decorator decodes ``prompt_ids``/``response_ids`` into
+        readable ``prompt_text``/``response_text``; reward, ``num_turns`` and any feedback
+        ride along in the returned output's ``extra_fields``.
+        """
+        return agent_output
+
+    def _segment_to_output(
+        self,
+        segment: dict,
+        *,
+        reward_score: float | None,
+        num_turns: int,
+        should_mask_traj: bool,
+        metrics: dict,
+        shared_extra: dict,
+        seg_idx: int,
+        num_segments: int,
+    ) -> AgentLoopOutput:
+        """Build one AgentLoopOutput from a single trajectory segment's token buffer."""
+        rollout_cache = segment["rollout_cache"]
+        prompt_ids = list(rollout_cache["prompt_ids"])
+        raw_mask = rollout_cache["response_mask"]
+        response_mask = [0] * len(raw_mask) if should_mask_traj else list(raw_mask)
+        response_logprobs = list(rollout_cache.get("response_logprobs") or [])
         routed_experts = rollout_cache.get("routed_experts")
-        metrics = interaction_result.get("metrics", rollout_cache.get("metrics", {}))
-        extra_fields = dict(rollout_cache.get("extra_fields") or {})
-        extra_fields["traj_masked"] = traj_masked
-        extra_fields["traj_exit_reason"] = traj_exit_reason
+
         response_ids = prompt_ids[-len(response_mask) :]
         prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
 
         max_prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
         max_response_length = self.config.actor_rollout_ref.rollout.response_length
-
         if len(prompt_ids) > max_prompt_length:
-            prompt_ids = prompt_ids[:max_prompt_length]
             self.logger.warning(
-                f"prompt_ids length {len(prompt_ids)} exceeds max_prompt_length {max_prompt_length} "
-                "truncate prompt_ids length"
+                f"prompt_ids length {len(prompt_ids)} exceeds max_prompt_length {max_prompt_length}; truncating"
             )
+            prompt_ids = prompt_ids[:max_prompt_length]
         if len(response_ids) > max_response_length:
+            self.logger.warning(
+                f"response_ids length {len(response_ids)} exceeds max_response_length {max_response_length}; truncating"
+            )
             response_ids = response_ids[:max_response_length]
             response_mask = response_mask[:max_response_length]
             response_logprobs = response_logprobs[:max_response_length]
-            self.logger.warning(
-                f"response_ids length {len(response_ids)} exceeds max_response_length {max_response_length} "
-                "truncate response_ids length"
-            )
 
-        self.logger.info(f"prompt_ids length: {len(prompt_ids)}")
-        self.logger.info(f"response_ids length: {len(response_ids)}")
-        self.logger.info(f"reward_score: {reward_score}")
-        response_logprobs = response_logprobs if response_logprobs else None
         if routed_experts is not None:
             routed_experts = routed_experts[: len(prompt_ids) + len(response_ids)]
 
         multi_modal_data = {}
+        extra_fields = dict(rollout_cache.get("extra_fields") or {})
+        extra_fields.update(shared_extra)
+        extra_fields["segment_index"] = seg_idx
+        extra_fields["num_segments"] = num_segments
+        # Only condensation segments (idx > 0) need their own prompt context for the
+        # SDPO teacher; segment 0 uses the standard raw_prompt (avoids duplicating it).
+        if seg_idx > 0 and segment.get("prompt_messages") is not None:
+            extra_fields["segment_prompt"] = segment["prompt_messages"]
+
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
-            response_logprobs=response_logprobs,
+            response_logprobs=response_logprobs if response_logprobs else None,
             routed_experts=routed_experts,
             multi_modal_data=multi_modal_data,
             reward_score=reward_score,

@@ -33,6 +33,24 @@ class TerminalNotAliveError(Exception):
     pass
 
 
+class EnvAction(BaseModel):
+    """A single action to run in the environment session.
+
+    Attributes:
+        command: The bash command to run; or, when ``is_input`` is True, the
+            input to send to the currently running interactive program
+            (``"C-c"`` interrupts it).
+        is_input: Send ``command`` to the running interactive program instead of
+            starting a new command.
+        timeout: Optional per-action timeout in seconds; callers fall back to
+            their own default when this is ``None``.
+    """
+
+    command: str
+    is_input: bool = False
+    timeout: int | None = None
+
+
 class AgentEnvConfig(BaseModel):
     deployment: DeployConfig = Field(description="Deployment configuration")
     env_variables: dict[str, str] | None = Field(
@@ -155,24 +173,33 @@ class AgentEnv:
             return
         self.logger.info("Environment shutdown completed")
 
+    @staticmethod
+    def _format_observation(raw: str, max_observation_length: int, empty_message: str) -> str:
+        """Strip control chars and wrap raw session output as an observation.
+
+        Shared by :meth:`run_action` and :meth:`send_input`. Returns
+        ``empty_message`` when there is no output, an ``Observation:``-prefixed
+        block otherwise, and a clipped block with a NOTE when the output exceeds
+        ``max_observation_length``.
+        """
+        cleaned = re.sub(r"\x1b\[[0-9;]*m|\r", "", raw or "").strip()
+        if cleaned == "":
+            return empty_message
+        if len(cleaned) > max_observation_length:
+            elided = len(cleaned) - max_observation_length
+            return (
+                f"Observation:\n{cleaned[:max_observation_length]}<response clipped>\n"
+                f"<NOTE>Observation exceeded {max_observation_length} characters; {elided} were elided. "
+                "Run a command that produces less output, or pipe through head/tail/grep or redirect to a "
+                "file. Do not use interactive pagers.</NOTE>"
+            )
+        return f"Observation:\n{cleaned}"
+
     @auto_await
     async def run_action(self, action_cmd: str, action_timeout: int, max_observation_length: int = 100_000) -> str:
+        """Run a new bash command in the session and return its observation."""
         try:
             observation = await self.communicate(input=action_cmd, timeout=action_timeout, check="ignore")
-            observation = re.sub(r"\x1b\[[0-9;]*m|\r", "", observation).strip()
-            if observation == "":
-                observation = "Your command ran successfully and did not produce any output."
-            elif len(observation) > max_observation_length:
-                observation = (
-                    f"Observation:\n{observation[:max_observation_length]}<response clipped>\n"
-                    f"<NOTE>Observations should not exceeded {max_observation_length} characters. "
-                    f"{max_observation_length - len(observation)} characters were elided. "
-                    "Please try a different command that produces less output or "
-                    "use head/tail/grep/redirect the output to a file. Do not use interactive pagers.</NOTE>"
-                )
-            else:
-                observation = f"Observation:\n{observation}"
-            return observation
         except CommandTimeoutError:
             # interrupt timeout action
             # if terminal is still alive after interrupt, raise error
@@ -215,6 +242,49 @@ class AgentEnv:
                 f"{e.extra_info['bash_stdout']}\n{e.extra_info['bash_stderr']}"
             )
             raise ActionIncorrectSyntaxError(error_message) from None
+
+        return self._format_observation(
+            observation,
+            max_observation_length,
+            empty_message="Your command ran successfully and did not produce any output.",
+        )
+
+    @auto_await
+    async def send_input(self, payload: str, action_timeout: int, max_observation_length: int = 100_000) -> str:
+        """Send input to a program already running in the persistent session.
+
+        ``payload == "C-c"`` interrupts the running process; any other payload is
+        sent as a line of input via SWE-ReX's interactive-command mode (no exit
+        code / PS1 seek). A timeout here is benign (the program is still running or
+        awaiting more input) and does NOT interrupt the session. Only ``C-c`` is
+        special-cased; SWE-ReX exposes no clean per-key API for ``C-d`` / ``C-z``.
+        """
+        if payload.strip() == "C-c":
+            try:
+                obs = await self.deployment.runtime.run_in_session(BashInterruptAction(timeout=10))
+            except Exception as e:
+                self.logger.error(f"Failed to interrupt session: {e}")
+                return "Failed to send interrupt (C-c) to the running process."
+            return self._format_observation(
+                getattr(obs, "output", "") or "",
+                max_observation_length,
+                empty_message="Sent interrupt (C-c) to the running process.",
+            )
+
+        try:
+            r = await self.deployment.runtime.run_in_session(
+                BashAction(command=payload, timeout=action_timeout, is_interactive_command=True, check="ignore")
+            )
+        except CommandTimeoutError:
+            return (
+                f"The interactive program did not return within {action_timeout} seconds; it may still be "
+                "running or waiting for input. Send more input, wait, or send 'C-c' (is_input=true) to interrupt it."
+            )
+        return self._format_observation(
+            r.output,
+            max_observation_length,
+            empty_message="Your input was sent; the program produced no output yet.",
+        )
 
     @auto_await
     async def interrupt_session(self):

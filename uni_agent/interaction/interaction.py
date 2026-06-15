@@ -8,6 +8,7 @@ from uni_agent.async_logging import get_logger
 from uni_agent.skills.manager import SkillsManager
 from uni_agent.utils import auto_await, simple_timer
 
+from .condenser import AbstractCondenser, CondensationFailed
 from .env import ActionIncorrectSyntaxError, ActionTimeoutError, AgentEnv, TerminalNotAliveError
 from .model import AgentChatModel, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
@@ -15,6 +16,12 @@ from .tool_schemas import OpenAIFunctionToolCall
 from .tools_manager import ToolsManager
 
 ToolStatus = Literal["ok", "timeout", "syntax_error", "skipped"]
+
+# Heuristic budget for reactive condensation: how many characters to free when the
+# context overflows, escalated per retry (~chars_per_token x tokens_over + margin).
+CONDENSE_CHARS_PER_TOKEN = 4
+CONDENSE_MARGIN_TOKENS = 1024
+CONDENSE_MIN_CHARS = 2000
 
 
 class ToolResult(BaseModel):
@@ -58,12 +65,28 @@ class AgentInteraction:
         max_turns: int = 50,
         skills_manager: SkillsManager | None = None,
         chat_mode: bool = False,
+        stuck_threshold: int = 0,
+        condenser: AbstractCondenser | None = None,
+        condense_max_retries: int = 5,
+        condense_chars_per_token: int = CONDENSE_CHARS_PER_TOKEN,
+        condense_margin_tokens: int = CONDENSE_MARGIN_TOKENS,
+        condense_min_chars: int = CONDENSE_MIN_CHARS,
     ):
         """:param chat_mode: how to treat an assistant message with no
         tool calls. ``False`` (default, training / code-eval) raises
         ``format_error`` so the loop continues. ``True`` (long-running
         chat) marks the step ``turn_done`` so the caller can wait for
         the next user message.
+        :param stuck_threshold: abort the rollout once this many consecutive
+        assistant responses are identical (a stuck loop). ``0`` disables the
+        check. The aborted trajectory exits with ``exit_reason="stuck"`` and is
+        scored normally (masked only if ``mask_abnormal_exit_traj`` is set).
+        :param condenser: optional context condenser. When set, a context overflow
+        is handled reactively: the current token buffer is materialized as a
+        trajectory *segment*, the message history is condensed, the buffer is
+        re-seated from it, and generation retries. ``None`` keeps the legacy
+        behavior (overflow ends the rollout with ``token_limit``).
+        :param condense_max_retries: max condense+retry attempts per overflow.
         """
         self.env = env
         self.model = model
@@ -74,6 +97,12 @@ class AgentInteraction:
         self.timeout_budget = timeout_budget
         self.max_turns = max_turns
         self.chat_mode = chat_mode
+        self.stuck_threshold = stuck_threshold
+        self.condenser = condenser
+        self.condense_max_retries = condense_max_retries
+        self.condense_chars_per_token = condense_chars_per_token
+        self.condense_margin_tokens = condense_margin_tokens
+        self.condense_min_chars = condense_min_chars
         self.logger = get_logger("interaction", run_id)
 
     def inject_skills_manifest(self) -> None:
@@ -117,7 +146,7 @@ class AgentInteraction:
             ``token_limit``, ``terminal_dead``, ``timeout_budget_exhausted``.
           - non-terminal (``done=False``): ``completed``,
             ``completed_with_tool_errors``, ``format_error``.
-          - set by :meth:`run`: ``max_step_limit``, ``unknown_error``.
+          - set by :meth:`run`: ``max_step_limit``, ``stuck``, ``unknown_error``.
 
         ``turn_done`` is gated on ``self.chat_mode`` (see ``__init__``).
         """
@@ -128,29 +157,44 @@ class AgentInteraction:
         # step 1: prepare template
         self.logger.info(f"🤖 MODEL INPUT\n{self.messages[-1]['content']}")
 
-        # step 2: generate response and update rollout cache
-        try:
-            model_output, tool_calls, rollout_cache, generation_info = await self.model.query(
-                messages=self.messages,
-                rollout_cache=self.rollout_cache,
-            )
-            step_output.response = model_output
-            self.logger.info(
-                f"Prompt Tokens: {generation_info['prompt_tokens']}, "
-                f"Completion Tokens: {generation_info['completion_tokens']}"
-            )
-            self.logger.debug(f"Model Output:\n{model_output}")
-        except MaxTokenExceededError as e:
-            _msg = (
-                f"[step{step_idx}] MaxTokenExceededError: "
-                f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
-                f"prompt_ids_len={len(self.rollout_cache.get('prompt_ids', []))} "
-                f"detail: {str(e)}"
-            )
-            self.logger.error("{}", _msg)
-            step_output.exit_reason = "token_limit"
-            step_output.done = True
-            return step_output
+        # step 2: generate response and update rollout cache. On context overflow,
+        # either condense + re-seat + retry (if a condenser is configured) or end.
+        model_output = tool_calls = rollout_cache = generation_info = None
+        for attempt in range(self.condense_max_retries + 1):
+            try:
+                model_output, tool_calls, rollout_cache, generation_info = await self.model.query(
+                    messages=self.messages,
+                    rollout_cache=self.rollout_cache,
+                )
+                break
+            except MaxTokenExceededError as e:
+                _msg = (
+                    f"[step{step_idx}] MaxTokenExceededError: "
+                    f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
+                    f"prompt_ids_len={len(self.rollout_cache.get('prompt_ids', []))} "
+                    f"detail: {str(e)}"
+                )
+                if self.condenser is None or attempt == self.condense_max_retries:
+                    self.logger.error("{}", _msg)
+                    step_output.exit_reason = "token_limit"
+                    step_output.done = True
+                    return step_output
+                self.logger.warning("{}", _msg)
+                try:
+                    await self._condense_and_reseat(attempt)
+                    self.logger.info(f"Condensed context (attempt {attempt + 1}); retrying generation.")
+                except CondensationFailed as ce:
+                    self.logger.error(f"Condensation failed: {ce}")
+                    step_output.exit_reason = "token_limit"
+                    step_output.done = True
+                    return step_output
+
+        step_output.response = model_output
+        self.logger.info(
+            f"Prompt Tokens: {generation_info['prompt_tokens']}, "
+            f"Completion Tokens: {generation_info['completion_tokens']}"
+        )
+        self.logger.debug(f"Model Output:\n{model_output}")
 
         # step 3: parse model response to actions
         self.rollout_cache = rollout_cache
@@ -216,13 +260,17 @@ class AgentInteraction:
         with simple_timer("tool_calls", self.rollout_cache["metrics"]):
             for idx, tool_call in enumerate(tool_calls):
                 tool_call: OpenAIFunctionToolCall  # type: ignore[no-redef]
-                action_cmd = self.tools_manager.get_tool_bash_command(tool_call)
-                self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action_cmd}")
+                action = self.tools_manager.get_tool_action(tool_call)
+                self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
+                action_timeout = action.timeout or self.action_timeout
 
                 tool_t0 = time.perf_counter()
                 status: ToolStatus
                 try:
-                    observation = await self.env.run_action(action_cmd, action_timeout=self.action_timeout)
+                    if action.is_input:
+                        observation = await self.env.send_input(action.command, action_timeout=action_timeout)
+                    else:
+                        observation = await self.env.run_action(action.command, action_timeout=action_timeout)
                     status = "ok"
                     if tool_call.function.name in ("finish", "submit"):
                         saw_finish = True
@@ -246,7 +294,7 @@ class AgentInteraction:
                     ToolResult(
                         tool_call_id=tool_call.id,
                         name=tool_call.function.name,
-                        action=action_cmd,
+                        action=action.command,
                         observation=observation,
                         status=status,
                         execution_time=elapsed,
@@ -321,6 +369,57 @@ class AgentInteraction:
         step_output.exit_reason = "completed"
         return step_output
 
+    def check_stuck(self) -> bool:
+        """Return True when the last ``stuck_threshold`` assistant responses are
+        all identical (a degenerate repeat loop). Disabled when threshold <= 0.
+
+        Scans the trajectory tail and short-circuits: stops at the first response
+        that differs (not stuck) or once ``stuck_threshold`` identical ones are
+        seen (stuck), so it never materializes the full history.
+        """
+        if not self.stuck_threshold or self.stuck_threshold <= 0:
+            return False
+        last = None
+        count = 0
+        for step in reversed(self.trajectory):
+            response = step.response
+            if not response:
+                continue
+            if last is None:
+                last = response
+            elif response != last:
+                return False
+            count += 1
+            if count >= self.stuck_threshold:
+                return True
+        return False
+
+    def _materialize_segment(self) -> None:
+        """Freeze the current token buffer as a finished trajectory segment, paired
+        with the message context that formed its prompt (used downstream for
+        per-segment teacher reconstruction)."""
+        self.segments.append(
+            {"rollout_cache": self.rollout_cache, "prompt_messages": self.segment_start_messages}
+        )
+
+    def _condense_budget(self, attempt: int) -> int:
+        over_tokens = max(0, len(self.rollout_cache.get("prompt_ids", [])) - self.model.max_model_len)
+        tokens_to_free = (over_tokens + self.condense_margin_tokens) * (attempt + 1)
+        return max(self.condense_min_chars, tokens_to_free * self.condense_chars_per_token)
+
+    async def _condense_and_reseat(self, attempt: int) -> None:
+        """Materialize the overflowing buffer as a segment (when it produced tokens),
+        condense the history, and re-seat a fresh buffer from the condensed messages so
+        the next generation continues into a new segment."""
+        if len(self.rollout_cache.get("response_mask", [])) > 0:
+            self._materialize_segment()
+        budget = self._condense_budget(attempt)
+        self.messages = self.condenser.condense(
+            self.messages, budget, arg_masker=self.tools_manager.mask_tool_args
+        )
+        self.rollout_cache = await self.model.prepare_rollout_cache(self.messages)
+        self.segment_start_messages = list(self.messages)
+
     @auto_await
     async def run(self):
         self.trajectory: list[StepOutput] = []
@@ -331,6 +430,10 @@ class AgentInteraction:
 
         rollout_cache = await self.model.prepare_rollout_cache(self.messages)
         self.rollout_cache: dict[str, str] = rollout_cache
+        # Trajectory segments: a new one starts after each condensation. With no
+        # condensation this stays a single segment == the whole rollout.
+        self.segments: list[dict] = []
+        self.segment_start_messages: list[dict] = list(self.messages)
 
         done = False
         step_idx = 0
@@ -342,6 +445,13 @@ class AgentInteraction:
                 step_output = await self.step(step_idx=step_idx)
                 self.trajectory.append(step_output)
                 done = step_output.done
+                if done:
+                    break
+                if self.check_stuck():
+                    self.logger.error(f"Exit due to stuck loop: {self.stuck_threshold} identical responses")
+                    step_output = StepOutput(step_idx=step_idx, exit_reason="stuck")
+                    self.trajectory.append(step_output)
+                    break
                 if step_idx >= self.max_turns:
                     self.logger.error(f"Exit due to max step limit: {self.max_turns}")
                     step_output = StepOutput(step_idx=step_idx, exit_reason="max_step_limit")
@@ -359,10 +469,14 @@ class AgentInteraction:
                 self.trajectory.append(step_output)
                 break
 
+        # Freeze the final (active) buffer as the last segment.
+        self._materialize_segment()
+
         execution_time = time.perf_counter() - execution_time
         result = {
             "trajectory": self.trajectory,
-            "rollout_cache": self.rollout_cache,
+            "rollout_cache": self.rollout_cache,  # final buffer (kept for save/back-compat)
+            "segments": self.segments,
             "execution_time": execution_time,
             "messages": self.messages,
         }

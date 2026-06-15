@@ -148,6 +148,23 @@ class XMLToolParser:
         tool_call = OpenAIFunctionToolCall(id=str(uuid.uuid4()), type="function", function=function_call)
         return tool_call
 
+    def mask_arguments(self, content: str, arg_names: list[str], placeholder: str = "<MASKED>") -> tuple[str, int]:
+        """Replace the values of the named ``<parameter=...>`` arguments with
+        ``placeholder`` (in this parser's XML format). Returns
+        ``(new_content, chars_removed)``. Used by condensers to reclaim context.
+        """
+        chars_removed = 0
+        for name in arg_names:
+            pattern = regex.compile(rf"(<parameter={regex.escape(name)}>)(.*?)(</parameter>)", regex.DOTALL)
+
+            def _repl(match):
+                nonlocal chars_removed
+                chars_removed += max(0, len(match.group(2)) - len(placeholder))
+                return match.group(1) + placeholder + match.group(3)
+
+            content = pattern.sub(_repl, content)
+        return content, chars_removed
+
     def _get_function_calls(self, model_output: str) -> list[str]:
         """Return ``<function=...>`` bodies found inside ``<tool_call>`` blocks.
         Empty list = nothing recoverable (caller treats as "no tool calls").
@@ -234,6 +251,31 @@ class HermesToolParser:
 
         content_index = model_output.find(self.tool_call_start_token)
         return model_output[:content_index], tool_calls
+
+    def mask_arguments(self, content: str, arg_names: list[str], placeholder: str = "<MASKED>") -> tuple[str, int]:
+        """Replace the values of the named arguments with ``placeholder`` inside each
+        ``<tool_call>{json}</tool_call>`` block (in this parser's JSON format).
+        Returns ``(new_content, chars_removed)``. Blocks with invalid JSON are left
+        untouched. Used by condensers to reclaim context.
+        """
+        names = set(arg_names)
+        chars_removed = 0
+
+        def _repl(match):
+            nonlocal chars_removed
+            try:
+                obj = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                return match.group(0)
+            args = obj.get("arguments") if isinstance(obj, dict) else None
+            if isinstance(args, dict):
+                for key, value in args.items():
+                    if key in names and isinstance(value, str):
+                        chars_removed += max(0, len(value) - len(placeholder))
+                        args[key] = placeholder
+            return f"{self.tool_call_start_token}\n{json.dumps(obj, ensure_ascii=False)}\n{self.tool_call_end_token}"
+
+        return self.tool_call_regex.sub(_repl, content), chars_removed
 
     def _parse_single(self, raw: str, valid_names: set[str]) -> OpenAIFunctionToolCall:
         try:

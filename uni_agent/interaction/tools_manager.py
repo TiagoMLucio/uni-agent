@@ -3,6 +3,7 @@ import shlex
 
 from pydantic import BaseModel, ConfigDict
 
+from uni_agent.interaction.env import EnvAction
 from uni_agent.interaction.tool_parser import FunctionCallFormatError, get_tool_parser
 from uni_agent.interaction.tool_schemas import (
     OpenAIFunctionCallSchema,
@@ -119,3 +120,42 @@ class ToolsManager:
             cmd_parts.append(shlex.quote(param_str))
 
         return " ".join(cmd_parts)
+
+    def mask_tool_args(self, content: str, arg_names: list[str], placeholder: str = "<MASKED>") -> tuple[str, int]:
+        """Mask the values of the named tool-call arguments in ``content`` using the
+        active parser's format. Returns ``(new_content, chars_removed)``; a no-op
+        ``(content, 0)`` if the parser does not support masking. Lets a condenser
+        reclaim context without knowing the tool-call format itself.
+        """
+        masker = getattr(self._tool_parser, "mask_arguments", None)
+        if masker is None:
+            return content, 0
+        return masker(content, arg_names, placeholder)
+
+    def get_tool_action(self, tool_call: OpenAIFunctionToolCall) -> EnvAction:
+        """Translate a tool call into an :class:`EnvAction` (command + execution flags).
+
+        Tool-specific argument interpretation lives here (next to the
+        ``submit``/``lark-cli`` special-casing in :meth:`get_tool_bash_command`),
+        so the interaction loop stays tool-agnostic. Only ``execute_bash``
+        currently carries interactive-input (``is_input``) and per-call ``timeout``
+        arguments.
+        """
+        command = self.get_tool_bash_command(tool_call)
+        is_input = False
+        timeout = None
+        if tool_call.function.name == "execute_bash":
+            args = tool_call.function.arguments if isinstance(tool_call.function.arguments, dict) else {}
+            is_input = bool(args.get("is_input", False))
+            timeout = self._coerce_timeout(args.get("timeout"))
+        return EnvAction(command=command, is_input=is_input, timeout=timeout)
+
+    @staticmethod
+    def _coerce_timeout(value) -> int | None:
+        """Best-effort int coercion for a per-call timeout; ``None`` if unset/invalid."""
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
