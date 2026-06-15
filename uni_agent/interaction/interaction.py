@@ -52,6 +52,14 @@ def fast_deepcopy(obj):
     return orjson.loads(orjson.dumps(obj))
 
 
+def _should_break(name: str) -> bool:
+    try:
+        from verl.utils.debug_breakpoints import should_break
+    except ImportError:
+        return False
+    return should_break(name)
+
+
 class AgentInteraction:
     def __init__(
         self,
@@ -267,6 +275,8 @@ class AgentInteraction:
                 tool_t0 = time.perf_counter()
                 status: ToolStatus
                 try:
+                    if _should_break("tool"):
+                        breakpoint()
                     if action.is_input:
                         observation = await self.env.send_input(action.command, action_timeout=action_timeout)
                     else:
