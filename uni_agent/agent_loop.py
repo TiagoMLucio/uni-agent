@@ -54,6 +54,11 @@ class UniAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> list[AgentLoopOutput]:
+        from verl.utils.debug_breakpoints import should_break
+
+        if should_break("agent_run"):
+            breakpoint()
+
         config_dict = self._init_config(sampling_params, **kwargs)
         self.mask_abnormal_exit_traj = config_dict.get("mask_abnormal_exit_traj", False)
         # When the reward spec emits feedback, keep a consistent ``reward_extra_info``
@@ -125,6 +130,8 @@ class UniAgentLoop(AgentLoopBase):
 
                 # interaction environment should be visible to the reward spec
                 if self.reward_spec is not None:
+                    if should_break("reward"):
+                        breakpoint()
                     reward_score, reward_result = await self.reward_spec.compute_reward(
                         interaction_result=interaction_result,
                         env_config=config_dict["env"],
