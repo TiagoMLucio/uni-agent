@@ -479,8 +479,10 @@ class AgentInteraction:
                 self.trajectory.append(step_output)
                 break
 
-        # Freeze the final (active) buffer as the last segment.
-        self._materialize_segment()
+        # Freeze the final buffer as the last segment, unless it was already materialized
+        # (on CondensationFailed the buffer isn't re-seated, so it would be duplicated).
+        if not self.segments or self.segments[-1]["rollout_cache"] is not self.rollout_cache:
+            self._materialize_segment()
 
         execution_time = time.perf_counter() - execution_time
         result = {
