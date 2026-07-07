@@ -3,6 +3,7 @@ import uuid
 from functools import cached_property
 from typing import Any
 
+from uni_agent.tracing import rollout_trace_generation
 from uni_agent.utils import get_event_loop, simple_timer
 
 
@@ -128,6 +129,17 @@ class AgentChatModel:
             if max_global_steps is not None:
                 rollout_cache["extra_fields"]["max_global_steps"] = max_global_steps
         response_str = await self.loop.run_in_executor(None, lambda: self.tokenizer.decode(response_ids))
+        # omit tool_calls: null breaks Langfuse chat rendering; calls are their own tool spans
+        rollout_trace_generation(
+            "model_call",
+            model=getattr(self.tokenizer, "name_or_path", None),
+            input=list(messages),
+            output={"role": "assistant", "content": response_str},
+            usage={
+                "input": generation_info["prompt_tokens"],
+                "output": generation_info["completion_tokens"],
+            },
+        )
 
         if len(rollout_cache["prompt_ids"]) >= self.max_model_len:
             raise MaxTokenExceededError(

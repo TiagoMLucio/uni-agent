@@ -19,9 +19,14 @@ from uni_agent.interaction import (
 )
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
+from uni_agent.tracing import (
+    register_langfuse_op,
+    rollout_trace_event,
+    rollout_trace_op,
+    rollout_trace_score,
+)
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
-from verl.utils.rollout_trace import rollout_trace_op
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -41,6 +46,10 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
+# trace root, named "rollout"; token-id I/O omitted (huge payloads)
+register_langfuse_op("UniAgentLoop.run", no_io=True, as_type="agent", root=True, name="rollout")
 
 
 class UniAgentLoop(AgentLoopBase):
@@ -137,8 +146,17 @@ class UniAgentLoop(AgentLoopBase):
                         env_config=config_dict["env"],
                     )
                     interaction_result["reward_score"] = reward_score
+                    rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
                     if isinstance(reward_result, dict):
                         interaction_result["reward_extra_info"] = reward_result.get("reward_extra_info", {})
+                        if "resolved" in reward_result:
+                            rollout_trace_score(
+                                "resolved", int(bool(reward_result["resolved"])), data_type="BOOLEAN"
+                            )
+                        # persist the textual eval report; only scalar scores are traced otherwise
+                        feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback")
+                        if feedback:
+                            rollout_trace_event("reward_feedback", output=feedback)
                 else:
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
@@ -383,9 +401,9 @@ class UniAgentLoop(AgentLoopBase):
 
         num_segments = len(segments)
         self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
-        outputs = []
-        for seg_idx, seg in enumerate(segments):
-            seg_output = self._segment_to_output(
+        # segments are post-hoc views of work already traced live (segment_index rides on those spans)
+        return [
+            self._segment_to_output(
                 seg,
                 reward_score=reward_score,
                 num_turns=num_turns,
@@ -395,38 +413,8 @@ class UniAgentLoop(AgentLoopBase):
                 seg_idx=seg_idx,
                 num_segments=num_segments,
             )
-            # Emit one trace span per segment (no-op when tracing is disabled).
-            outputs.append(
-                await self._trace_segment(
-                    seg_output,
-                    segment_index=seg_idx,
-                    num_segments=num_segments,
-                    trajectory_id=self.run_id,
-                )
-            )
-        return outputs
-
-    @rollout_trace_op
-    async def _trace_segment(
-        self,
-        agent_output: AgentLoopOutput,
-        *,
-        segment_index: int,
-        num_segments: int,
-        trajectory_id: str,
-    ) -> AgentLoopOutput:
-        """Emit one rollout-trace span per trajectory segment.
-
-        Pass-through whose sole purpose is the ``@rollout_trace_op`` instrumentation: the
-        configured trace backend records this segment as its own span (a no-op when
-        tracing is off). Nested under the rollout's ``run`` span, so all segments and the
-        per-turn model calls of one trajectory share a ``trace_id``; ``trajectory_id`` (the
-        agent-loop run id, also the run-log dir name) is recorded as a span input for flat
-        grouping/correlation. The decorator decodes ``prompt_ids``/``response_ids`` into
-        readable ``prompt_text``/``response_text``; reward, ``num_turns`` and any feedback
-        ride along in the returned output's ``extra_fields``.
-        """
-        return agent_output
+            for seg_idx, seg in enumerate(segments)
+        ]
 
     def _segment_to_output(
         self,
