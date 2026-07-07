@@ -7,6 +7,7 @@ from .config import (
     LocalDeploymentConfig,
     LocalNativeDeploymentConfig,
     ModalDeploymentConfig,
+    SshPodmanDeploymentConfig,
     VefaasDeploymentConfig,
 )
 
@@ -16,6 +17,7 @@ _LAZY_EXPORTS = {
     "LocalDeployment": ".local.deployment",
     "LocalNativeDeployment": ".local_native.deployment",
     "ModalDeployment": ".modal.deployment",
+    "SshPodmanDeployment": ".ssh_podman.deployment",
     "VefaasDeployment": ".vefaas.deployment",
 }
 
@@ -26,12 +28,14 @@ __all__ = [
     "LocalDeploymentConfig",
     "LocalNativeDeploymentConfig",
     "ModalDeploymentConfig",
+    "SshPodmanDeploymentConfig",
     "VefaasDeploymentConfig",
     "HostDeployment",
     "LocalAttachDeployment",
     "LocalDeployment",
     "LocalNativeDeployment",
     "ModalDeployment",
+    "SshPodmanDeployment",
     "VefaasDeployment",
 ]
 
