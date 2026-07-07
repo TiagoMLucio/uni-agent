@@ -6,6 +6,12 @@ from pydantic import BaseModel, Field
 
 from uni_agent.async_logging import get_logger
 from uni_agent.skills.manager import SkillsManager
+from uni_agent.tracing import (
+    register_langfuse_op,
+    rollout_trace_event,
+    rollout_trace_op,
+    rollout_trace_set_attr,
+)
 from uni_agent.utils import auto_await, simple_timer
 
 from .condenser import AbstractCondenser, CondensationFailed
@@ -58,6 +64,41 @@ def _should_break(name: str) -> bool:
     except ImportError:
         return False
     return should_break(name)
+
+
+def _step_span_update(result):
+    """Compact span output for a step: outcome only (messages/tools are their own observations)."""
+    if not hasattr(result, "model_dump"):
+        return {"output": result}
+    dumped = result.model_dump()
+    output = {
+        "exit_reason": dumped.get("exit_reason"),
+        "done": dumped.get("done"),
+        "n_tools": len(dumped.get("tool_results") or []),
+    }
+    return {"output": output}
+
+
+def _tool_span_update(result):
+    """Span rendering for one executed tool call (errors surface as ERROR level)."""
+    update = {
+        "input": result.action,
+        "output": result.observation,
+        "metadata": {"status": result.status, "execution_time": result.execution_time},
+    }
+    if result.status != "ok":
+        update["level"] = "ERROR"
+        update["status_message"] = str(result.status)
+    return update
+
+
+register_langfuse_op("AgentInteraction.step", as_type="chain", name="step", update_fn=_step_span_update)
+register_langfuse_op(
+    "AgentInteraction._execute_tool_call",
+    as_type="tool",
+    name_fn=lambda inputs: f"tool:{inputs['tool_call'].function.name}",
+    update_fn=_tool_span_update,
+)
 
 
 class AgentInteraction:
@@ -141,6 +182,7 @@ class AgentInteraction:
                 return
         self.messages.insert(0, {"role": "system", "content": manifest})
 
+    @rollout_trace_op
     async def step(self, step_idx: int):
         """Run one model-call + tool-execution cycle.
 
@@ -268,55 +310,19 @@ class AgentInteraction:
         with simple_timer("tool_calls", self.rollout_cache["metrics"]):
             for idx, tool_call in enumerate(tool_calls):
                 tool_call: OpenAIFunctionToolCall  # type: ignore[no-redef]
-                action = self.tools_manager.get_tool_action(tool_call)
-                self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
-                action_timeout = action.timeout or self.action_timeout
-
-                tool_t0 = time.perf_counter()
-                status: ToolStatus
-                try:
-                    if _should_break("tool"):
-                        breakpoint()
-                    if action.is_input:
-                        observation = await self.env.send_input(action.command, action_timeout=action_timeout)
-                    else:
-                        observation = await self.env.run_action(action.command, action_timeout=action_timeout)
-                    status = "ok"
-                    if tool_call.function.name in ("finish", "submit"):
-                        saw_finish = True
-                except ActionTimeoutError as e:
-                    observation = str(e)
-                    status = "timeout"
-                    self.timeout_budget -= 1
-                    self.logger.error(f"{observation} (timeout_budget left: {self.timeout_budget})")
-                except ActionIncorrectSyntaxError as e:
-                    observation = str(e)
-                    status = "syntax_error"
-                    self.logger.error(observation)
-                except TerminalNotAliveError as e:
-                    observation = str(e)
-                    status = "skipped"
+                result = await self._execute_tool_call(tool_call)
+                if result.status == "ok" and result.name in ("finish", "submit"):
+                    saw_finish = True
+                elif result.status == "skipped":
                     terminal_dead = True
-                    self.logger.error(observation)
-                elapsed = time.perf_counter() - tool_t0
 
-                tool_results.append(
-                    ToolResult(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.function.name,
-                        action=action.command,
-                        observation=observation,
-                        status=status,
-                        execution_time=elapsed,
-                    )
-                )
-
+                tool_results.append(result)
                 tool_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "content": observation,
+                        "tool_call_id": result.tool_call_id,
+                        "name": result.name,
+                        "content": result.observation,
                     }
                 )
 
@@ -417,6 +423,45 @@ class AgentInteraction:
         tokens_to_free = (over_tokens + self.condense_margin_tokens) * (attempt + 1)
         return max(self.condense_min_chars, tokens_to_free * self.condense_chars_per_token)
 
+    @rollout_trace_op
+    async def _execute_tool_call(self, tool_call: OpenAIFunctionToolCall) -> ToolResult:
+        """Run one tool call in the env; errors become the observation (status marks the kind)."""
+        action = self.tools_manager.get_tool_action(tool_call)
+        self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
+        action_timeout = action.timeout or self.action_timeout
+
+        tool_t0 = time.perf_counter()
+        status: ToolStatus
+        try:
+            if _should_break("tool"):
+                breakpoint()
+            if action.is_input:
+                observation = await self.env.send_input(action.command, action_timeout=action_timeout)
+            else:
+                observation = await self.env.run_action(action.command, action_timeout=action_timeout)
+            status = "ok"
+        except ActionTimeoutError as e:
+            observation = str(e)
+            status = "timeout"
+            self.timeout_budget -= 1
+            self.logger.error(f"{observation} (timeout_budget left: {self.timeout_budget})")
+        except ActionIncorrectSyntaxError as e:
+            observation = str(e)
+            status = "syntax_error"
+            self.logger.error(observation)
+        except TerminalNotAliveError as e:
+            observation = str(e)
+            status = "skipped"
+            self.logger.error(observation)
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_call.function.name,
+            action=action.command,
+            observation=observation,
+            status=status,
+            execution_time=time.perf_counter() - tool_t0,
+        )
+
     async def _condense_and_reseat(self, attempt: int) -> None:
         """Materialize the overflowing buffer as a segment (when it produced tokens),
         condense the history, and re-seat a fresh buffer from the condensed messages so
@@ -429,6 +474,16 @@ class AgentInteraction:
         )
         self.rollout_cache = await self.model.prepare_rollout_cache(self.messages)
         self.segment_start_messages = list(self.messages)
+        # mark the condensation boundary; later op spans carry the new segment index
+        seg_idx = len(self.segments)
+        rollout_trace_set_attr("segment_index", seg_idx)
+        n_after = len(self.rollout_cache.get("prompt_ids", []))
+        rollout_trace_event(
+            "condensation",
+            metadata={"segment_index": seg_idx, "attempt": attempt, "budget": budget},
+            input=f"context overflow on attempt {attempt}; freeing ~{budget} chars",
+            output=f"re-seated to {len(self.messages)} messages / {n_after} prompt tokens (segment {seg_idx})",
+        )
 
     @auto_await
     async def run(self):
