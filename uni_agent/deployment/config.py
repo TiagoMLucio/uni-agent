@@ -181,12 +181,62 @@ class VefaasDeploymentConfig(BaseModel):
         return VefaasDeployment.from_config(self, run_id)
 
 
+class SshPodmanDeploymentConfig(BaseModel):
+    """Run each sandbox in rootless podman on a remote host, over a shared SSH ControlMaster.
+
+    Lets a separate CPU box serve as the sandbox/eval pool while training runs elsewhere;
+    mechanism details on :mod:`uni_agent.deployment.ssh_podman.deployment`.
+    """
+
+    image: str = "python:3.12"
+    """Container image for the sandbox (per-task image is merged in from the data)."""
+    command: str = (
+        "swerex-remote --host 0.0.0.0 --port {port} --auth-token {token} || "
+        "( python3 -m pip install -q swe-rex && "
+        "python3 -m swerex.server --host 0.0.0.0 --port {port} --auth-token {token} )"
+    )
+    """Command run inside the sandbox to start the swerex server. Uses the swerex
+    already present in the image, falling back to a pip install for plain images."""
+    ssh_host: str
+    """SSH target running rootless podman, e.g. ``user@host``."""
+    ssh_key: str | None = None
+    """Path to the SSH private key used to reach the host."""
+    ssh_port: int | None = None
+    """SSH port, if not 22."""
+    podman_port: int = 8085
+    """Loopback TCP port the remote ``podman system service`` listens on."""
+    runtime_port: int = 8000
+    """Port the swerex server binds inside the sandbox."""
+    shell: str = "/bin/bash"
+    """Shell used as the container entrypoint."""
+    timeout: float = 60.0
+    """Timeout for runtime operations."""
+    startup_timeout: float = 300.0
+    """Timeout waiting for the runtime to come alive (includes image pull)."""
+    max_lifetime: int = 7200
+    """Hard cap (s) on a sandbox's lifetime, enforced container-side via ``timeout``.
+
+    In-process teardown (``stop``) can't run if the owning process is SIGKILLed, which would
+    otherwise leak the container forever. This makes the container self-terminate so
+    ``auto_remove`` reaps it. Set well above the longest real rollout."""
+
+    type: Literal["ssh_podman"] = "ssh_podman"
+    """Discriminator for (de)serialization/CLI. Do not change."""
+    model_config = ConfigDict(extra="forbid")
+
+    def get_deployment(self, run_id: str):
+        from .ssh_podman.deployment import SshPodmanDeployment
+
+        return SshPodmanDeployment.from_config(self, run_id)
+
+
 DeployConfig: TypeAlias = Annotated[
     VefaasDeploymentConfig
     | LocalDeploymentConfig
     | LocalAttachDeploymentConfig
     | HostDeploymentConfig
     | LocalNativeDeploymentConfig
-    | ModalDeploymentConfig,
+    | ModalDeploymentConfig
+    | SshPodmanDeploymentConfig,
     Field(discriminator="type"),
 ]
