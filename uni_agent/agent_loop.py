@@ -123,17 +123,22 @@ class UniAgentLoop(AgentLoopBase):
             self.logger.info(f"interaction config: {config_dict['interaction']}")
             self.logger.info(f"mask_abnormal_exit_traj: {self.mask_abnormal_exit_traj}")
             self.logger.info(f"output_dir: {self.output_dir}")
+            # cap the setup phase: one wedged env.start would stall the whole gathered step
+            setup_timeout = config_dict.get("setup_timeout", 300)
+            setup_done = False
             try:
-                await self.env.start()
+                async with asyncio.timeout(setup_timeout):
+                    await self.env.start()
 
-                # tools schemas should be visible to the model
-                # to generate correct tool call format in response
-                self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
-                await self.env.install_tools(self.tools_manager.tools)
-                if self.skills_manager is not None:
-                    await self.env.install_skills(self.skills_manager)
-                    self.interaction.inject_skills_manifest()
+                    # tools schemas should be visible to the model
+                    # to generate correct tool call format in response
+                    self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
+                    await self.env.install_tools(self.tools_manager.tools)
+                    if self.skills_manager is not None:
+                        await self.env.install_skills(self.skills_manager)
+                        self.interaction.inject_skills_manifest()
 
+                setup_done = True
                 interaction_result = await self.interaction.run()
                 interaction_result["metrics"] = dict(interaction_result.get("rollout_cache", {}).get("metrics", {}))
 
@@ -164,8 +169,9 @@ class UniAgentLoop(AgentLoopBase):
                 self._save_interaction_result(interaction_result)
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
-                self.logger.critical(f"Agent loop failed before producing interaction result: {e}")
-                output = [await self._build_empty_agent_output(exit_reason="agent_loop_failed")]
+                exit_reason = "setup_timeout" if not setup_done and isinstance(e, TimeoutError) else "agent_loop_failed"
+                self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {e!r}")
+                output = [await self._build_empty_agent_output(exit_reason=exit_reason)]
             finally:
                 await self.env.close()
             return output
