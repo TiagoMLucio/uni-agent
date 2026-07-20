@@ -41,6 +41,7 @@ from uni_agent.interaction import AgentEnv
 from uni_agent.reward.base import AbstractRewardSpec
 from uni_agent.reward.registry import register_reward_spec
 from uni_agent.reward.swe_bench import FeedbackConfig
+from uni_agent.tracing import rollout_trace_span
 from uni_agent.utils import auto_await
 
 #: HEREDOC delimiter unlikely to appear in a diff (matches swe_bench's convention).
@@ -145,32 +146,44 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         eval_env = self.env
         sibling = None
         try:
-            if self.isolate:
-                env_config = kwargs.get("env_config") or self.env_config
-                sibling = await self._start_sibling_env(env_config)
-                eval_env = sibling
+            with rollout_trace_span("eval_env_setup", metadata={"isolate": self.isolate}) as env_span:
+                if self.isolate:
+                    env_config = kwargs.get("env_config") or self.env_config
+                    sibling = await self._start_sibling_env(env_config)
+                    eval_env = sibling
 
-            eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
-            await eval_env.write_file(eval_script_container, eval_script)
+                eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
+                await eval_env.write_file(eval_script_container, eval_script)
+                if env_span is not None:
+                    env_span.update(output={"status": "ready", "sibling": sibling is not None})
 
-            execution_t0 = time.perf_counter()
-            output = await eval_env.communicate(
-                f"bash {eval_script_container}",
-                timeout=self.eval_timeout,
-                check="ignore",
-            )
-            result["eval_execution_time"] = time.perf_counter() - execution_t0
-            result["eval_completed"] = True
+            with rollout_trace_span("tests", input={"test_command": test_command}) as tests_span:
+                execution_t0 = time.perf_counter()
+                output = await eval_env.communicate(
+                    f"bash {eval_script_container}",
+                    timeout=self.eval_timeout,
+                    check="ignore",
+                )
+                result["eval_execution_time"] = time.perf_counter() - execution_t0
+                result["eval_completed"] = True
 
-            # Strip ANSI escapes / carriage returns before parsing.
-            output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+                # Strip ANSI escapes / carriage returns before parsing.
+                output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
 
-            eval_report = self._get_eval_report(output)
-            result["eval_report"] = eval_report
-            self.logger.info(f"Eval report: {eval_report}")
-            result["resolved"] = eval_report["resolved"]
-            if not eval_report["found_eval_status"] and APPLY_PATCH_FAIL in output:
-                result["patch_apply_failed"] = True
+                eval_report = self._get_eval_report(output)
+                result["eval_report"] = eval_report
+                self.logger.info(f"Eval report: {eval_report}")
+                result["resolved"] = eval_report["resolved"]
+                if not eval_report["found_eval_status"] and APPLY_PATCH_FAIL in output:
+                    result["patch_apply_failed"] = True
+                if tests_span is not None:
+                    tests_span.update(
+                        output={
+                            "resolved": result["resolved"],
+                            "eval_execution_time": result["eval_execution_time"],
+                            "patch_apply_failed": result.get("patch_apply_failed", False),
+                        }
+                    )
         except Exception as e:
             self.logger.error(f"Failed to evaluate: {e}")
         finally:

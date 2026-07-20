@@ -34,16 +34,19 @@ class AgentChatModel:
     def set_tools_schemas(self, tools_schemas: list[dict]) -> None:
         self.tools_schemas = tools_schemas
 
-    async def prepare_rollout_cache(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    async def prepare_rollout_cache(
+        self, messages: list[dict[str, str]], include_tools: bool = True
+    ) -> dict[str, Any]:
         from verl.utils.tokenizer import normalize_token_ids
 
+        tools = self.tools_schemas if include_tools else None
         prompt_ids = await self.loop.run_in_executor(
             None,
             lambda: self.tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 tokenize=True,
-                tools=self.tools_schemas,
+                tools=tools,
             ),
         )
         prompt_ids = normalize_token_ids(prompt_ids)

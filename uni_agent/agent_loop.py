@@ -17,6 +17,7 @@ from uni_agent.interaction import (
     ToolsManager,
     ToolsManagerConfig,
 )
+from uni_agent.reflection import ReflectionConfig, Reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
@@ -24,6 +25,9 @@ from uni_agent.tracing import (
     rollout_trace_event,
     rollout_trace_op,
     rollout_trace_score,
+    rollout_trace_span,
+    rollout_trace_update_span,
+    rollout_trace_update_trace,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -48,8 +52,18 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
     return result
 
 
-# trace root, named "rollout"; token-id I/O omitted (huge payloads)
-register_langfuse_op("UniAgentLoop.run", no_io=True, as_type="agent", root=True, name="rollout")
+# trace root; token-id I/O omitted (huge payloads)
+register_langfuse_op("UniAgentLoop.run", no_io=True, as_type="agent", root=True, name="agent_loop")
+
+
+def _termination(trajectory) -> str:
+    """Terminal status of a trajectory: the last step's abnormal exit_reason, else finished/max_turns."""
+    last = trajectory[-1] if trajectory else None
+    return (
+        last.exit_reason
+        if last is not None and last.exit_reason not in ("", "turn_done")
+        else ("finished" if last is not None and last.done else "max_turns")
+    )
 
 
 class UniAgentLoop(AgentLoopBase):
@@ -113,6 +127,32 @@ class UniAgentLoop(AgentLoopBase):
         else:
             self.reward_spec = None
 
+        # trace identity up front: survives even if the final outcome update is lost on kill
+        task_text = next(
+            (m.get("content", "") for m in kwargs.get("raw_prompt") or [] if m.get("role") == "user"), ""
+        )
+        reward_meta = (config_dict.get("reward") or {}).get("metadata") or {}
+        image = ((config_dict.get("env") or {}).get("deployment") or {}).get("image")
+        identity = {
+            "run_id": self.run_id,
+            "uid": kwargs.get("uid"),
+            "data_source": kwargs.get("data_source"),
+            "instance_id": reward_meta.get("instance_id"),
+            "image": image,
+            "model": self.config.actor_rollout_ref.model.path,
+        }
+        rollout_trace_update_trace(
+            input=task_text or None, metadata={k: v for k, v in identity.items() if v is not None}
+        )
+        rollout_trace_update_span(
+            input={
+                "model": self.config.actor_rollout_ref.model.path,
+                "image": image,
+                "max_turns": (config_dict.get("interaction") or {}).get("max_turns"),
+                "tools": [t.get("name") for t in config_dict.get("tools") or [] if isinstance(t, dict)],
+            }
+        )
+
         async with self._semaphore:
             add_file_handler(self.output_dir / "run.log", self.run_id)
 
@@ -127,29 +167,54 @@ class UniAgentLoop(AgentLoopBase):
             setup_timeout = config_dict.get("setup_timeout", 300)
             setup_done = False
             try:
-                async with asyncio.timeout(setup_timeout):
-                    await self.env.start()
+                with rollout_trace_span("rollout", as_type="chain") as rollout_span:
+                    with rollout_trace_span(
+                        "env_setup", metadata={"image": image, "timeout_s": setup_timeout}
+                    ) as env_span:
+                        async with asyncio.timeout(setup_timeout):
+                            await self.env.start()
 
-                    # tools schemas should be visible to the model
-                    # to generate correct tool call format in response
-                    self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
-                    await self.env.install_tools(self.tools_manager.tools)
-                    if self.skills_manager is not None:
-                        await self.env.install_skills(self.skills_manager)
-                        self.interaction.inject_skills_manifest()
+                            # tools schemas should be visible to the model
+                            # to generate correct tool call format in response
+                            self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
+                            await self.env.install_tools(self.tools_manager.tools)
+                            if self.skills_manager is not None:
+                                await self.env.install_skills(self.skills_manager)
+                                self.interaction.inject_skills_manifest()
+                        if env_span is not None:
+                            env_span.update(
+                                output={"status": "ready", "tools_installed": len(self.tools_manager.tools)}
+                            )
 
-                setup_done = True
-                interaction_result = await self.interaction.run()
-                interaction_result["metrics"] = dict(interaction_result.get("rollout_cache", {}).get("metrics", {}))
+                    setup_done = True
+                    interaction_result = await self.interaction.run()
+                    interaction_result["metrics"] = dict(
+                        interaction_result.get("rollout_cache", {}).get("metrics", {})
+                    )
+                    if rollout_span is not None:
+                        trajectory = interaction_result.get("trajectory") or []
+                        rollout_span.update(
+                            output={"turns": len(trajectory), "termination": _termination(trajectory)}
+                        )
 
                 # interaction environment should be visible to the reward spec
                 if self.reward_spec is not None:
                     if should_break("reward"):
                         breakpoint()
-                    reward_score, reward_result = await self.reward_spec.compute_reward(
-                        interaction_result=interaction_result,
-                        env_config=config_dict["env"],
-                    )
+                    with rollout_trace_span("reward", as_type="evaluator") as reward_span:
+                        reward_score, reward_result = await self.reward_spec.compute_reward(
+                            interaction_result=interaction_result,
+                            env_config=config_dict["env"],
+                        )
+                        if reward_span is not None:
+                            reward_span.update(
+                                output={
+                                    "reward_score": reward_score,
+                                    "resolved": (reward_result or {}).get("resolved")
+                                    if isinstance(reward_result, dict)
+                                    else None,
+                                }
+                            )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
                     if isinstance(reward_result, dict):
@@ -166,15 +231,76 @@ class UniAgentLoop(AgentLoopBase):
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
 
+                interaction_result["turn_feedback"] = await self._maybe_reflect(
+                    interaction_result, config_dict, validate=bool(kwargs.get("validate"))
+                )
+                self._record_trace_outcome(interaction_result)
                 self._save_interaction_result(interaction_result)
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
                 exit_reason = "setup_timeout" if not setup_done and isinstance(e, TimeoutError) else "agent_loop_failed"
                 self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {e!r}")
+                outcome = {"termination": exit_reason}
+                rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
                 output = [await self._build_empty_agent_output(exit_reason=exit_reason)]
             finally:
                 await self.env.close()
             return output
+
+    async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
+        """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: diagnosis}."""
+        try:
+            config = ReflectionConfig(**(config_dict.get("reflection") or {}))
+            if not config.enabled or validate:
+                return {}
+            if config.failed_only and interaction_result.get("reward_score"):
+                return {}
+            gold = ((config_dict.get("reward") or {}).get("metadata") or {}).get("patch") or ""
+            feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback") or ""
+            task = next(
+                (m.get("content", "") for m in interaction_result.get("messages") or [] if m.get("role") == "user"),
+                "",
+            )
+            trajectory = interaction_result.get("trajectory") or []
+            steps = {step.step_idx: step for step in trajectory}
+            termination = _termination(trajectory)
+            resolved = bool((interaction_result.get("reward_extra_info") or {}).get("resolved"))
+            outcome = (
+                f"resolved: {resolved} | reward: {interaction_result.get('reward_score')} | "
+                f"termination: {termination} | turns: {len(trajectory)}"
+            )
+            segments = interaction_result.get("segments") or [{"rollout_cache": interaction_result["rollout_cache"]}]
+            # a turn lives in exactly one segment's spans: the union ordered by step is the full turn table
+            turns = sorted(
+                (
+                    {
+                        "step": step_idx,
+                        "tokens": end - start,
+                        "response": steps[step_idx].response,
+                        "tools": [
+                            {"name": r.name, "action": r.action, "observation": r.observation}
+                            for r in steps[step_idx].tool_results
+                        ],
+                    }
+                    for segment in segments
+                    for step_idx, start, end in segment["rollout_cache"].get("turn_spans") or []
+                    if step_idx in steps
+                ),
+                key=lambda turn: turn["step"],
+            )
+            if not turns:
+                return {}
+            from verl.utils.debug_breakpoints import should_break
+
+            if should_break("reflection"):
+                breakpoint()
+            reflector = Reflector(self.chat_model, config, run_id=self.run_id)
+            return await reflector.reflect_trajectory(
+                task=task, turns=turns, gold=gold, feedback=feedback, outcome=outcome
+            )
+        except Exception as e:  # hints are optional supervision; never kill the rollout over them
+            self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
+            return {}
 
     async def _build_empty_agent_output(self, exit_reason: str) -> AgentLoopOutput:
         self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
@@ -201,6 +327,8 @@ class UniAgentLoop(AgentLoopBase):
         extra_fields["traj_exit_reason"] = exit_reason
         if getattr(self, "emit_feedback", False):
             extra_fields["reward_extra_info"] = {"feedback": None}
+        extra_fields["turn_spans"] = []
+        extra_fields["turn_feedback"] = []
         extra_fields["global_steps"] = 0
         extra_fields["min_global_steps"] = 0
         extra_fields["max_global_steps"] = 0
@@ -252,6 +380,20 @@ class UniAgentLoop(AgentLoopBase):
             cls._routing_replay_resolved = True
             self.logger.info(f"routed_experts replay shape resolved: {cls._routing_replay_shape}")
         return cls._routing_replay_shape
+
+    def _record_trace_outcome(self, interaction_result: dict) -> None:
+        """Publish the loop outcome as the trace output (+ filterable metadata)."""
+        trajectory = interaction_result.get("trajectory") or []
+        segments = interaction_result.get("segments")
+        outcome = {
+            "reward_score": interaction_result.get("reward_score"),
+            "resolved": bool((interaction_result.get("reward_extra_info") or {}).get("resolved")),
+            "termination": _termination(trajectory),
+            "turns": len(trajectory),
+            "condensations": max(len(segments) - 1, 0) if segments else 0,
+            "hinted_turns": len(interaction_result.get("turn_feedback") or {}),
+        }
+        rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
 
     def _save_interaction_result(self, interaction_result: dict):
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -407,6 +549,7 @@ class UniAgentLoop(AgentLoopBase):
 
         num_segments = len(segments)
         self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
+        turn_feedback = interaction_result.get("turn_feedback") or {}
         # segments are post-hoc views of work already traced live (segment_index rides on those spans)
         return [
             self._segment_to_output(
@@ -418,6 +561,7 @@ class UniAgentLoop(AgentLoopBase):
                 shared_extra=shared_extra,
                 seg_idx=seg_idx,
                 num_segments=num_segments,
+                turn_feedback=turn_feedback,
             )
             for seg_idx, seg in enumerate(segments)
         ]
@@ -433,6 +577,7 @@ class UniAgentLoop(AgentLoopBase):
         shared_extra: dict,
         seg_idx: int,
         num_segments: int,
+        turn_feedback: dict[int, str] | None = None,
     ) -> AgentLoopOutput:
         """Build one AgentLoopOutput from a single trajectory segment's token buffer."""
         rollout_cache = segment["rollout_cache"]
@@ -465,6 +610,16 @@ class UniAgentLoop(AgentLoopBase):
 
         multi_modal_data = {}
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
+        # per-turn response spans [step_idx, start, end), clamped to the shipped response
+        extra_fields["turn_spans"] = [
+            [step, start, min(end, len(response_ids))]
+            for step, start, end in rollout_cache.get("turn_spans") or []
+            if start < len(response_ids)
+        ]
+        turn_feedback = turn_feedback or {}
+        extra_fields["turn_feedback"] = [
+            [step, turn_feedback[step]] for step, _, _ in extra_fields["turn_spans"] if step in turn_feedback
+        ]
         extra_fields.update(shared_extra)
         extra_fields["segment_index"] = seg_idx
         extra_fields["num_segments"] = num_segments
