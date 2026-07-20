@@ -12,8 +12,12 @@ try:
         rollout_trace_op,
         rollout_trace_score,
         rollout_trace_set_attr,
+        rollout_trace_span,
+        rollout_trace_update_span,
+        rollout_trace_update_trace,
     )
 except ImportError:
+    import contextlib
 
     def rollout_trace_op(func):
         return func
@@ -33,6 +37,16 @@ except ImportError:
     def rollout_trace_set_attr(*args, **kwargs):
         pass
 
+    @contextlib.contextmanager
+    def rollout_trace_span(*args, **kwargs):
+        yield None
+
+    def rollout_trace_update_span(*args, **kwargs):
+        pass
+
+    def rollout_trace_update_trace(*args, **kwargs):
+        pass
+
 
 __all__ = [
     "register_langfuse_op",
@@ -41,4 +55,7 @@ __all__ = [
     "rollout_trace_op",
     "rollout_trace_score",
     "rollout_trace_set_attr",
+    "rollout_trace_span",
+    "rollout_trace_update_span",
+    "rollout_trace_update_trace",
 ]

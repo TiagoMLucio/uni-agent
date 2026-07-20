@@ -71,10 +71,13 @@ def _step_span_update(result):
     if not hasattr(result, "model_dump"):
         return {"output": result}
     dumped = result.model_dump()
+    tool_results = dumped.get("tool_results") or []
     output = {
         "exit_reason": dumped.get("exit_reason"),
         "done": dumped.get("done"),
-        "n_tools": len(dumped.get("tool_results") or []),
+        "n_tools": len(tool_results),
+        "tools": [t.get("name") for t in tool_results],
+        "response_chars": len(dumped.get("response") or ""),
     }
     return {"output": output}
 
@@ -240,6 +243,11 @@ class AgentInteraction:
                     return step_output
 
         step_output.response = model_output
+        # turn table: this step's response span within the active segment buffer
+        span_end = len(rollout_cache["response_mask"])
+        rollout_cache.setdefault("turn_spans", []).append(
+            [step_idx, span_end - generation_info["completion_tokens"], span_end]
+        )
         self.logger.info(
             f"Prompt Tokens: {generation_info['prompt_tokens']}, "
             f"Completion Tokens: {generation_info['completion_tokens']}"
@@ -466,9 +474,13 @@ class AgentInteraction:
         """Materialize the overflowing buffer as a segment (when it produced tokens),
         condense the history, and re-seat a fresh buffer from the condensed messages so
         the next generation continues into a new segment."""
+        if _should_break("condense"):
+            breakpoint()
         if len(self.rollout_cache.get("response_mask", [])) > 0:
             self._materialize_segment()
         budget = self._condense_budget(attempt)
+        n_messages_before = len(self.messages)
+        n_tokens_before = len(self.rollout_cache.get("prompt_ids", []))
         self.messages = self.condenser.condense(
             self.messages, budget, arg_masker=self.tools_manager.mask_tool_args
         )
@@ -481,7 +493,8 @@ class AgentInteraction:
         rollout_trace_event(
             "condensation",
             metadata={"segment_index": seg_idx, "attempt": attempt, "budget": budget},
-            input=f"context overflow on attempt {attempt}; freeing ~{budget} chars",
+            input=f"context overflow on attempt {attempt} at {n_messages_before} messages / "
+            f"{n_tokens_before} prompt tokens; freeing ~{budget} chars",
             output=f"re-seated to {len(self.messages)} messages / {n_after} prompt tokens (segment {seg_idx})",
         )
 
@@ -514,6 +527,12 @@ class AgentInteraction:
                     break
                 if self.check_stuck():
                     self.logger.error(f"Exit due to stuck loop: {self.stuck_threshold} identical responses")
+                    rollout_trace_event(
+                        "stuck_abort",
+                        metadata={"threshold": self.stuck_threshold, "step_idx": step_idx},
+                        input=f"{self.stuck_threshold} consecutive identical responses",
+                        output=(step_output.response or "")[:500],
+                    )
                     step_output = StepOutput(step_idx=step_idx, exit_reason="stuck")
                     self.trajectory.append(step_output)
                     break
