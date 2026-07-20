@@ -263,10 +263,16 @@ class SshPodmanDeployment(AbstractDeployment):
         self._local_port = None
         self._remote_port = None
         if self._container_name is not None and self._master is not None and self._master.docker is not None:
-            try:
-                await asyncio.to_thread(self._master.docker.containers.get(self._container_name).remove, force=True)
-            except Exception as exc:
-                self.logger.error(f"Failed to remove remote sandbox {self._container_name}: {exc}")
+            # rootless podman netns teardown fails transiently under concurrent ops; container TTL is the backstop
+            for attempt, delay in enumerate((0, 3, 9), start=1):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    await asyncio.to_thread(self._master.docker.containers.get(self._container_name).remove, force=True)
+                    break
+                except Exception as exc:
+                    log = self.logger.error if attempt == 3 else self.logger.warning
+                    log(f"Failed to remove remote sandbox {self._container_name} (attempt {attempt}/3): {exc}")
             self._container_name = None
         self._stopped = True
 
