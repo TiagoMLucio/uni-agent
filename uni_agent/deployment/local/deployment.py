@@ -14,7 +14,6 @@ from swerex.deployment.abstract import AbstractDeployment
 from swerex.deployment.hooks.abstract import CombinedDeploymentHook, DeploymentHook
 from swerex.exceptions import DeploymentNotStartedError
 from swerex.runtime.abstract import Command, CreateBashSessionRequest, IsAliveResponse, UploadRequest
-from swerex.utils.wait import _wait_until_alive
 
 from uni_agent.async_logging import get_logger
 from uni_agent.deployment.config import LocalDeploymentConfig
@@ -119,12 +118,19 @@ class LocalDeployment(AbstractDeployment):
         return await self._runtime.is_alive(timeout=timeout)
 
     async def _wait_until_alive(self, timeout: float) -> IsAliveResponse:
-        try:
-            return await _wait_until_alive(self.is_alive, timeout=timeout, function_timeout=0.5)
-        except TimeoutError as e:
-            self.logger.error("Local runtime did not start within timeout.")
-            await self.stop()
-            raise e
+        # swerex's _wait_until_alive polls with a blocking time.sleep, freezing the shared
+        # event loop under concurrent startups; re-implemented with `await asyncio.sleep`
+        loop = asyncio.get_event_loop()
+        end = loop.time() + timeout
+        last: IsAliveResponse | None = None
+        while loop.time() < end:
+            last = await self.is_alive(timeout=5.0)
+            if last:
+                return last
+            await asyncio.sleep(0.5)
+        raise TimeoutError(
+            f"Local runtime did not start within {timeout}s; last={getattr(last, 'message', last)}"
+        )
 
     def _get_token(self) -> str:
         return str(uuid.uuid4())
