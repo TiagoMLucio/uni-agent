@@ -183,16 +183,18 @@ class LocalDeployment(AbstractDeployment):
         ip_address = result.stdout.strip()
         return ip_address or None
 
-    def _get_runtime_host(self, container_name: str) -> str:
+    def _resolve_runtime_endpoint(self, container_name: str, published_port: int) -> tuple[str, int]:
+        """Host and port the runtime is reachable at: the container IP serves the
+        runtime port directly, while localhost goes through the published mapping."""
         if self._config.host:
-            return self._config.host
+            return self._config.host, published_port
 
         if _is_running_in_container() or self._config.network:
             container_ip = self._get_container_ip(container_name)
             if container_ip:
-                return f"http://{container_ip}"
+                return f"http://{container_ip}", self._config.runtime_port
 
-        return "http://127.0.0.1"
+        return "http://127.0.0.1", published_port
 
     def _format_command(self, token: str, port: int) -> str:
         return self._config.command.format(token=token, port=port)
@@ -281,11 +283,11 @@ class LocalDeployment(AbstractDeployment):
             self._runtime_exec, self._build_run_command(container_name, published_port, command)
         )
         self._container_id = result.stdout.strip()
-        host = await asyncio.to_thread(self._get_runtime_host, container_name)
+        host, port = await asyncio.to_thread(self._resolve_runtime_endpoint, container_name, published_port)
         runtime_config = LocalRuntimeConfig(
             auth_token=token,
             host=host,
-            port=self._config.runtime_port,
+            port=port,
             timeout=self._config.timeout,
         )
         self._runtime = LocalRuntime.from_config(runtime_config, run_id=self.run_id)
