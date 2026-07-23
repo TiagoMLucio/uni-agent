@@ -215,6 +215,9 @@ class LocalDeployment(AbstractDeployment):
             "-d",
             "--name",
             container_name,
+            # disposable sandbox: skip the SIGTERM grace period on stop/remove
+            "--stop-signal",
+            "SIGKILL",
             "--entrypoint",
             self._config.shell,
         ]

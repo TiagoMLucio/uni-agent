@@ -178,6 +178,8 @@ class SshPodmanDeployment(AbstractDeployment):
             name=name,
             detach=True,
             auto_remove=True,
+            # disposable sandbox: skip the SIGTERM grace period on stop/remove
+            stop_signal="SIGKILL",
             ports={f"{self._config.runtime_port}/tcp": ("127.0.0.1", None)},
         )
         container.reload()
