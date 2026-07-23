@@ -211,9 +211,11 @@ class RemoteRuntime(AbstractRuntime):
         backoff_max = 30
         timeout = self._get_timeout()
 
+        # the HTTP timeout must outlast the in-session command it carries, else long
+        # commands (evals, slow tool calls) are aborted at the transport layer
         command_timeout = getattr(payload, "timeout", None)
-        if command_timeout and command_timeout > timeout:
-            self.logger.warning(f"Command timeout {command_timeout} is larger than runtime timeout {timeout}")
+        if command_timeout:
+            timeout = max(timeout, command_timeout + 30)
 
         while num_retries >= 0 and client_error_retries >= 0:
             try:
