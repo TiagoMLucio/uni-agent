@@ -149,7 +149,11 @@ class DashboardMonitor:
                 if not entry.is_dir():
                     continue
                 seen_run_ids.add(entry.name)
-                self._scan_run(Path(entry.path))
+                try:
+                    self._scan_run(Path(entry.path))
+                except OSError:
+                    # a live log dir races with whatever writes it; drop this round
+                    seen_run_ids.discard(entry.name)
 
             removed_run_ids = sorted(set(self.runs) - seen_run_ids)
             for run_id in removed_run_ids:
