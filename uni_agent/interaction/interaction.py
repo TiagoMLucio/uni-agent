@@ -234,7 +234,8 @@ class AgentInteraction:
                     return step_output
                 self.logger.warning("{}", _msg)
                 try:
-                    await self._condense_and_reseat(attempt)
+                    with simple_timer("condense", self.rollout_cache["metrics"]):
+                        await self._condense_and_reseat(attempt)
                     self.logger.info(f"Condensed context (attempt {attempt + 1}); retrying generation.")
                 except CondensationFailed as ce:
                     self.logger.error(f"Condensation failed: {ce}")
@@ -271,7 +272,8 @@ class AgentInteraction:
                     tool_calls_data=tool_calls,
                 )
             else:
-                content, tool_calls = await self.tools_manager.parse_action(model_output=model_output)
+                with simple_timer("parse_action", self.rollout_cache["metrics"]):
+                    content, tool_calls = await self.tools_manager.parse_action(model_output=model_output)
             if not tool_calls and not self.chat_mode:
                 raise FunctionCallFormatError("No function call found in the response.")
         except FunctionCallFormatError as e:
@@ -288,7 +290,10 @@ class AgentInteraction:
             else:
                 error_msgs = [{"role": "tool", "content": str(e)}]
             self.messages.extend(error_msgs)
-            self.rollout_cache = await self.model.append_messages_to_rollout_cache(error_msgs, self.rollout_cache)
+            with simple_timer("tokenize_observations", self.rollout_cache["metrics"]):
+                self.rollout_cache = await self.model.append_messages_to_rollout_cache(
+                    error_msgs, self.rollout_cache
+                )
             step_output.exit_reason = "format_error"
             model_output_preview = "\n".join(model_output.splitlines()[:20])
             _msg = (
@@ -367,7 +372,8 @@ class AgentInteraction:
 
         # step 6: commit collected tool messages
         self.messages.extend(tool_messages)
-        self.rollout_cache = await self.model.append_messages_to_rollout_cache(tool_messages, self.rollout_cache)
+        with simple_timer("tokenize_observations", self.rollout_cache["metrics"]):
+            self.rollout_cache = await self.model.append_messages_to_rollout_cache(tool_messages, self.rollout_cache)
         step_output.tool_results = tool_results
 
         # step 7: step-level exit_reason (precedence: terminal_dead >
@@ -484,7 +490,11 @@ class AgentInteraction:
         self.messages = self.condenser.condense(
             self.messages, budget, arg_masker=self.tools_manager.mask_tool_args
         )
+        carried_metrics = self.rollout_cache.get("metrics", {})
         self.rollout_cache = await self.model.prepare_rollout_cache(self.messages)
+        # the fresh buffer starts with empty metrics: carry the dict so timings stay
+        # per-trajectory (and so timers holding the old reference keep writing somewhere live)
+        self.rollout_cache["metrics"] = carried_metrics
         self.segment_start_messages = list(self.messages)
         # mark the condensation boundary; later op spans carry the new segment index
         seg_idx = len(self.segments)

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import pickle
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,7 @@ class UniAgentLoop(AgentLoopBase):
             setup_done = False
             try:
                 with rollout_trace_span("rollout", as_type="chain") as rollout_span:
+                    env_setup_t0 = time.perf_counter()
                     with rollout_trace_span(
                         "env_setup", metadata={"image": image, "timeout_s": setup_timeout}
                     ) as env_span:
@@ -187,10 +189,15 @@ class UniAgentLoop(AgentLoopBase):
                             )
 
                     setup_done = True
+                    env_setup_s = time.perf_counter() - env_setup_t0
                     interaction_result = await self.interaction.run()
                     interaction_result["metrics"] = dict(
                         interaction_result.get("rollout_cache", {}).get("metrics", {})
                     )
+                    # env setup and reward run outside the turn loop, so they are invisible in
+                    # execution_time; without them a trajectory's wall clock cannot be accounted for
+                    interaction_result["metrics"]["env_setup"] = env_setup_s
+                    interaction_result["metrics"]["loop_wall"] = interaction_result.get("execution_time", 0.0)
                     if rollout_span is not None:
                         trajectory = interaction_result.get("trajectory") or []
                         rollout_span.update(
@@ -201,6 +208,7 @@ class UniAgentLoop(AgentLoopBase):
                 if self.reward_spec is not None:
                     if should_break("reward"):
                         breakpoint()
+                    reward_t0 = time.perf_counter()
                     with rollout_trace_span("reward", as_type="evaluator") as reward_span:
                         reward_score, reward_result = await self.reward_spec.compute_reward(
                             interaction_result=interaction_result,
@@ -215,6 +223,14 @@ class UniAgentLoop(AgentLoopBase):
                                     else None,
                                 }
                             )
+                    interaction_result["metrics"]["reward_eval"] = time.perf_counter() - reward_t0
+                    if isinstance(reward_result, dict):
+                        interaction_result["metrics"]["eval_completed"] = float(
+                            bool(reward_result.get("eval_completed", True))
+                        )
+                        interaction_result["metrics"]["patch_apply_failed"] = float(
+                            bool(reward_result.get("patch_apply_failed", False))
+                        )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
                     if isinstance(reward_result, dict):
@@ -231,9 +247,11 @@ class UniAgentLoop(AgentLoopBase):
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
 
+                reflect_t0 = time.perf_counter()
                 interaction_result["turn_feedback"] = await self._maybe_reflect(
                     interaction_result, config_dict, validate=bool(kwargs.get("validate"))
                 )
+                interaction_result["metrics"]["reflect"] = time.perf_counter() - reflect_t0
                 self._record_trace_outcome(interaction_result)
                 self._save_interaction_result(interaction_result)
                 output = await self.convert_to_agent_output(interaction_result)
@@ -533,6 +551,9 @@ class UniAgentLoop(AgentLoopBase):
         shared_extra: dict[str, Any] = {
             "traj_masked": int(should_mask_traj),
             "traj_exit_reason": traj_exit_reason,
+            # AgentLoopMetrics is a fixed schema the sync trainer never surfaces, so the
+            # per-trajectory timings ride along here instead
+            "timings": {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
         }
         if self.emit_feedback:
             reward_extra_info = interaction_result.get("reward_extra_info") or {}
