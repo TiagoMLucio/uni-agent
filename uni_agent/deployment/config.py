@@ -79,6 +79,8 @@ class LocalDeploymentConfig(BaseModel):
     """Optional Docker network to attach the sandbox to."""
     shell: str = "/bin/bash"
     """Shell executable used as the container entrypoint."""
+    shell_args: list[str] = Field(default_factory=lambda: ["-lc"])
+    """Args before the startup command. "-c" skips the login profile (conda init, /etc/profile.d)."""
     extra_run_args: list[str] = Field(default_factory=list)
     """Extra args appended to the container runtime startup command."""
 

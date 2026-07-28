@@ -226,7 +226,7 @@ class LocalDeployment(AbstractDeployment):
             args.extend(["--network", network])
         args.extend(["-p", f"{published_port}:{self._config.runtime_port}"])
         args.extend(self._config.extra_run_args)
-        args.extend([self._config.image, "-lc", command])
+        args.extend([self._config.image, *self._config.shell_args, command])
         return args
 
     def _build_apptainer_command(self, command: str) -> list[str]:
@@ -237,7 +237,7 @@ class LocalDeployment(AbstractDeployment):
             "--compat",
         ]
         args.extend(self._config.extra_run_args)
-        args.extend([_normalize_apptainer_image(self._config.image), self._config.shell, "-lc", command])
+        args.extend([_normalize_apptainer_image(self._config.image), self._config.shell, *self._config.shell_args, command])
         return args
 
     def _get_container_logs(self, container_name: str) -> str:
