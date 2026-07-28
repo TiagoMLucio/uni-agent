@@ -100,6 +100,7 @@ class LocalDeployment(AbstractDeployment):
         self._server_log_path: Path | None = None
         self._server_log_handle: Any | None = None
         self._stopped = False
+        self.startup_timings: dict[str, float] = {}
 
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
@@ -334,9 +335,15 @@ class LocalDeployment(AbstractDeployment):
                     CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=60)
                 )
                 # container = image pull + unpack + start; serve = the swerex bootstrap inside it
+                self.startup_timings = {
+                    "container": t_container - t0,
+                    "serve": t_alive - t_container,
+                    "session": time.perf_counter() - t_alive,
+                }
                 self.logger.info(
-                    f"sandbox startup: container={t_container - t0:.1f}s serve={t_alive - t_container:.1f}s "
-                    f"session={time.perf_counter() - t_alive:.1f}s image={self._config.image}"
+                    "sandbox startup: "
+                    + " ".join(f"{k}={v:.1f}s" for k, v in self.startup_timings.items())
+                    + f" image={self._config.image}"
                 )
                 self._stopped = False
                 return
