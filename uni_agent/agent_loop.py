@@ -273,6 +273,9 @@ class UniAgentLoop(AgentLoopBase):
                 return {}
             if config.failed_only and interaction_result.get("reward_score"):
                 return {}
+            # hinting a trajectory whose eval never ran would teach against an unknown label
+            if (interaction_result.get("metrics") or {}).get("eval_completed", 1.0) < 1.0:
+                return {}
             gold = ((config_dict.get("reward") or {}).get("metadata") or {}).get("patch") or ""
             feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback") or ""
             task = next(
@@ -545,8 +548,12 @@ class UniAgentLoop(AgentLoopBase):
         trajectory = interaction_result.get("trajectory", [])
         num_turns = len(trajectory)
         traj_exit_reason = trajectory[-1].exit_reason if num_turns > 0 else "unknown"
-        should_mask_traj = self.mask_abnormal_exit_traj and traj_exit_reason != "finished"
         metrics = interaction_result.get("metrics", {})
+        # an eval that never ran scores resolved=False, which is indistinguishable from a real failure
+        eval_incomplete = metrics.get("eval_completed", 1.0) < 1.0
+        should_mask_traj = eval_incomplete or (
+            self.mask_abnormal_exit_traj and traj_exit_reason != "finished"
+        )
 
         shared_extra: dict[str, Any] = {
             "traj_masked": int(should_mask_traj),
