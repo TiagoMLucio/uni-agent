@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Self
@@ -316,6 +317,7 @@ class LocalDeployment(AbstractDeployment):
             self._container_name = container_name
 
             try:
+                t0 = time.perf_counter()
                 if _is_apptainer_runtime(self._config.container_runtime):
                     await self._start_apptainer(token=token, published_port=published_port)
                 else:
@@ -325,9 +327,16 @@ class LocalDeployment(AbstractDeployment):
                         published_port=published_port,
                     )
 
+                t_container = time.perf_counter()
                 await self._wait_until_alive(timeout=self._config.startup_timeout)
+                t_alive = time.perf_counter()
                 await self.runtime.create_session(
                     CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=60)
+                )
+                # container = image pull + unpack + start; serve = the swerex bootstrap inside it
+                self.logger.info(
+                    f"sandbox startup: container={t_container - t0:.1f}s serve={t_alive - t_container:.1f}s "
+                    f"session={time.perf_counter() - t_alive:.1f}s image={self._config.image}"
                 )
                 self._stopped = False
                 return
