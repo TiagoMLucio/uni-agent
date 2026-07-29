@@ -24,9 +24,17 @@ def test_ansi_is_stripped_from_normal_output():
     assert AgentEnv._format_observation("\x1b[32mok\x1b[0m\r", 1000, EMPTY) == "Observation:\nok"
 
 
-def test_over_limit_is_clipped_with_positive_elided_count():
-    raw = "a" * 50
+def test_over_limit_keeps_both_ends_with_positive_elided_count():
+    raw = "a" * 25 + "b" * 25
     out = AgentEnv._format_observation(raw, 10, EMPTY)
-    assert out.startswith("Observation:\n" + "a" * 10 + "<response clipped>")
-    assert "40 were elided" in out  # 50 - 10, never negative
+    assert out.startswith("Observation:\n" + "a" * 5)
+    assert "40 characters elided from the middle" in out  # 50 - 10, never negative
+    assert out.split("<response clipped")[1].endswith("b" * 5 + "\n<NOTE>" + out.split("<NOTE>")[1])
     assert "<NOTE>" in out
+
+
+def test_over_limit_preserves_the_tail():
+    # a test run's verdict is its last line; head-only truncation deletes it
+    raw = "noise\n" * 500 + "3 failed, 12 passed"
+    out = AgentEnv._format_observation(raw, 200, EMPTY)
+    assert "3 failed, 12 passed" in out
