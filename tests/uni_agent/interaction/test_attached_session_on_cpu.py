@@ -78,3 +78,24 @@ def test_control_keys_detach(key):
     env.deployment.runtime.script = [_Obs("", "")]
     _run(AgentEnv.send_input.__wrapped__(env, key, action_timeout=90))
     assert env.attached_command is None
+
+
+def test_stale_prompt_triggers_one_follow_up_read():
+    # the timed-out command left its prompt unread, so the first match consumes that
+    # one and returns nothing; a second read must pick up the real output
+    env = _env()
+    env.attached_command = "python"
+    env.deployment.runtime.script = [_Obs("", ">>> $"), _Obs("42", ">>> $")]
+    out = _run(AgentEnv.send_input.__wrapped__(env, "print(6*7)", action_timeout=15))
+    assert "42" in out
+    assert env.attached_command == "python"  # still in the REPL
+
+
+def test_no_follow_up_read_after_a_confirmation_prompt():
+    # a bare newline would be read as the default answer, so never re-read these
+    env = _env()
+    env.attached_command = "apt install foo"
+    env.deployment.runtime.script = [_Obs("", r"\[Y/n\]"), _Obs("SHOULD-NOT-BE-READ", "PS1")]
+    out = _run(AgentEnv.send_input.__wrapped__(env, "n", action_timeout=15))
+    assert "SHOULD-NOT-BE-READ" not in out
+    assert env.attached_command == "apt install foo"

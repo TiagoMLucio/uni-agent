@@ -23,18 +23,23 @@ from uni_agent.utils import auto_await
 
 # A program awaiting input never prints the shell's PS1, so interactive sends must also
 # expect the program's own prompt or they wait out the full timeout and return nothing.
-INTERACTIVE_PROMPTS = [
+# REPL prompts are re-issued for a bare newline, so an extra read is safe; a confirmation
+# prompt would read that newline as its default answer, so those are never re-read.
+REPL_PROMPTS = [
     r">>> $",            # python
     r"\.\.\. $",         # python continuation
     r"\(Pdb\) $",        # pdb
     r"ipdb> $",
     r"In \[\d+\]: $",    # ipython
+]
+CONFIRM_PROMPTS = [
     r"\[Y/n\]",          # apt and friends
     r"\[y/N\]",
     r"\(y/n\)",
     r"File to patch: $",
     r"\? $",
 ]
+INTERACTIVE_PROMPTS = REPL_PROMPTS + CONFIRM_PROMPTS
 
 
 class ActionTimeoutError(Exception):
@@ -312,14 +317,34 @@ class AgentEnv:
                 "running or waiting for input. Send more input, wait, send 'C-c' (is_input=true) to interrupt "
                 "it, or 'C-d' to send EOF."
             )
+        matched = getattr(r, "expect_string", "")
+        output = r.output
+        # The prompt left unread by the timed-out command is still buffered, so this
+        # first match consumed that one and returned everything before it: nothing.
+        # One more read lands on the prompt that follows the actual output.
+        if not (output or "").strip() and matched in REPL_PROMPTS:
+            try:
+                r2 = await self.deployment.runtime.run_in_session(
+                    BashAction(
+                        command="",
+                        timeout=action_timeout,
+                        is_interactive_command=True,
+                        check="ignore",
+                        expect=INTERACTIVE_PROMPTS,
+                    )
+                )
+                output, matched = r2.output, getattr(r2, "expect_string", "")
+            except CommandTimeoutError:
+                pass
         # a matched shell PS1 means the program exited and the session is free again;
         # matching one of INTERACTIVE_PROMPTS means it is still waiting on us
-        if getattr(r, "expect_string", "") not in INTERACTIVE_PROMPTS:
+        if matched not in INTERACTIVE_PROMPTS:
             self.attached_command = None
         return self._format_observation(
-            r.output,
+            output,
             max_observation_length,
-            empty_message="Your input was sent; the program produced no output yet.",
+            empty_message="Your input was sent; the program produced no output yet. "
+            "Send an empty command to collect more output.",
         )
 
     @auto_await
