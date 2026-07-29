@@ -99,3 +99,39 @@ def test_no_follow_up_read_after_a_confirmation_prompt():
     out = _run(AgentEnv.send_input.__wrapped__(env, "n", action_timeout=15))
     assert "SHOULD-NOT-BE-READ" not in out
     assert env.attached_command == "apt install foo"
+
+
+def test_no_follow_up_read_at_a_continuation_prompt():
+    # a newline at "..." ends the block: re-reading turned `if True:` into a SyntaxError
+    env = _env()
+    env.attached_command = "python"
+    env.deployment.runtime.script = [_Obs("", r"\.\.\. $"), _Obs("SHOULD-NOT-BE-READ", ">>> $")]
+    out = _run(AgentEnv.send_input.__wrapped__(env, "if True:", action_timeout=15))
+    assert "SHOULD-NOT-BE-READ" not in out
+
+
+def test_no_follow_up_read_at_a_pdb_prompt():
+    # a newline at "(Pdb)" repeats the previous command
+    env = _env()
+    env.attached_command = "python"
+    env.deployment.runtime.script = [_Obs("", r"\(Pdb\) $"), _Obs("SHOULD-NOT-BE-READ", ">>> $")]
+    out = _run(AgentEnv.send_input.__wrapped__(env, "n", action_timeout=15))
+    assert "SHOULD-NOT-BE-READ" not in out
+
+
+def test_interactive_send_timeout_is_capped():
+    # a program with no prompt can never match, so an uncapped send burns action_timeout
+    from uni_agent.interaction.env import INTERACTIVE_SEND_TIMEOUT
+
+    seen = {}
+
+    class _Rt:
+        async def run_in_session(self, action):
+            seen["timeout"] = action.timeout
+            return _Obs("ok", "PS1")
+
+    env = _env()
+    env.attached_command = "cat"
+    env.deployment.runtime = _Rt()
+    _run(AgentEnv.send_input.__wrapped__(env, "hello", action_timeout=900))
+    assert seen["timeout"] == INTERACTIVE_SEND_TIMEOUT

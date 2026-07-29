@@ -23,23 +23,31 @@ from uni_agent.utils import auto_await
 
 # A program awaiting input never prints the shell's PS1, so interactive sends must also
 # expect the program's own prompt or they wait out the full timeout and return nothing.
-# REPL prompts are re-issued for a bare newline, so an extra read is safe; a confirmation
-# prompt would read that newline as its default answer, so those are never re-read.
-REPL_PROMPTS = [
+# Only these treat a bare newline as a no-op, so only these may be read a second time to
+# get past a prompt the timed-out command left buffered. Elsewhere a newline MEANS
+# something: it ends a block at "...", repeats the last command at "(Pdb)", and answers
+# the default at "[Y/n]".
+REREADABLE_PROMPTS = [
     r">>> $",            # python
-    r"\.\.\. $",         # python continuation
-    r"\(Pdb\) $",        # pdb
-    r"ipdb> $",
     r"In \[\d+\]: $",    # ipython
 ]
-CONFIRM_PROMPTS = [
-    r"\[Y/n\]",          # apt and friends
+OTHER_PROMPTS = [
+    r"\.\.\. $",         # python continuation: a newline ends the block
+    r"\(Pdb\) $",        # pdb: a newline repeats the last command
+    r"ipdb> $",
+    r"\[Y/n\]",          # apt and friends: a newline answers the default
     r"\[y/N\]",
     r"\(y/n\)",
     r"File to patch: $",
     r"\? $",
 ]
-INTERACTIVE_PROMPTS = REPL_PROMPTS + CONFIRM_PROMPTS
+INTERACTIVE_PROMPTS = REREADABLE_PROMPTS + OTHER_PROMPTS
+
+# Interactive sends are conversational round trips (measured: 50-110ms against a live
+# REPL). A program with no prompt at all can never match, so without a ceiling every
+# such send would burn the full action_timeout; the model can send an empty command to
+# keep waiting.
+INTERACTIVE_SEND_TIMEOUT = 15
 
 
 class ActionTimeoutError(Exception):
@@ -301,11 +309,12 @@ class AgentEnv:
                 empty_message="Sent interrupt (C-c) to the running process.",
             )
 
+        send_timeout = min(action_timeout, INTERACTIVE_SEND_TIMEOUT)
         try:
             r = await self.deployment.runtime.run_in_session(
                 BashAction(
                     command=payload,
-                    timeout=action_timeout,
+                    timeout=send_timeout,
                     is_interactive_command=True,
                     check="ignore",
                     expect=INTERACTIVE_PROMPTS,
@@ -313,21 +322,21 @@ class AgentEnv:
             )
         except CommandTimeoutError:
             return (
-                f"The interactive program did not return within {action_timeout} seconds; it may still be "
-                "running or waiting for input. Send more input, wait, send 'C-c' (is_input=true) to interrupt "
-                "it, or 'C-d' to send EOF."
+                f"The interactive program did not return within {send_timeout} seconds; it may still be "
+                "running or waiting for input. Send an empty command to keep waiting, send more input, "
+                "send 'C-c' (is_input=true) to interrupt it, or 'C-d' to send EOF."
             )
         matched = getattr(r, "expect_string", "")
         output = r.output
         # The prompt left unread by the timed-out command is still buffered, so this
         # first match consumed that one and returned everything before it: nothing.
         # One more read lands on the prompt that follows the actual output.
-        if not (output or "").strip() and matched in REPL_PROMPTS:
+        if not (output or "").strip() and matched in REREADABLE_PROMPTS:
             try:
                 r2 = await self.deployment.runtime.run_in_session(
                     BashAction(
                         command="",
-                        timeout=action_timeout,
+                        timeout=send_timeout,
                         is_interactive_command=True,
                         check="ignore",
                         expect=INTERACTIVE_PROMPTS,
