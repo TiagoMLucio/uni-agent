@@ -45,9 +45,10 @@ INTERACTIVE_PROMPTS = REREADABLE_PROMPTS + OTHER_PROMPTS
 
 # Interactive sends are conversational round trips (measured: 50-110ms against a live
 # REPL). A program with no prompt at all can never match, so without a ceiling every
-# such send would burn the full action_timeout; the model can send an empty command to
-# keep waiting.
-INTERACTIVE_SEND_TIMEOUT = 15
+# such send would burn the full action_timeout. Erring short is cheap: overshooting
+# wastes step wall clock, while undershooting costs one polling turn, since the model
+# can send an empty command to keep waiting and the session stays attached.
+INTERACTIVE_SEND_TIMEOUT = 8
 
 
 class ActionTimeoutError(Exception):
