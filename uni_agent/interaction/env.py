@@ -21,6 +21,22 @@ from uni_agent.tools.base import AbstractTool
 from uni_agent.utils import auto_await
 
 
+# A program awaiting input never prints the shell's PS1, so interactive sends must also
+# expect the program's own prompt or they wait out the full timeout and return nothing.
+INTERACTIVE_PROMPTS = [
+    r">>> $",            # python
+    r"\.\.\. $",         # python continuation
+    r"\(Pdb\) $",        # pdb
+    r"ipdb> $",
+    r"In \[\d+\]: $",    # ipython
+    r"\[Y/n\]",          # apt and friends
+    r"\[y/N\]",
+    r"\(y/n\)",
+    r"File to patch: $",
+    r"\? $",
+]
+
+
 class ActionTimeoutError(Exception):
     pass
 
@@ -82,6 +98,9 @@ class AgentEnv:
         self.post_setup_cmd = env_config.post_setup_cmd
         self.tool_install_dir = env_config.tool_install_dir
         self.logger = get_logger("environment", run_id)
+        # command still attached to the session after a timeout; while set, only input
+        # may be sent, so a new command is never typed into a running program
+        self.attached_command: str | None = None
 
     @auto_await
     async def start(self, max_retries: int = 5) -> None:
@@ -186,10 +205,16 @@ class AgentEnv:
         if cleaned == "":
             return empty_message
         if len(cleaned) > max_observation_length:
+            # keep both ends: a test run's verdict is its last lines, and head-only
+            # truncation deletes exactly that
+            head = max_observation_length // 2
+            tail = max_observation_length - head
             elided = len(cleaned) - max_observation_length
             return (
-                f"Observation:\n{cleaned[:max_observation_length]}<response clipped>\n"
-                f"<NOTE>Observation exceeded {max_observation_length} characters; {elided} were elided. "
+                f"Observation:\n{cleaned[:head]}\n"
+                f"<response clipped: {elided} characters elided from the middle>\n"
+                f"{cleaned[-tail:]}\n"
+                f"<NOTE>Observation exceeded {max_observation_length} characters. "
                 "Run a command that produces less output, or pipe through head/tail/grep or redirect to a "
                 "file. Do not use interactive pagers.</NOTE>"
             )
@@ -201,34 +226,15 @@ class AgentEnv:
         try:
             observation = await self.communicate(input=action_cmd, timeout=action_timeout, check="ignore")
         except CommandTimeoutError:
-            # interrupt timeout action
-            # if terminal is still alive after interrupt, raise error
-            try:
-                await self.interrupt_session()
-            except Exception:
-                self.logger.error("Failed to interrupt session after command timeout")
-                # check current terminal is still alive
-                terminal_alive = False
-                for _ in range(5):
-                    probe_output = await self.communicate("echo 'terminal still alive'", check="ignore")
-                    # Use substring match on stripped lines so residual marker
-                    # noise from a recovering session does not fail the probe.
-                    if isinstance(probe_output, str) and any(
-                        line.strip() == "terminal still alive" for line in probe_output.splitlines()
-                    ):
-                        terminal_alive = True
-                        break
-                if not terminal_alive:
-                    error_message = "Terminal did not respond to health checks"
-                    self.logger.critical(error_message)
-                    raise TerminalNotAliveError(error_message) from None
-
-            # if terminal is still alive, return timeout observation
+            # the command keeps running: killing it here would destroy the state that
+            # is_input exists to reach. Mark the session attached instead; the next
+            # non-input command is refused rather than typed into the running program.
+            self.attached_command = action_cmd
             observation = (
-                f"The command '{action_cmd}' was cancelled because it took more than {action_timeout} seconds. "
-                "Please try a different command that completes more quickly. Note: A common source of this error is "
-                "if the command is interactive or requires user input (it is impossible to receive user input "
-                "in the current environment, so the command will never complete)."
+                f"The command '{action_cmd}' is still running but the {action_timeout}s timeout was hit. "
+                "You can now send input to it with is_input=true, wait for more output by sending an empty "
+                'command, cancel it by sending "C-c", or send "C-d" for EOF. It has NOT been stopped, so a '
+                "new command cannot be run until this one finishes or is cancelled."
             )
             raise ActionTimeoutError(observation) from None
 
@@ -253,18 +259,37 @@ class AgentEnv:
     async def send_input(self, payload: str, action_timeout: int, max_observation_length: int = 100_000) -> str:
         """Send input to a program already running in the persistent session.
 
-        ``payload == "C-c"`` interrupts the running process; any other payload is
-        sent as a line of input via SWE-ReX's interactive-command mode (no exit
-        code / PS1 seek). A timeout here is benign (the program is still running or
-        awaiting more input) and does NOT interrupt the session. Only ``C-c`` is
-        special-cased; SWE-ReX exposes no clean per-key API for ``C-d`` / ``C-z``.
+        ``payload == "C-c"`` interrupts the running process, ``"C-d"`` sends EOF (a
+        REPL ignores SIGINT but exits on EOF); any other payload is sent as a line of
+        input via SWE-ReX's interactive-command mode (no exit code / PS1 seek). A
+        timeout here is benign: the program is still running or awaiting more input,
+        and the session is NOT interrupted.
+
+        The interactive mode waits for ``expect + [PS1]``, and a live program never
+        prints the shell's PS1, so without ``INTERACTIVE_PROMPTS`` every send would
+        wait out the full timeout and return nothing.
         """
+        if payload.strip() == "C-d":
+            try:
+                r = await self.deployment.runtime.run_in_session(
+                    BashAction(command="\x04", timeout=action_timeout, is_interactive_quit=True, check="ignore")
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to send EOF: {e}")
+                return "Failed to send EOF (C-d) to the running process."
+            self.attached_command = None
+            return self._format_observation(
+                getattr(r, "output", "") or "",
+                max_observation_length,
+                empty_message="Sent EOF (C-d); the program exited and the shell is back at a prompt.",
+            )
         if payload.strip() == "C-c":
             try:
-                obs = await self.deployment.runtime.run_in_session(BashInterruptAction(timeout=10))
+                obs = await self.deployment.runtime.run_in_session(BashInterruptAction(timeout=2))
             except Exception as e:
                 self.logger.error(f"Failed to interrupt session: {e}")
                 return "Failed to send interrupt (C-c) to the running process."
+            self.attached_command = None
             return self._format_observation(
                 getattr(obs, "output", "") or "",
                 max_observation_length,
@@ -273,13 +298,24 @@ class AgentEnv:
 
         try:
             r = await self.deployment.runtime.run_in_session(
-                BashAction(command=payload, timeout=action_timeout, is_interactive_command=True, check="ignore")
+                BashAction(
+                    command=payload,
+                    timeout=action_timeout,
+                    is_interactive_command=True,
+                    check="ignore",
+                    expect=INTERACTIVE_PROMPTS,
+                )
             )
         except CommandTimeoutError:
             return (
                 f"The interactive program did not return within {action_timeout} seconds; it may still be "
-                "running or waiting for input. Send more input, wait, or send 'C-c' (is_input=true) to interrupt it."
+                "running or waiting for input. Send more input, wait, send 'C-c' (is_input=true) to interrupt "
+                "it, or 'C-d' to send EOF."
             )
+        # a matched shell PS1 means the program exited and the session is free again;
+        # matching one of INTERACTIVE_PROMPTS means it is still waiting on us
+        if getattr(r, "expect_string", "") not in INTERACTIVE_PROMPTS:
+            self.attached_command = None
         return self._format_observation(
             r.output,
             max_observation_length,
@@ -287,9 +323,15 @@ class AgentEnv:
         )
 
     @auto_await
-    async def interrupt_session(self):
+    async def interrupt_session(self) -> str:
+        """Interrupt whatever is running; returns the output it had produced so far.
+
+        swe-rex retries the SIGINT ``n_retry`` times at this timeout before escalating,
+        so a large value is paid in full against programs that ignore SIGINT (a REPL).
+        """
         self.logger.info("Interrupting session")
-        await self.deployment.runtime.run_in_session(BashInterruptAction(timeout=10))
+        obs = await self.deployment.runtime.run_in_session(BashInterruptAction(timeout=2))
+        return getattr(obs, "output", "") or ""
 
     @auto_await
     async def communicate(
@@ -313,7 +355,9 @@ class AgentEnv:
             output: output from container
         """
         self.logger.debug(f"Input:\n{input}")
-        rex_check = "silent" if check else "ignore"
+        # `check` is a Literal string, so a truthiness test always picked "silent" and
+        # paid swe-rex's extra exit-code round trip on every command
+        rex_check = "ignore" if check == "ignore" else "silent"
         r = await self.deployment.runtime.run_in_session(BashAction(command=input, timeout=timeout, check=rex_check))
         output = r.output
         self.logger.debug(f"Output:\n{output}")

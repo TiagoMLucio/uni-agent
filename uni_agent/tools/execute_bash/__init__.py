@@ -10,8 +10,23 @@ from uni_agent.tools.registry import register_tool
 DESCRIPTION = """
 Execute a bash command in the terminal.
 
-For interactive programs (e.g. python, gdb, a prompt waiting for input), set
-is_input=true and put the text to send (or "C-c" to interrupt) in `command`.
+A command that exceeds its timeout is NOT stopped: it stays attached to the session,
+and no new command can run until it finishes or is cancelled. When that happens, call
+this tool again with is_input=true and `command` set to one of:
+  - the text to send to the program
+  - "C-c" to cancel it
+  - "C-d" to send EOF (a REPL ignores C-c but exits on EOF)
+  - "" (empty) to wait and collect more output
+So prefer forms that cannot block on a prompt: `patch --batch`, always give `grep` a
+path to search, and avoid REPLs (`python` with no script, `scrapy shell`) unless you
+intend to drive them with is_input.
+
+For searching, `grep -rl 'pattern' /testbed` is 8-30x faster than
+`find ... -exec grep {} \\;`, which spawns one process per file. Narrowing it to the
+repository's own language helps further, e.g. `--include='*.py'` in a Python repo.
+
+Redirect long-running work instead of waiting on it:
+`<command> > /tmp/out.log 2>&1 &` then `tail -n 50 /tmp/out.log`.
 """.strip()
 
 

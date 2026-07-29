@@ -442,7 +442,32 @@ class AgentInteraction:
         """Run one tool call in the env; errors become the observation (status marks the kind)."""
         action = self.tools_manager.get_tool_action(tool_call)
         self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
-        action_timeout = action.timeout or self.action_timeout
+        # a model-supplied timeout may only lower the ceiling, never raise it
+        requested = action.timeout if action.timeout and action.timeout > 0 else self.action_timeout
+        action_timeout = max(1, min(requested, self.action_timeout))
+
+        attached = getattr(self.env, "attached_command", None)
+        if attached and not action.is_input:
+            observation = (
+                f'Your command "{action.command}" is NOT executed. The previous command '
+                f'"{attached}" is still running, so you cannot start a new one. Set is_input=true '
+                'to interact with it: send text as input, "C-c" to cancel it, or "C-d" for EOF.'
+            )
+            self.logger.error(observation)
+            return ToolResult(
+                tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
+                observation=observation, status="skipped", execution_time=0.0,
+            )
+        if action.is_input and not attached:
+            observation = (
+                "A command was expected but is_input was set. Nothing is currently running in the "
+                "session, so there is nothing to send input to. Re-send with is_input=false."
+            )
+            self.logger.error(observation)
+            return ToolResult(
+                tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
+                observation=observation, status="syntax_error", execution_time=0.0,
+            )
 
         tool_t0 = time.perf_counter()
         status: ToolStatus
