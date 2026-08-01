@@ -22,6 +22,7 @@ from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
 from uni_agent.reward.base import AbstractRewardSpec
 from uni_agent.reward.registry import register_reward_spec
+from uni_agent.tracing import rollout_trace_span
 from uni_agent.utils import auto_await
 
 
@@ -338,43 +339,50 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         # sibling env (isolation) and/or to detect the empty-patch failure mode.
         patch: str | None = None
         if self.isolate or self.feedback.enabled:
-            patch = await self._get_interaction_env_patch()
+            with rollout_trace_span("patch_extract"):
+                patch = await self._get_interaction_env_patch()
 
         output = ""
         eval_env = self.env
         sibling = None
         try:
-            if self.isolate:
-                env_config = kwargs.get("env_config") or self.env_config
-                sibling = await self._start_sibling_env(env_config)
-                eval_env = sibling
-                try:
-                    await self._apply_patch(patch or "", env=sibling)
-                except Exception as e:
-                    self.logger.error(f"Failed to apply patch in sibling eval env: {e}")
-                    result["patch_apply_failed"] = True
-                    raise
+            with rollout_trace_span("eval_env_setup", metadata={"isolate": self.isolate}) as env_span:
+                if self.isolate:
+                    env_config = kwargs.get("env_config") or self.env_config
+                    sibling = await self._start_sibling_env(env_config)
+                    eval_env = sibling
+                    try:
+                        await self._apply_patch(patch or "", env=sibling)
+                    except Exception as e:
+                        self.logger.error(f"Failed to apply patch in sibling eval env: {e}")
+                        result["patch_apply_failed"] = True
+                        raise
 
-            # write eval script to the eval container
-            eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
-            await eval_env.write_file(eval_script_container, eval_script)
+                # write eval script to the eval container
+                eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
+                await eval_env.write_file(eval_script_container, eval_script)
+                if env_span is not None:
+                    env_span.update(output={"status": "ready", "sibling": sibling is not None})
 
-            execution_t0 = time.perf_counter()
+            with rollout_trace_span("tests") as tests_span:
+                execution_t0 = time.perf_counter()
 
-            cmd_str = f"bash {eval_script_container}"
-            output = await eval_env.communicate(cmd_str, timeout=self.eval_timeout, check="ignore")
+                cmd_str = f"bash {eval_script_container}"
+                output = await eval_env.communicate(cmd_str, timeout=self.eval_timeout, check="ignore")
 
-            execution_time = time.perf_counter() - execution_t0
-            result["eval_completed"] = True
-            result["eval_execution_time"] = execution_time
+                execution_time = time.perf_counter() - execution_t0
+                result["eval_completed"] = True
+                result["eval_execution_time"] = execution_time
 
-            # Remove ANSI escape codes and \r
-            output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+                # Remove ANSI escape codes and \r
+                output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
 
-            eval_report = self._get_eval_report(output)
-            result["eval_report"] = eval_report
-            self.logger.info(f"Eval report: {eval_report}")
-            result["resolved"] = eval_report["resolved"]
+                eval_report = self._get_eval_report(output)
+                result["eval_report"] = eval_report
+                self.logger.info(f"Eval report: {eval_report}")
+                result["resolved"] = eval_report["resolved"]
+                if tests_span is not None:
+                    tests_span.update(output={"resolved": result["resolved"], "eval_execution_time": execution_time})
         except Exception as e:
             self.logger.error(f"Failed to evaluate: {e}")
         finally:
@@ -385,9 +393,10 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                     self.logger.error(f"Failed to close sibling eval env: {e}")
 
         if self.feedback.enabled:
-            feedback = self.feedback.render(
-                result=result, output=output, patch=patch, instance_id=self.metadata.get("instance_id", "")
-            )
+            with rollout_trace_span("feedback_render"):
+                feedback = self.feedback.render(
+                    result=result, output=output, patch=patch, instance_id=self.metadata.get("instance_id", "")
+                )
             result["reward_extra_info"] = {"feedback": feedback}
 
         return result["resolved"], result
