@@ -138,7 +138,8 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             test_files = []
 
         # The agent's diff IS the prediction we evaluate, so we always need it.
-        patch = await self._get_interaction_env_patch()
+        with rollout_trace_span("patch_extract"):
+            patch = await self._get_interaction_env_patch()
         eval_script_list = _make_eval_script_list(instance_id, patch, test_command, test_files)
         eval_script = "\n".join(["#!/bin/bash", "set -uxo pipefail"] + eval_script_list) + "\n"
 
@@ -194,12 +195,13 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     self.logger.error(f"Failed to close sibling eval env: {e}")
 
         if self.feedback.enabled:
-            feedback = self.feedback.render(
-                result=result,
-                output=output,
-                patch=patch,
-                instance_id=instance.get("instance_id", ""),
-            )
+            with rollout_trace_span("feedback_render"):
+                feedback = self.feedback.render(
+                    result=result,
+                    output=output,
+                    patch=patch,
+                    instance_id=instance.get("instance_id", ""),
+                )
             result["reward_extra_info"] = {"feedback": feedback}
 
         return result["resolved"], result
