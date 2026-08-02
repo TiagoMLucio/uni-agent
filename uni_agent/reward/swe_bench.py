@@ -218,7 +218,12 @@ def _extract_tracebacks(output: str) -> dict[str, str] | None:
     blocks: dict[str, str] = {}
     for banner, status in (("ERRORS", "ERROR"), ("FAILURES", "FAILED")):
         bodies = _section_blocks(section, banner)
-        ids = _ordered_ids(section, status)
+        # Two ordered id sources; the pty wraps long --verbose progress lines, which
+        # silently drops ids from that source, so trust whichever count matches the
+        # traceback bodies instead of always preferring progress lines.
+        progress = [nid for nid, outcome in _PROGRESS_RE.findall(section) if outcome == status]
+        summary = [nid for outcome, nid in _SUMMARY_LINE_RE.findall(section) if outcome == status]
+        ids = progress if len(progress) == len(bodies) else summary
         if len(bodies) != len(ids):
             return None
         blocks.update(zip(ids, bodies, strict=True))
