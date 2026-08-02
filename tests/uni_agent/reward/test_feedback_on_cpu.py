@@ -45,10 +45,10 @@ def test_regressions_and_newly_passing():
     assert "test_reg" in fb and "test_fixed" in fb
 
 
-def test_max_tests_cap_exposes_more():
+def test_max_names_cap_exposes_more():
     cfg = FeedbackConfig(
         parts=["failing_tests"],
-        max_tests=2,
+        max_names=2,
         templates={"failing_tests": "fails={count} shown={shown} more={more}\n{tests}"},
     )
     fb = cfg.render(result=_result(f2p_fail=[f"t{i}" for i in range(5)]), patch="diff")
@@ -106,10 +106,10 @@ def test_raw_output_extracts_delimited_section():
     assert "noise before" not in fb and "noise after" not in fb
 
 
-def test_raw_output_tail_truncation():
+def test_raw_output_middle_truncation():
     cfg = FeedbackConfig(parts=["raw_output"], max_output_chars=20)
     fb = cfg.render(result=_result(f2p_fail=["a"]), output="X" * 100, patch="diff")
-    assert "[... output truncated ...]" in fb
+    assert "[... 80 chars elided from the middle ...]" in fb
     assert fb.count("X") == 20
 
 
@@ -135,7 +135,7 @@ def test_unknown_part_skipped_and_empty_returns_none():
 
 
 def test_max_chars_truncation():
-    cfg = FeedbackConfig(parts=["failing_tests"], max_chars=40, max_tests=1000)
+    cfg = FeedbackConfig(parts=["failing_tests"], max_chars=40, max_names=1000)
     fb = cfg.render(result=_result(f2p_fail=[f"some_long_test_name_{i}" for i in range(200)]), patch="diff")
     assert fb.endswith("[... feedback truncated ...]")
 

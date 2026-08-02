@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Literal
 
@@ -15,13 +16,20 @@ from uni_agent.tracing import (
 from uni_agent.utils import auto_await, simple_timer
 
 from .condenser import AbstractCondenser, CondensationFailed
-from .env import ActionIncorrectSyntaxError, ActionTimeoutError, AgentEnv, TerminalNotAliveError
+from .env import (
+    ActionIncorrectSyntaxError,
+    ActionTimeoutError,
+    AgentEnv,
+    TerminalNotAliveError,
+)
 from .model import AgentChatModel, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
 from .tool_schemas import OpenAIFunctionToolCall
 from .tools_manager import ToolsManager
 
-ToolStatus = Literal["ok", "timeout", "syntax_error", "skipped"]
+# "yielded": the command hit its timeout but is still running and still reachable, so it
+# is normal operation, not a failure. Only "timeout" (the kill) spends the budget.
+ToolStatus = Literal["ok", "yielded", "timeout", "syntax_error", "skipped"]
 
 # Heuristic budget for reactive condensation: how many characters to free when the
 # context overflows, escalated per retry (~chars_per_token x tokens_over + margin).
@@ -113,6 +121,8 @@ class AgentInteraction:
         tools_manager: ToolsManager,
         messages: list[dict[str, str]],
         action_timeout: int = 60,
+        yield_timeout: int = 5,
+        attached_kill_timeout: float = 45.0,
         timeout_budget: int = 3,
         max_turns: int = 50,
         skills_manager: SkillsManager | None = None,
@@ -146,6 +156,8 @@ class AgentInteraction:
         self.skills_manager = skills_manager
         self.messages = messages
         self.action_timeout = action_timeout
+        self.yield_timeout = yield_timeout
+        self.attached_kill_timeout = attached_kill_timeout
         self.timeout_budget = timeout_budget
         self.max_turns = max_turns
         self.chat_mode = chat_mode
@@ -442,9 +454,17 @@ class AgentInteraction:
         """Run one tool call in the env; errors become the observation (status marks the kind)."""
         action = self.tools_manager.get_tool_action(tool_call)
         self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
-        # a model-supplied timeout may only lower the ceiling, never raise it
-        requested = action.timeout if action.timeout and action.timeout > 0 else self.action_timeout
+        # unasked, a command gets the short yield timeout: it is not killed when that
+        # expires, so the cost of guessing low is one polling turn. A model that knows
+        # its command is slow may ask for more, up to the ceiling, but never past it.
+        requested = action.timeout if action.timeout and action.timeout > 0 else self.yield_timeout
         action_timeout = max(1, min(requested, self.action_timeout))
+        # the kill wall bounds total run time, so no single action may outlive what is
+        # left of it: checking only afterwards let a 30s request served on 1s of budget
+        # run the full 30s before anything cancelled it. One second is the floor, so the
+        # wall may be overrun by that much rather than leaving an unusable sliver.
+        left = self.attached_kill_timeout - getattr(self.env, "attached_seconds", 0.0)
+        action_timeout = max(1, min(action_timeout, math.ceil(left)))
 
         attached = getattr(self.env, "attached_command", None)
         if attached and not action.is_input:
@@ -481,9 +501,8 @@ class AgentInteraction:
             status = "ok"
         except ActionTimeoutError as e:
             observation = str(e)
-            status = "timeout"
-            self.timeout_budget -= 1
-            self.logger.error(f"{observation} (timeout_budget left: {self.timeout_budget})")
+            status = "yielded"
+            self.logger.info(observation)
         except ActionIncorrectSyntaxError as e:
             observation = str(e)
             status = "syntax_error"
@@ -492,13 +511,54 @@ class AgentInteraction:
             observation = str(e)
             status = "skipped"
             self.logger.error(observation)
+        elapsed = time.perf_counter() - tool_t0
+        if getattr(self.env, "attached_command", None):
+            self.env.attached_seconds += elapsed
+            if self.env.attached_seconds >= self.attached_kill_timeout:
+                observation, status = await self._kill_attached(observation)
+            elif status == "yielded":
+                # one note, built here because this is where the balance is known: the
+                # model cannot judge whether to keep waiting on a wall it is not told about
+                observation += (
+                    f"\n<NOTE>Still running: {self.env.attached_seconds:.2f}s of "
+                    f"{self.attached_kill_timeout:g}s used before it is cancelled, and no new command "
+                    'can run until then. Send it input with is_input=true, "C-c" to cancel, "C-d" for '
+                    'EOF, or "" to wait.</NOTE>'
+                )
         return ToolResult(
             tool_call_id=tool_call.id,
             name=tool_call.function.name,
             action=action.command,
             observation=observation,
             status=status,
-            execution_time=time.perf_counter() - tool_t0,
+            execution_time=elapsed,
+        )
+
+    async def _kill_attached(self, observation: str) -> tuple[str, ToolStatus]:
+        """Cancel a command that has held the session past its limit."""
+        killed, spent = self.env.attached_command, self.env.attached_seconds
+        last_words = await self.env.kill_attached()
+        self.timeout_budget -= 1
+        self.logger.error(
+            f"Killed attached command {killed!r} after {spent:.1f}s of run time "
+            f"(timeout_budget left: {self.timeout_budget})"
+        )
+        if last_words:
+            observation += f"\n{last_words}"
+        # the step ends once the budget goes below zero, so this many cancellations remain
+        left = self.timeout_budget + 1
+        if left <= 0:
+            consequence = "That was the last one allowed, so the episode ends here."
+        elif left == 1:
+            consequence = "One more cancellation ends the episode."
+        else:
+            consequence = f"{left} more cancellations end the episode."
+        return (
+            observation
+            + f"\n<NOTE>'{killed}' was cancelled: it held the session for {spent:.2f}s of run time, "
+            f"past the {self.attached_kill_timeout:g}s limit. The session is free again. "
+            f"{consequence}</NOTE>",
+            "timeout",
         )
 
     async def _condense_and_reseat(self, attempt: int) -> None:
