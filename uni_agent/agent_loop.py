@@ -509,6 +509,7 @@ class UniAgentLoop(AgentLoopBase):
             "tokenizer": self.tokenizer,
             "max_model_len": max_model_len,
             "sampling_params": sampling_params,
+            "max_completion_tokens": config_dict.get("max_completion_tokens"),
         }
 
         if not config_dict.get("reward"):
