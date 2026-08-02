@@ -169,6 +169,7 @@ class AgentChatModel:
                 "input": generation_info["prompt_tokens"],
                 "output": generation_info["completion_tokens"],
             },
+            num_preempted=token_output.num_preempted,
         )
 
         if len(rollout_cache["prompt_ids"]) >= self.max_model_len:
