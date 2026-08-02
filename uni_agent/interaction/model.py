@@ -4,6 +4,7 @@ from functools import cached_property
 from typing import Any
 
 from uni_agent.tracing import rollout_trace_generation
+from uni_agent.async_logging import get_logger
 from uni_agent.utils import get_event_loop, simple_timer
 
 
@@ -126,6 +127,17 @@ class AgentChatModel:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
         else:
             metrics["num_preempted"] += token_output.num_preempted if token_output.num_preempted is not None else 0
+        if turn_limit and len(token_output.token_ids) > turn_limit:
+            # Should be impossible (the server clamps to the requested max_tokens), yet
+            # observed once, immediately after a condensation retry (run 2985518,
+            # 5137 > 4096). Enforce the invariant here and log enough to find the path.
+            get_logger("model").warning(
+                f"generation returned {len(token_output.token_ids)} tokens despite max_tokens={turn_limit} "
+                f"(prompt={len(prompt_ids)}, request_id={request_id}); truncating to the cap"
+            )
+            token_output.token_ids = token_output.token_ids[:turn_limit]
+            if token_output.log_probs is not None:
+                token_output.log_probs = token_output.log_probs[:turn_limit]
         generation_info = {
             "prompt_tokens": len(prompt_ids),
             "completion_tokens": len(token_output.token_ids),
