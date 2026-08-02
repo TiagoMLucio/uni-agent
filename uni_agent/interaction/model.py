@@ -110,9 +110,11 @@ class AgentChatModel:
         # window (measured: 0.15% of turns, ~14% of all generated tokens, ~4min of
         # single-stream decode each, and the overflow usually kills the segment).
         # min() with the window keeps a capped call from ever overflowing max_model_len.
+        turn_limit = None
         if self.max_completion_tokens:
             room = max(1, self.max_model_len - len(prompt_ids))
-            sampling_params = {**sampling_params, "max_tokens": min(int(self.max_completion_tokens), room)}
+            turn_limit = min(int(self.max_completion_tokens), room)
+            sampling_params = {**sampling_params, "max_tokens": turn_limit}
 
         with simple_timer("generate_sequences", metrics):
             token_output = await self.client.generate(
@@ -127,6 +129,9 @@ class AgentChatModel:
         generation_info = {
             "prompt_tokens": len(prompt_ids),
             "completion_tokens": len(token_output.token_ids),
+            # the turn was cut mid-generation by the per-turn cap (not a natural stop);
+            # the interaction layer tells the model, or it misreads the parse error
+            "capped": bool(turn_limit and len(token_output.token_ids) >= turn_limit),
         }
         response_ids = token_output.token_ids
         rollout_cache["prompt_ids"] += response_ids
