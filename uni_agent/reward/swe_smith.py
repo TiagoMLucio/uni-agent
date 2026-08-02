@@ -137,9 +137,14 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         rp = registry.get_from_inst(instance)
         # Whole-suite command (f2p_only would drop P2P tests in other files -> false regressions).
         test_command, _ = rp.get_test_cmd(instance, f2p_only=False)
-        # the profiles ship --tb=no, which truncates the failure reason mid-sentence and never
-        # names the source frame; the traceback is the single most useful thing in the feedback
-        test_command = test_command.replace("--tb=no", "--tb=long")
+        # Long tracebacks are the single most useful thing in the feedback, and the
+        # per-test pairing needs the FAILURES blocks they produce. Profiles ship
+        # assorted --tb flavors or none at all (click had none: its evals fell back
+        # to the raw dump), so rewrite whatever is there rather than string-replace.
+        if "pytest" in test_command:
+            test_command, n = re.subn(r"--tb[= ]\S+", "--tb=long", test_command)
+            if n == 0:
+                test_command += " --tb=long"
         try:
             f2p_files, p2p_files = rp.get_test_files(instance)
             test_files = sorted(set(f2p_files + p2p_files))

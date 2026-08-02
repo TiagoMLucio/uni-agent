@@ -44,7 +44,7 @@ DEFAULT_USER_TEMPLATE = (
     "Return the JSON with one hint per selected turn (at most {k})."
 )
 
-TURN_TEMPLATE = "### Turn {step} ({tokens} tokens)\nASSISTANT:\n{response}\n{tools}"
+TURN_TEMPLATE = "### Turn {step}\nASSISTANT:\n{response}\n{tools}"
 # the response is the model's raw output, so it already carries the tool call and its arguments;
 # rendering the parsed action too duplicated whole written files in the prompt
 TOOL_TEMPLATE = "TOOL {name}:\n{observation}"
