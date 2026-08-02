@@ -474,9 +474,11 @@ class AgentInteraction:
                 'to interact with it: send text as input, "C-c" to cancel it, or "C-d" for EOF.'
             )
             self.logger.error(observation)
+            # a protocol correction, not a dead session: "skipped" would trip the
+            # terminal_dead abort and end the trajectory on a recoverable mistake
             return ToolResult(
                 tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
-                observation=observation, status="skipped", execution_time=0.0,
+                observation=observation, status="syntax_error", execution_time=0.0,
             )
         if action.is_input and not attached:
             observation = (
