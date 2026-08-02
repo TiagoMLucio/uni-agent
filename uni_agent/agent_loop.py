@@ -204,6 +204,14 @@ class UniAgentLoop(AgentLoopBase):
                             output={"turns": len(trajectory), "termination": _termination(trajectory)}
                         )
 
+                # a command the agent left attached would swallow reward-side session
+                # commands until their timeout; free the session before reward runs
+                if setup_done:
+                    try:
+                        await self.env.clear_attached()
+                    except Exception as e:
+                        self.logger.warning(f"Failed to clear attached command at loop end: {e}")
+
                 # interaction environment should be visible to the reward spec
                 if self.reward_spec is not None:
                     if should_break("reward"):
