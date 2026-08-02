@@ -211,11 +211,14 @@ class RemoteRuntime(AbstractRuntime):
         backoff_max = 30
         timeout = self._get_timeout()
 
-        # the HTTP timeout must outlast the in-session command it carries, else long
-        # commands (evals, slow tool calls) are aborted at the transport layer
+        # The HTTP timeout must outlast the in-session command it carries, else long
+        # commands (evals, slow tool calls) are aborted at the transport layer. But it
+        # must not dwarf it either: against a dead container the in-env timeout never
+        # fires and THIS is the binding one - the old max(default, +30) floor plus
+        # retries turned 5s yields into 60-108s stalls (run 2985518 val).
         command_timeout = getattr(payload, "timeout", None)
         if command_timeout:
-            timeout = max(timeout, command_timeout + 30)
+            timeout = command_timeout + 15
 
         while num_retries >= 0 and client_error_retries >= 0:
             try:

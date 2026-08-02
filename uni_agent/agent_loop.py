@@ -497,6 +497,12 @@ class UniAgentLoop(AgentLoopBase):
                 "per-sample. Remove `model` from your dataset's tools_kwargs."
             )
         config_dict = _deep_merge(base_config, tools_kwargs)
+        # Validation rollouts deep-merge `validation_overrides` (from the agent YAML)
+        # over the effective config: val limits live explicitly next to the train
+        # knobs instead of silently sharing them. Applied after the per-sample merge
+        # so a dataset row can never lose its env/reward identity to an override.
+        if kwargs.get("validate") and isinstance(config_dict.get("validation_overrides"), dict):
+            config_dict = _deep_merge(config_dict, config_dict["validation_overrides"])
 
         rollout_config = self.config.actor_rollout_ref.rollout
         max_model_len = (

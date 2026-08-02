@@ -45,4 +45,8 @@ async def test_request_timeout_covers_command_timeout():
         await runner.cleanup()
 
     assert seen["command_timeout"] == 300
-    assert captured["total"] >= 330, f"HTTP timeout {captured['total']} must outlast the 300s command"
+    assert captured["total"] == 315, (
+        f"HTTP timeout {captured['total']} must outlast the 300s command by the fixed margin, "
+        "without a default floor: against a dead container the transport timeout is the "
+        "binding one, and a large floor turns short yields into minute-long stalls"
+    )
