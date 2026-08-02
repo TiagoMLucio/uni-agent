@@ -24,6 +24,9 @@ class AgentChatModel:
     sampling_params: dict[str, Any]
     """Sampling parameters for the model"""
 
+    max_completion_tokens: int | None = None
+    """Per-turn completion cap; None leaves the window as the only bound."""
+
     tools_schemas: list[dict] = None
 
     def __init__(self, **data):
@@ -103,6 +106,13 @@ class AgentChatModel:
             )
 
         sampling_params = kwargs.get("sampling_params", self.sampling_params)
+        # Cap one turn's completion. Uncapped, a runaway turn fills the whole remaining
+        # window (measured: 0.15% of turns, ~14% of all generated tokens, ~4min of
+        # single-stream decode each, and the overflow usually kills the segment).
+        # min() with the window keeps a capped call from ever overflowing max_model_len.
+        if self.max_completion_tokens:
+            room = max(1, self.max_model_len - len(prompt_ids))
+            sampling_params = {**sampling_params, "max_tokens": min(int(self.max_completion_tokens), room)}
 
         with simple_timer("generate_sequences", metrics):
             token_output = await self.client.generate(
