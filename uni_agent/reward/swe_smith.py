@@ -53,9 +53,11 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
 
     Replicates ``swesmith.harness.utils.run_patch_in_container`` as a single bash
     script so it can run through ``env.communicate`` (like swe_bench's eval), rather
-    than via the host docker SDK. ``set -uxo pipefail`` (no ``-e``) so a failed apply
+    than via the host docker SDK. ``set -uo pipefail`` (no ``-e``) so a failed apply
     does not abort the script — we surface it via the ``APPLY_PATCH_FAIL`` sentinel,
-    exactly as the library does.
+    exactly as the library does. No ``-x``: its trace would eat the feedback budget,
+    so the output markers the grader looks for must be echoed explicitly (the
+    library's ``: 'marker'`` no-ops only ever surfaced through the ``-x`` trace).
     """
     repo_directory = "/testbed"
     # Apply the agent patch with swesmith's fallback ladder; echo the sentinel on total
@@ -79,9 +81,9 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
         *apply_lines,
         # Tests are graded from the repo's own copy — discard any agent edits to them.
         revert_tests,
-        f": '{TEST_OUTPUT_START}'",
+        f"echo '{TEST_OUTPUT_START}'",
         test_command,
-        f": '{TEST_OUTPUT_END}'",
+        f"echo '{TEST_OUTPUT_END}'",
     ]
 
 
