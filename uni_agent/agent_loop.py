@@ -233,6 +233,12 @@ class UniAgentLoop(AgentLoopBase):
                             )
                     interaction_result["metrics"]["reward_eval"] = time.perf_counter() - reward_t0
                     if isinstance(reward_result, dict):
+                        # reward_eval covers the sibling container end to end; this is the
+                        # test run alone, so the difference is what its setup cost
+                        if reward_result.get("eval_execution_time") is not None:
+                            interaction_result["metrics"]["eval_execution"] = float(
+                                reward_result["eval_execution_time"]
+                            )
                         interaction_result["metrics"]["eval_completed"] = float(
                             bool(reward_result.get("eval_completed", True))
                         )
@@ -284,7 +290,12 @@ class UniAgentLoop(AgentLoopBase):
             # hinting a trajectory whose eval never ran would teach against an unknown label
             if (interaction_result.get("metrics") or {}).get("eval_completed", 1.0) < 1.0:
                 return {}
-            gold = ((config_dict.get("reward") or {}).get("metadata") or {}).get("patch") or ""
+            # SWE-smith's dataset `patch` is the diff that *introduced* the bug, so the env
+            # captures the real fix at setup; benchmarks whose `patch` is already the solution
+            # (SWE-bench) leave privileged_setup_cmd unset and fall through to it.
+            gold = getattr(self.env, "privileged_context", "") or (
+                ((config_dict.get("reward") or {}).get("metadata") or {}).get("patch") or ""
+            )
             feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback") or ""
             task = next(
                 (m.get("content", "") for m in interaction_result.get("messages") or [] if m.get("role") == "user"),
@@ -325,7 +336,12 @@ class UniAgentLoop(AgentLoopBase):
                 breakpoint()
             reflector = Reflector(self.chat_model, config, run_id=self.run_id)
             return await reflector.reflect_trajectory(
-                task=task, turns=turns, gold=gold, feedback=feedback, outcome=outcome
+                task=task,
+                turns=turns,
+                gold=gold,
+                feedback=feedback,
+                outcome=outcome,
+                agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
             )
         except Exception as e:  # hints are optional supervision; never kill the rollout over them
             self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")

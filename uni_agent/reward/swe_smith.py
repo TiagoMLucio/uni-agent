@@ -40,7 +40,7 @@ from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
 from uni_agent.reward.base import AbstractRewardSpec
 from uni_agent.reward.registry import register_reward_spec
-from uni_agent.reward.swe_bench import FeedbackConfig
+from uni_agent.reward.swe_bench import FeedbackConfig, _feedback_seed
 from uni_agent.tracing import rollout_trace_span
 from uni_agent.utils import auto_await
 
@@ -97,6 +97,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         feedback: dict | FeedbackConfig | None = None,
         env_config: dict | None = None,
         isolate: bool = False,
+        agent_patch_diff_args: str = "",
     ):
         self.run_id = run_id
         self.metadata = metadata
@@ -106,6 +107,9 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         self.feedback = feedback if isinstance(feedback, FeedbackConfig) else FeedbackConfig(**(feedback or {}))
         self.env_config = env_config
         self.isolate = isolate
+        # extra git-diff flags for the reflector's copy of the patch ('-U10', '-W');
+        # empty means do not capture one
+        self.agent_patch_diff_args = agent_patch_diff_args
 
     @auto_await
     async def apply_gold_patch(self) -> None:
@@ -131,6 +135,9 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         rp = registry.get_from_inst(instance)
         # Whole-suite command (f2p_only would drop P2P tests in other files -> false regressions).
         test_command, _ = rp.get_test_cmd(instance, f2p_only=False)
+        # the profiles ship --tb=no, which truncates the failure reason mid-sentence and never
+        # names the source frame; the traceback is the single most useful thing in the feedback
+        test_command = test_command.replace("--tb=no", "--tb=long")
         try:
             f2p_files, p2p_files = rp.get_test_files(instance)
             test_files = sorted(set(f2p_files + p2p_files))
@@ -141,7 +148,9 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         with rollout_trace_span("patch_extract"):
             patch = await self._get_interaction_env_patch()
         eval_script_list = _make_eval_script_list(instance_id, patch, test_command, test_files)
-        eval_script = "\n".join(["#!/bin/bash", "set -uxo pipefail"] + eval_script_list) + "\n"
+        # -x would echo every conda-activation line into the captured output and eat the
+        # feedback budget before pytest has said anything
+        eval_script = "\n".join(["#!/bin/bash", "set -uo pipefail"] + eval_script_list) + "\n"
 
         output = ""
         eval_env = self.env
@@ -194,15 +203,22 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                 except Exception as e:
                     self.logger.error(f"Failed to close sibling eval env: {e}")
 
+        extra_info: dict = {}
         if self.feedback.enabled:
             with rollout_trace_span("feedback_render"):
-                feedback = self.feedback.render(
+                extra_info["feedback"] = self.feedback.render(
                     result=result,
                     output=output,
                     patch=patch,
-                    instance_id=instance.get("instance_id", ""),
+                    instance_id=instance_id,
+                    seed=_feedback_seed(instance_id, kwargs.get("interaction_result")),
                 )
-            result["reward_extra_info"] = {"feedback": feedback}
+        if self.agent_patch_diff_args:
+            # a wider re-render of the same prediction, for the reflector only
+            with rollout_trace_span("patch_extract", metadata={"diff_args": self.agent_patch_diff_args}):
+                extra_info["agent_patch"] = await self._get_interaction_env_patch(self.agent_patch_diff_args)
+        if extra_info:
+            result["reward_extra_info"] = extra_info
 
         return result["resolved"], result
 
@@ -228,14 +244,23 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         return sibling
 
     @auto_await
-    async def _get_interaction_env_patch(self) -> str:
-        """Get the current staged diff in /testbed (interaction env state) as a patch string."""
+    async def _get_interaction_env_patch(self, diff_args: str = "") -> str:
+        """Get the current staged diff in /testbed (interaction env state) as a patch string.
+
+        ``diff_args`` are extra git-diff flags (``-U10``, ``-W``, ...) for the reflector's copy;
+        the prediction that is graded is always taken with none, so the eval never depends on
+        them. The attributes file is what makes ``-W`` find Python function boundaries: without
+        it git falls back to a generic heuristic that expands every hunk to the whole file.
+        """
         try:
             env_patch_file = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
+            attrs = "/tmp/.uniagent_gitattributes"
             # side session: the agent's own session may still be running whatever it
             # left attached, which would swallow this command until the timeout
             await self.env.communicate_isolated(
-                f"cd /testbed && git add -A && git diff --no-color --cached > {env_patch_file.as_posix()}",
+                f"cd /testbed && printf '*.py diff=python\\n' > {attrs} && git add -A && "
+                f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
+                f"> {env_patch_file.as_posix()}",
             )
             return await self.env.read_file(env_patch_file)
         except Exception as e:

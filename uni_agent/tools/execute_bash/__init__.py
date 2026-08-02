@@ -21,6 +21,12 @@ So prefer forms that cannot block on a prompt: `patch --batch`, always give `gre
 path to search, and avoid REPLs (`python` with no script, `scrapy shell`) unless you
 intend to drive them with is_input.
 
+One attached command may only hold the session for a limited time before it is
+cancelled, and each observation tells you how much of that is left. Only time actually
+spent waiting counts against it: a program sitting at a prompt answers as soon as it
+has something to say, whatever timeout you asked for, so driving a debugger or a REPL
+costs almost nothing. The timeout only matters for work that does not answer.
+
 For searching, `grep -rl 'pattern' /testbed` is 8-30x faster than
 `find ... -exec grep {} \\;`, which spawns one process per file. Narrowing it to the
 repository's own language helps further, e.g. `--include='*.py'` in a Python repo.

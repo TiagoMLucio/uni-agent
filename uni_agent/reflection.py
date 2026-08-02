@@ -37,6 +37,7 @@ DEFAULT_SYSTEM_TEMPLATE = (
 DEFAULT_USER_TEMPLATE = (
     "Task:\n{task}\n\n"
     "Outcome of the attempt:\n{outcome}\n\n"
+    "Patch the attempt produced:\n{agent_patch}\n\n"
     "Reference patch (privileged, never reveal its content):\n{gold}\n\n"
     "Execution feedback from the attempt:\n{feedback}\n\n"
     "Full trajectory:\n{turns}\n\n"
@@ -44,7 +45,9 @@ DEFAULT_USER_TEMPLATE = (
 )
 
 TURN_TEMPLATE = "### Turn {step} ({tokens} tokens)\nASSISTANT:\n{response}\n{tools}"
-TOOL_TEMPLATE = "TOOL {name}({action}):\n{observation}"
+# the response is the model's raw output, so it already carries the tool call and its arguments;
+# rendering the parsed action too duplicated whole written files in the prompt
+TOOL_TEMPLATE = "TOOL {name}:\n{observation}"
 
 _JSON_DECODER = json.JSONDecoder()
 
@@ -55,10 +58,16 @@ class ReflectionConfig(BaseModel):
     enabled: bool = False
     failed_only: bool = True
     include_gold: bool = True
+    # what the attempt actually produced; the other half of "what they did vs what was needed".
+    # Captured by the reward spec (``reward.agent_patch_context`` sets its width).
+    include_agent_patch: bool = True
     include_exec_feedback: bool = True
     max_selected_turns: int = 5
-    max_observation_chars: int = 300
+    max_observation_chars: int = 1000
     max_diagnosis_chars: int = 4000
+    # the shrink ladder only trims turns, so an outsized patch overflows at every level and
+    # drops the rollout's hints entirely. Over SWE-smith 16k spares 99.2% of tasks.
+    max_patch_chars: int = 16000
     system_template: str = DEFAULT_SYSTEM_TEMPLATE
     user_template: str = DEFAULT_USER_TEMPLATE
 
@@ -76,7 +85,7 @@ class Reflector:
 
     @rollout_trace_op
     async def reflect_trajectory(
-        self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = ""
+        self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = "", agent_patch: str = ""
     ) -> dict[int, str]:
         """Select and hint the pivotal turns of one full trajectory; empty on any failure.
 
@@ -88,10 +97,13 @@ class Reflector:
         k = str(cfg.max_selected_turns)
         system = cfg.system_template.replace("{k}", k)
         obs = cfg.max_observation_chars
+        gold = self._clip(gold, cfg.max_patch_chars) if gold else gold
+        agent_patch = self._clip(agent_patch, cfg.max_patch_chars) if agent_patch else agent_patch
         for obs_cap, resp_cap in ((obs, None), (obs // 2, None), (obs // 2, 800)):
             user = cfg.user_template.replace("{k}", k).format(
                 task=task,
                 outcome=outcome or "(not available)",
+                agent_patch=agent_patch if cfg.include_agent_patch and agent_patch else "(not available)",
                 gold=gold if cfg.include_gold and gold else "(not available)",
                 feedback=feedback if cfg.include_exec_feedback and feedback else "(not available)",
                 turns=self._render_turns(turns, obs_cap, resp_cap),
@@ -141,9 +153,7 @@ class Reflector:
                     else self._clip_response(turn["response"], resp_cap)
                 ),
                 tools="\n".join(
-                    TOOL_TEMPLATE.format(
-                        name=r["name"], action=r["action"], observation=self._clip(r["observation"] or "", obs_cap)
-                    )
+                    TOOL_TEMPLATE.format(name=r["name"], observation=self._clip(r["observation"] or "", obs_cap))
                     for r in turn["tools"]
                 )
                 or "(no tool calls)",
