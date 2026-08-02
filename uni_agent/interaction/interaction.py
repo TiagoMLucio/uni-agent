@@ -289,18 +289,30 @@ class AgentInteraction:
             if not tool_calls and not self.chat_mode:
                 raise FunctionCallFormatError("No function call found in the response.")
         except FunctionCallFormatError as e:
+            error_text = str(e)
+            if generation_info and generation_info.get("capped"):
+                # without this the model misattributes the cut ("the file content was
+                # truncated") and walks into the same runaway generation again
+                cap = getattr(self.model, "max_completion_tokens", None)
+                error_text = (
+                    f"Your response was cut off at the per-turn output limit"
+                    f"{f' of {cap} tokens' if cap else ''} before the tool call was closed, "
+                    "so it was not executed. Produce a shorter response this turn: make "
+                    "smaller edits (str_replace on a narrow block, or write the file in "
+                    "parts) and do not repeat content."
+                )
             if tool_calls:
                 error_msgs: list[dict[str, object]] = [
                     {
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "name": tc["function"]["name"],
-                        "content": str(e),
+                        "content": error_text,
                     }
                     for tc in tool_calls
                 ]
             else:
-                error_msgs = [{"role": "tool", "content": str(e)}]
+                error_msgs = [{"role": "tool", "content": error_text}]
             self.messages.extend(error_msgs)
             with simple_timer("tokenize_observations", self.rollout_cache["metrics"]):
                 self.rollout_cache = await self.model.append_messages_to_rollout_cache(
