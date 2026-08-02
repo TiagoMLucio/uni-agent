@@ -647,7 +647,12 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             )
         from uni_agent.interaction import AgentEnv, AgentEnvConfig
 
-        sibling = AgentEnv(run_id=f"{self.run_id}-eval", env_config=AgentEnvConfig(**env_config))
+        # keep post_setup (the benign base-commit reset) but never the privileged setup:
+        # its history rewrite is for the agent env only and fails on a fresh clone
+        sibling = AgentEnv(
+            run_id=f"{self.run_id}-eval",
+            env_config=AgentEnvConfig(**{**env_config, "privileged_setup_cmd": None}),
+        )
         await sibling.start()
         self.logger.info("Started isolated sibling eval environment")
         return sibling
