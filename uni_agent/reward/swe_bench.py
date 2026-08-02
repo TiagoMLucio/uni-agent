@@ -420,9 +420,10 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         """Get the current staged diff in /testbed (interaction env state) as a patch string."""
         try:
             env_patch_file = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
-            await self.env.communicate(
+            # side session: the agent's own session may still be running whatever it
+            # left attached, which would swallow this command until the timeout
+            await self.env.communicate_isolated(
                 f"cd /testbed && git add -A && git diff --no-color --cached > {env_patch_file.as_posix()}",
-                check="ignore",
             )
             patch_content = await self.env.read_file(env_patch_file)
             return patch_content

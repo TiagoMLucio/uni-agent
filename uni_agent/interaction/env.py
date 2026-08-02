@@ -9,6 +9,7 @@ from swerex.runtime.abstract import (
     BashAction,
     BashInterruptAction,
     Command,
+    CreateBashSessionRequest,
     ReadFileRequest,
     UploadRequest,
     WriteFileRequest,
@@ -115,6 +116,8 @@ class AgentEnv:
         # command still attached to the session after a timeout; while set, only input
         # may be sent, so a new command is never typed into a running program
         self.attached_command: str | None = None
+        # lazily created side session for reward-time commands (communicate_isolated)
+        self._isolated_session: str | None = None
 
     @auto_await
     async def start(self, max_retries: int = 5) -> None:
@@ -367,6 +370,46 @@ class AgentEnv:
         self.logger.info("Interrupting session")
         obs = await self.deployment.runtime.run_in_session(BashInterruptAction(timeout=2))
         return getattr(obs, "output", "") or ""
+
+    @auto_await
+    async def clear_attached(self) -> None:
+        """Free the session if a timed-out command is still attached when the trajectory ends.
+
+        The model no longer owns the session, but reward-side commands (patch
+        extraction) still run in it, and a live leftover process swallows them until
+        their own timeout. C-c first; a REPL ignores SIGINT, so C-d next; each attempt
+        is verified with a no-op command because ``send_input`` clears the flag
+        optimistically.
+        """
+        if self.attached_command is None:
+            return
+        cmd = self.attached_command
+        self.logger.info(f"Trajectory ended with a command still attached; interrupting: '{cmd}'")
+        for payload in ("C-c", "C-d"):
+            await self.send_input(payload, action_timeout=5)
+            try:
+                await self.communicate("true", timeout=5, check="ignore")
+                self.attached_command = None
+                return
+            except CommandTimeoutError:
+                continue
+        self.attached_command = None
+        self.logger.warning(f"Session still busy after C-c/C-d; leftover command: '{cmd}'")
+
+    @auto_await
+    async def communicate_isolated(self, input: str, timeout: int | float = 60) -> str:
+        """Run a command in a dedicated side session, immune to whatever the agent left
+        running or broke in the main one (used for reward-side inspection like patch
+        extraction). The session is created lazily on first use."""
+        if self._isolated_session is None:
+            await self.deployment.runtime.create_session(
+                CreateBashSessionRequest(session="uniagent-reward", startup_timeout=30)
+            )
+            self._isolated_session = "uniagent-reward"
+        r = await self.deployment.runtime.run_in_session(
+            BashAction(command=input, timeout=timeout, check="ignore", session=self._isolated_session)
+        )
+        return r.output
 
     @auto_await
     async def communicate(
