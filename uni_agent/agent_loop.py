@@ -200,7 +200,10 @@ class UniAgentLoop(AgentLoopBase):
                                     f"sandbox, attempt {attempt + 2}/{setup_retries + 1}"
                                 )
                                 try:
-                                    await self.env.close()
+                                    # bounded: a stalled node can hang teardown too, and that
+                                    # time is outside the per-attempt budget
+                                    async with asyncio.timeout(30):
+                                        await self.env.close()
                                 except Exception as close_err:
                                     self.logger.warning(f"could not close the broken sandbox: {close_err}")
                                 self.env = self._init_env(config_dict["env"])
