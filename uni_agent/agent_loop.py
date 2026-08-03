@@ -142,6 +142,7 @@ class UniAgentLoop(AgentLoopBase):
             "image": image,
             "model": self.config.actor_rollout_ref.model.path,
         }
+        self.identity = identity
         rollout_trace_update_trace(
             input=task_text or None, metadata={k: v for k, v in identity.items() if v is not None}
         )
@@ -244,6 +245,9 @@ class UniAgentLoop(AgentLoopBase):
                         )
                         interaction_result["metrics"]["patch_apply_failed"] = float(
                             bool(reward_result.get("patch_apply_failed", False))
+                        )
+                        interaction_result["metrics"]["empty_patch"] = float(
+                            bool(reward_result.get("empty_patch", False))
                         )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
@@ -452,6 +456,13 @@ class UniAgentLoop(AgentLoopBase):
             "messages": interaction_result["messages"],
             "metrics": interaction_result.get("metrics", {}),
             "reward_score": interaction_result.get("reward_score", None),
+            # Everything downstream analysis needs, so a rollout log is self-describing and
+            # offline tooling never has to reconstruct it from a trace backend that may have
+            # dropped events. Written on the training filesystem, never in the agent's sandbox.
+            "identity": getattr(self, "identity", {}),
+            "reward_extra_info": interaction_result.get("reward_extra_info") or {},
+            "gold_patch": getattr(self.env, "privileged_context", "") or "",
+            "turn_feedback": interaction_result.get("turn_feedback") or {},
         }
         (self.output_dir / "interaction_result.json").write_text(
             json.dumps(save_content, ensure_ascii=False, indent=2, default=str),
