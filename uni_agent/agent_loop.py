@@ -167,6 +167,7 @@ class UniAgentLoop(AgentLoopBase):
             self.logger.info(f"output_dir: {self.output_dir}")
             # cap the setup phase: one wedged env.start would stall the whole gathered step
             setup_timeout = config_dict.get("setup_timeout", 300)
+            setup_retries = config_dict.get("setup_retries", 2)
             setup_done = False
             try:
                 with rollout_trace_span("rollout", as_type="chain") as rollout_span:
@@ -174,19 +175,42 @@ class UniAgentLoop(AgentLoopBase):
                     with rollout_trace_span(
                         "env_setup", metadata={"image": image, "timeout_s": setup_timeout}
                     ) as env_span:
-                        async with asyncio.timeout(setup_timeout):
-                            await self.env.start()
+                        # Setup is idempotent (each attempt builds a fresh sandbox), so a
+                        # transient infrastructure stall must not cost the rollout: one
+                        # node-wide ~2min freeze killed 7 in-flight rollouts at the same
+                        # instant, each scored 0 for something the agent never saw.
+                        for attempt in range(setup_retries + 1):
+                            try:
+                                async with asyncio.timeout(setup_timeout):
+                                    await self.env.start()
 
-                            # tools schemas should be visible to the model
-                            # to generate correct tool call format in response
-                            self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
-                            await self.env.install_tools(self.tools_manager.tools)
-                            if self.skills_manager is not None:
-                                await self.env.install_skills(self.skills_manager)
-                                self.interaction.inject_skills_manifest()
+                                    # tools schemas should be visible to the model
+                                    # to generate correct tool call format in response
+                                    self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
+                                    await self.env.install_tools(self.tools_manager.tools)
+                                    if self.skills_manager is not None:
+                                        await self.env.install_skills(self.skills_manager)
+                                        self.interaction.inject_skills_manifest()
+                                break
+                            except Exception as e:
+                                if attempt == setup_retries:
+                                    raise
+                                self.logger.error(
+                                    f"env setup failed ({type(e).__name__}: {e}); rebuilding the "
+                                    f"sandbox, attempt {attempt + 2}/{setup_retries + 1}"
+                                )
+                                try:
+                                    await self.env.close()
+                                except Exception as close_err:
+                                    self.logger.warning(f"could not close the broken sandbox: {close_err}")
+                                self.env = self._init_env(config_dict["env"])
+                                self.interaction.env = self.env
+                                if self.reward_spec is not None:
+                                    self.reward_spec.env = self.env
                         if env_span is not None:
                             env_span.update(
-                                output={"status": "ready", "tools_installed": len(self.tools_manager.tools)}
+                                output={"status": "ready", "attempts": attempt + 1,
+                                        "tools_installed": len(self.tools_manager.tools)}
                             )
 
                     setup_done = True
