@@ -40,7 +40,7 @@ from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
 from uni_agent.reward.base import AbstractRewardSpec
 from uni_agent.reward.registry import register_reward_spec
-from uni_agent.reward.swe_bench import FeedbackConfig, _feedback_seed
+from uni_agent.reward.swe_bench import FeedbackConfig, _feedback_seed, clip_eval_report
 from uni_agent.tracing import (
     TRACE_FEEDBACK_CHARS,
     TRACE_PATCH_CHARS,
@@ -213,7 +213,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                 if tests_span is not None:
                     tests_span.update(
                         output={
-                            "eval_report": eval_report,
+                            "eval_report": clip_eval_report(eval_report),
                             "stdout": trace_clip(output, TRACE_TEST_OUTPUT_CHARS),
                         },
                         metadata={
