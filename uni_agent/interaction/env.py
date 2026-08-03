@@ -145,9 +145,13 @@ class AgentEnv:
 
         await self.deployment.start(max_retries=max_retries)
         self.logger.info("Runtime initialized")
+        # each step logs on entry: a stalled call used to leave a silent gap between
+        # "Runtime initialized" and the setup timeout, with no way to tell which one hung
         if self.env_variables:
+            self.logger.info("Setting env variables...")
             await self.set_env_variables(self.env_variables)
         if self.post_setup_cmd:
+            self.logger.info("Running post_setup_cmd...")
             await self.communicate(self.post_setup_cmd, check="raise")
         if self.privileged_setup_cmd:
             output = await self.communicate(self.privileged_setup_cmd, timeout=300, check="raise")
@@ -156,6 +160,7 @@ class AgentEnv:
 
     @auto_await
     async def install_tools(self, tools: list[AbstractTool]) -> None:
+        self.logger.info(f"Installing {len(tools)} tools...")
         install_dir = self.tool_install_dir
         await self.communicate(f"export PATH={shlex.quote(install_dir.as_posix())}:$PATH", check="raise")
         for tool in tools:
