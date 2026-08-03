@@ -24,7 +24,13 @@ from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
 from uni_agent.reward.base import AbstractRewardSpec
 from uni_agent.reward.registry import register_reward_spec
-from uni_agent.tracing import rollout_trace_span
+from uni_agent.tracing import (
+    TRACE_FEEDBACK_CHARS,
+    TRACE_PATCH_CHARS,
+    TRACE_TEST_OUTPUT_CHARS,
+    rollout_trace_span,
+    trace_clip,
+)
 from uni_agent.utils import auto_await
 
 
@@ -570,8 +576,13 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         # sibling env (isolation) and/or to detect the empty-patch failure mode.
         patch: str | None = None
         if self.isolate or self.feedback.enabled:
-            with rollout_trace_span("patch_extract"):
+            with rollout_trace_span("patch_extract") as patch_span:
                 patch = await self._get_interaction_env_patch()
+                if patch_span is not None:
+                    patch_span.update(
+                        output=trace_clip(patch, TRACE_PATCH_CHARS),
+                        metadata={"chars": len(patch or "")},
+                    )
 
         output = ""
         eval_env = self.env
@@ -613,7 +624,17 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                 self.logger.info(f"Eval report: {eval_report}")
                 result["resolved"] = eval_report["resolved"]
                 if tests_span is not None:
-                    tests_span.update(output={"resolved": result["resolved"], "eval_execution_time": execution_time})
+                    tests_span.update(
+                        output={
+                            "eval_report": eval_report,
+                            "stdout": trace_clip(output, TRACE_TEST_OUTPUT_CHARS),
+                        },
+                        metadata={
+                            "resolved": result["resolved"],
+                            "eval_execution_time": execution_time,
+                            "stdout_chars": len(output),
+                        },
+                    )
         except Exception as e:
             self.logger.error(f"Failed to evaluate: {e}")
         finally:
@@ -626,7 +647,7 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         extra_info: dict = {}
         if self.feedback.enabled:
             instance_id = self.metadata.get("instance_id", "")
-            with rollout_trace_span("feedback_render"):
+            with rollout_trace_span("feedback_render") as feedback_span:
                 extra_info["feedback"] = self.feedback.render(
                     result=result,
                     output=output,
@@ -634,12 +655,21 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                     instance_id=instance_id,
                     seed=_feedback_seed(instance_id, kwargs.get("interaction_result")),
                 )
+                if feedback_span is not None:
+                    feedback_span.update(output=trace_clip(extra_info["feedback"], TRACE_FEEDBACK_CHARS))
         if self.agent_patch_diff_args:
             # a wider re-render of the same prediction, for the reflector only
-            with rollout_trace_span("patch_extract", metadata={"diff_args": self.agent_patch_diff_args}):
+            with rollout_trace_span(
+                "patch_extract", metadata={"diff_args": self.agent_patch_diff_args}
+            ) as wide_span:
                 extra_info["agent_patch"] = await self._get_interaction_env_patch(self.agent_patch_diff_args)
+                if wide_span is not None:
+                    wide_span.update(output=trace_clip(extra_info["agent_patch"], TRACE_PATCH_CHARS))
         if extra_info:
             result["reward_extra_info"] = extra_info
+        # graded prediction, for the trace outcome only: kept out of reward_extra_info
+        # so it never lands in the persisted dumps
+        result["patch"] = patch
 
         return result["resolved"], result
 
