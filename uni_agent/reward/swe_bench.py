@@ -249,6 +249,42 @@ def _category(test_status: dict, category: str, outcome: str) -> list[str]:
 _PARAM_SUFFIX_RE = re.compile(r"\[.*\]$")
 
 
+# names kept per failing bucket; passing names are counted, never listed
+TRACE_REPORT_FAILURES = 40
+
+
+def clip_eval_report(report, cap=TRACE_REPORT_FAILURES):
+    """Trace-sized view of an eval report: counts for every bucket, names only for
+    failures.
+
+    ``PASS_TO_PASS.success`` alone runs to thousands of test ids on a large repo and
+    dwarfs everything else in the trace, while carrying no diagnostic weight -- the
+    failing ids are what a reader is after.
+    """
+    if not isinstance(report, dict):
+        return report
+    status = report.get("test_status")
+    if not isinstance(status, dict):
+        return report
+    clipped = {}
+    for category, buckets in status.items():
+        if not isinstance(buckets, dict):
+            clipped[category] = buckets
+            continue
+        entry = {}
+        for bucket, tests in buckets.items():
+            if not isinstance(tests, list):
+                entry[bucket] = tests
+                continue
+            entry[f"n_{bucket}"] = len(tests)
+            if bucket == "failure" and tests:
+                entry["failure"] = tests[:cap]
+                if len(tests) > cap:
+                    entry["failure_omitted"] = len(tests) - cap
+        clipped[category] = entry
+    return {**{k: v for k, v in report.items() if k != "test_status"}, "test_status": clipped}
+
+
 def _feedback_seed(instance_id: str, interaction_result: dict | None) -> int:
     """Per (task, training step): a task re-sampled at a later step surfaces different failures,
     but any single (task, step) renders identically, so a run stays reproducible."""
@@ -626,7 +662,7 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                 if tests_span is not None:
                     tests_span.update(
                         output={
-                            "eval_report": eval_report,
+                            "eval_report": clip_eval_report(eval_report),
                             "stdout": trace_clip(output, TRACE_TEST_OUTPUT_CHARS),
                         },
                         metadata={
