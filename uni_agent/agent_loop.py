@@ -34,6 +34,10 @@ from uni_agent.tracing import (
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
 
+#: What a saved segment grid keeps: enough to locate a turn's tokens and re-derive the row.
+#: `response_logprobs` is the bulk of the bytes and is recomputed by anything that needs it.
+SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "turn_spans")
+
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge ``overrides`` on top of ``base``, returning a new dict.
@@ -483,6 +487,14 @@ class UniAgentLoop(AgentLoopBase):
         # rollout_cache: binary pickle for fast I/O (no readability needed)
         with (self.output_dir / "rollout_cache.pkl").open("wb") as f:
             pickle.dump(interaction_result["rollout_cache"], f, protocol=pickle.HIGHEST_PROTOCOL)
+        # A condensation starts a new segment, and each segment becomes its own training row, so a
+        # turn's tokens live in exactly one grid. rollout_cache above is only the final buffer;
+        # without the rest, offline scoring of a hint on an earlier turn has nothing to score against.
+        segments = interaction_result.get("segments") or []
+        if len(segments) > 1:
+            grids = [{f: seg["rollout_cache"].get(f) for f in SEGMENT_GRID_FIELDS} for seg in segments]
+            with (self.output_dir / "segment_grids.pkl").open("wb") as f:
+                pickle.dump(grids, f, protocol=pickle.HIGHEST_PROTOCOL)
         # rest: readable JSON
         save_content = {
             "trajectory": [s.model_dump() for s in interaction_result["trajectory"]],
