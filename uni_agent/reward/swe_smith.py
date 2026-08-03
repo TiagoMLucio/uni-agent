@@ -62,10 +62,16 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
     repo_directory = "/testbed"
     # Apply the agent patch with swesmith's fallback ladder; echo the sentinel on total
     # failure so _get_logs_eval can flag patch_apply_failed (mirrors the library).
-    apply_lines = ["_applied=0"]
-    for cmd in GIT_APPLY_CMDS:
-        apply_lines.append(f'if [ "$_applied" -eq 0 ] && {cmd} /tmp/swesmith_pred.diff; then _applied=1; fi')
-    apply_lines.append(f"if [ \"$_applied\" -eq 0 ]; then echo '{APPLY_PATCH_FAIL}'; fi")
+    # An empty prediction reaches the heredoc as a lone newline, which every rung of the ladder
+    # rejects as garbage -- so an agent that never landed an edit was reported as
+    # patch_apply_failed. There is nothing to apply, so do not claim the apply failed.
+    if not (patch or "").strip():
+        apply_lines = ["echo 'empty prediction: nothing to apply'"]
+    else:
+        apply_lines = ["_applied=0"]
+        for cmd in GIT_APPLY_CMDS:
+            apply_lines.append(f'if [ "$_applied" -eq 0 ] && {cmd} /tmp/swesmith_pred.diff; then _applied=1; fi')
+        apply_lines.append(f"if [ \"$_applied\" -eq 0 ]; then echo '{APPLY_PATCH_FAIL}'; fi")
 
     revert_tests = f"git checkout -- {' '.join(test_files)}" if test_files else "echo 'no test files to reset'"
 
@@ -209,6 +215,9 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     await sibling.close()
                 except Exception as e:
                     self.logger.error(f"Failed to close sibling eval env: {e}")
+
+        # distinct from patch_apply_failed: the agent produced no diff at all
+        result["empty_patch"] = not (patch or "").strip()
 
         extra_info: dict = {}
         if self.feedback.enabled:
