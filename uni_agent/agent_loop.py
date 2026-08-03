@@ -22,13 +22,14 @@ from uni_agent.reflection import ReflectionConfig, Reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
+    TRACE_PATCH_CHARS,
     register_langfuse_op,
-    rollout_trace_event,
     rollout_trace_op,
     rollout_trace_score,
     rollout_trace_span,
     rollout_trace_update_span,
     rollout_trace_update_trace,
+    trace_clip,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -191,6 +192,11 @@ class UniAgentLoop(AgentLoopBase):
                                     if self.skills_manager is not None:
                                         await self.env.install_skills(self.skills_manager)
                                         self.interaction.inject_skills_manifest()
+                                if env_span is not None:
+                                    env_span.update(
+                                        output={"status": "ready", "attempts": attempt + 1},
+                                        metadata={"retried": attempt > 0},
+                                    )
                                 break
                             except Exception as e:
                                 if attempt == setup_retries:
@@ -284,10 +290,8 @@ class UniAgentLoop(AgentLoopBase):
                             rollout_trace_score(
                                 "resolved", int(bool(reward_result["resolved"])), data_type="BOOLEAN"
                             )
-                        # persist the textual eval report; only scalar scores are traced otherwise
-                        feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback")
-                        if feedback:
-                            rollout_trace_event("reward_feedback", output=feedback)
+                        # trace-only: the feedback text rides its own feedback_render span
+                        interaction_result["graded_patch"] = reward_result.get("patch")
                 else:
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
@@ -469,7 +473,10 @@ class UniAgentLoop(AgentLoopBase):
             "condensations": max(len(segments) - 1, 0) if segments else 0,
             "hinted_turns": len(interaction_result.get("turn_feedback") or {}),
         }
-        rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
+        patch = interaction_result.get("graded_patch")
+        # the diff goes in the output only: metadata stays scalar so it remains filterable
+        output = dict(outcome, patch=trace_clip(patch, TRACE_PATCH_CHARS)) if patch else outcome
+        rollout_trace_update_trace(output=output, metadata={"outcome": outcome})
 
     def _save_interaction_result(self, interaction_result: dict):
         self.output_dir.mkdir(parents=True, exist_ok=True)
