@@ -34,9 +34,10 @@ from uni_agent.tracing import (
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
 
-#: What a saved segment grid keeps: enough to locate a turn's tokens and re-derive the row.
-#: `response_logprobs` is the bulk of the bytes and is recomputed by anything that needs it.
-SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "turn_spans")
+#: What a saved segment grid keeps: enough to locate a turn's tokens and rebuild the training
+#: row for it. `response_logprobs` is the sampler's own log-prob per token, which the SDPO loss
+#: uses as `old_log_probs` for its IS ratio, so it cannot be recomputed after the fact.
+SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn_spans")
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
