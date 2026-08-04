@@ -54,8 +54,9 @@ def test_condensed_rollout_saves_every_segment(tmp_path):
     grids = pickle.loads((out / "segment_grids.pkl").read_bytes())
     assert [sorted(s for s, _, _ in g["turn_spans"]) for g in grids] == [[1, 2], [3]]
     assert all(set(g) == set(SEGMENT_GRID_FIELDS) for g in grids)
-    # the float array is the bulk of the bytes and is recomputed by whatever needs it
-    assert all("response_logprobs" not in g for g in grids)
+    # the sampler's log-probs ride along: the loss needs them as old_log_probs and nothing
+    # downstream can recover them
+    assert all(len(g["response_logprobs"]) == len(g["response_mask"]) for g in grids)
     # every turn is reachable, which is the whole point
     assert {s for g in grids for s, _, _ in g["turn_spans"]} == {1, 2, 3}
 
