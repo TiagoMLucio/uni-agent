@@ -100,9 +100,13 @@ class AgentChatModel:
         prompt_ids = rollout_cache["prompt_ids"]
         metrics = rollout_cache["metrics"]
 
-        if len(prompt_ids) >= self.max_model_len:
+        # `max_model_len` is the agent's own context budget, which is what the condenser reseats
+        # against; a caller that is not building the agent's context (the reflector reads a whole
+        # finished trajectory in one shot) may raise its own ceiling up to what the engine serves.
+        limit = kwargs.get("max_model_len") or self.max_model_len
+        if len(prompt_ids) >= limit:
             raise MaxTokenExceededError(
-                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {self.max_model_len}\n"
+                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {limit}\n"
                 f"Last tool response: {messages[-1]['content']}"
             )
 
@@ -113,7 +117,7 @@ class AgentChatModel:
         # min() with the window keeps a capped call from ever overflowing max_model_len.
         turn_limit = None
         if self.max_completion_tokens:
-            room = max(1, self.max_model_len - len(prompt_ids))
+            room = max(1, limit - len(prompt_ids))
             turn_limit = min(int(self.max_completion_tokens), room)
             sampling_params = {**sampling_params, "max_tokens": turn_limit}
 
@@ -172,9 +176,9 @@ class AgentChatModel:
             num_preempted=token_output.num_preempted,
         )
 
-        if len(rollout_cache["prompt_ids"]) >= self.max_model_len:
+        if len(rollout_cache["prompt_ids"]) >= limit:
             raise MaxTokenExceededError(
-                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {self.max_model_len}\n"
+                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {limit}\n"
                 f"Generated response:\n{response_str}"
             )
 

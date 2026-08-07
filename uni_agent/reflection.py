@@ -63,6 +63,12 @@ class ReflectionConfig(BaseModel):
     include_agent_patch: bool = True
     include_exec_feedback: bool = True
     max_selected_turns: int = 5
+    # The reflector reads a finished trajectory in one shot, so it needs far more room than the
+    # agent's own context budget, which the condenser reseats against. Left unset it inherits
+    # that budget, and long trajectories then get hints written from a shrink-laddered render:
+    # measured over SWE-smith, a render with observations already capped at 1000 chars reaches
+    # ~47k tokens, well past a 32k agent budget. Cannot exceed what the engine serves.
+    max_model_len: int | None = None
     max_observation_chars: int = 1000
     max_diagnosis_chars: int = 4000
     # the shrink ladder only trims turns, so an outsized patch overflows at every level and
@@ -115,7 +121,8 @@ class Reflector:
                 # the rollout request's response-length formula clamps to 1 token on long prompts, truncating the JSON
                 sampling_params = {**(getattr(self.model, "sampling_params", None) or {}), "max_tokens": 2048}
                 text, _, _, _ = await self.model.query(
-                    messages=messages, rollout_cache=cache, sampling_params=sampling_params
+                    messages=messages, rollout_cache=cache, sampling_params=sampling_params,
+                    max_model_len=cfg.max_model_len,
                 )
             except MaxTokenExceededError as exc:
                 self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")

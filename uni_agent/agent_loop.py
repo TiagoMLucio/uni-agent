@@ -563,11 +563,15 @@ class UniAgentLoop(AgentLoopBase):
             config_dict = _deep_merge(config_dict, config_dict["validation_overrides"])
 
         rollout_config = self.config.actor_rollout_ref.rollout
-        max_model_len = (
+        engine_len = (
             rollout_config.max_model_len
             if rollout_config.max_model_len is not None
             else rollout_config.prompt_length + rollout_config.response_length
         )
+        # The engine's ceiling and the agent's context budget stop being the same number once a
+        # caller needs more room than the agent does. `context_budget` is what the loop and the
+        # condenser live within; the engine is served wider so the reflector can use it.
+        max_model_len = min(int(config_dict.get("context_budget") or engine_len), engine_len)
         config_dict["model"] = {
             "client": self.server_manager,
             "tokenizer": self.tokenizer,
