@@ -18,7 +18,7 @@ from uni_agent.interaction import (
     ToolsManager,
     ToolsManagerConfig,
 )
-from uni_agent.reflection import ReflectionConfig, Reflector
+from uni_agent.reflection import build_reflection_config, load_reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
@@ -322,7 +322,7 @@ class UniAgentLoop(AgentLoopBase):
     async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
         """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: diagnosis}."""
         try:
-            config = ReflectionConfig(**(config_dict.get("reflection") or {}))
+            config = build_reflection_config(config_dict.get("reflection"))
             if not config.enabled or validate:
                 return {}
             if config.failed_only and interaction_result.get("reward_score"):
@@ -374,7 +374,7 @@ class UniAgentLoop(AgentLoopBase):
 
             if should_break("reflection"):
                 breakpoint()
-            reflector = Reflector(self.chat_model, config, run_id=self.run_id)
+            reflector = load_reflector(self.chat_model, config, run_id=self.run_id)
             return await reflector.reflect_trajectory(
                 task=task,
                 turns=turns,

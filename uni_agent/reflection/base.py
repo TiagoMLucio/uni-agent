@@ -8,13 +8,13 @@ target. Guidance only: the prompt forbids revealing the fix itself.
 """
 
 import json
-from typing import Any
+from abc import ABC, abstractmethod
+from typing import Any, ClassVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction.model import MaxTokenExceededError
-from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
 DEFAULT_SYSTEM_TEMPLATE = (
     "You are a hindsight coach reviewing a software-engineering agent's failed attempt at a "
@@ -44,6 +44,11 @@ DEFAULT_USER_TEMPLATE = (
     "Return the JSON with one hint per selected turn (at most {k})."
 )
 
+#: A reasoned prompt writes its audit before the answer, so the object that matters is the one
+#: after the last marker. Parsing the first decodable ``{...}`` instead lets a brace quoted in
+#: the audit shadow the real hints, which costs the rollout its supervision silently.
+FINAL_MARKER = "FINAL_HINTS_JSON:"
+
 TURN_TEMPLATE = "### Turn {step}\nASSISTANT:\n{response}\n{tools}"
 # the response is the model's raw output, so it already carries the tool call and its arguments;
 # rendering the parsed action too duplicated whole written files in the prompt
@@ -52,9 +57,17 @@ TOOL_TEMPLATE = "TOOL {name}:\n{observation}"
 _JSON_DECODER = json.JSONDecoder()
 
 
-class ReflectionConfig(BaseModel):
-    """Hindsight-reflector settings (off by default; the agent config's ``reflection`` block)."""
+class BaseReflectionConfig(BaseModel):
+    """Settings shared by every reflector (the agent config's ``reflection`` block).
 
+    ``name`` picks the implementation from the registry; each one validates the block against
+    its own subclass, so a key that belongs to another strategy is rejected rather than ignored.
+    """
+
+    #: a misspelled key used to be dropped in silence, leaving the default in force
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = "single"
     enabled: bool = False
     failed_only: bool = True
     include_gold: bool = True
@@ -74,74 +87,74 @@ class ReflectionConfig(BaseModel):
     # the shrink ladder only trims turns, so an outsized patch overflows at every level and
     # drops the rollout's hints entirely. Over SWE-smith 16k spares 99.2% of tasks.
     max_patch_chars: int = 16000
-    system_template: str = DEFAULT_SYSTEM_TEMPLATE
-    user_template: str = DEFAULT_USER_TEMPLATE
+    # Room for the reflector's own reply. A reasoned prompt writes an audit before its JSON, and
+    # 2048 truncates the tail on long trajectories: the object never closes and the rollout loses
+    # every hint without an error, since a cut reply simply parses to nothing.
+    max_output_tokens: int = 2048
+    # Retries when the render overflows the serving context, as (observation cap, response cap);
+    # None means uncapped. The first attempt always uses max_observation_chars, so these are what
+    # it falls back to. Deriving them from that field instead made the first rungs no-ops
+    # whenever it was set high.
+    shrink_ladder: list[tuple[int | None, int | None]] = [
+        (2000, None), (1000, None), (1000, 2000), (1000, 1000),
+    ]
 
 
-class Reflector:
-    """Policy-as-reflector: one call per rollout through the given chat model.
+class AbstractReflector(ABC):
+    """One reflector strategy: turns a finished trajectory into hints for its pivotal turns.
 
     ``model`` is any client exposing ``prepare_rollout_cache``/``query``.
     """
 
-    def __init__(self, model: Any, config: ReflectionConfig, run_id: str = ""):
+    Config: ClassVar[type[BaseReflectionConfig]] = BaseReflectionConfig
+
+    def __init__(self, model: Any, config: BaseReflectionConfig, run_id: str = ""):
         self.model = model
         self.config = config
         self.logger = get_logger("reflection", run_id=run_id)
 
-    @rollout_trace_op
+    @abstractmethod
     async def reflect_trajectory(
         self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = "", agent_patch: str = ""
     ) -> dict[int, str]:
-        """Select and hint the pivotal turns of one full trajectory; empty on any failure.
+        """Hints keyed by step index; empty on any failure, since hints are optional supervision."""
 
-        The render is retried down a shrink ladder (smaller observation caps, then middle-cut
-        responses) when the prompt exceeds the serving context; the overflow check is client-
-        side, so retries cost no server call.
-        """
+    async def _ask(self, system: str, render_user, max_output_tokens: int | None = None) -> str | None:
+        """One call, retried down the shrink ladder. ``render_user(obs_cap, resp_cap) -> str``."""
         cfg = self.config
-        k = str(cfg.max_selected_turns)
-        system = cfg.system_template.replace("{k}", k)
-        obs = cfg.max_observation_chars
-        gold = self._clip(gold, cfg.max_patch_chars) if gold else gold
-        agent_patch = self._clip(agent_patch, cfg.max_patch_chars) if agent_patch else agent_patch
-        for obs_cap, resp_cap in ((obs, None), (obs // 2, None), (obs // 2, 800)):
-            user = cfg.user_template.replace("{k}", k).format(
-                task=task,
-                outcome=outcome or "(not available)",
-                agent_patch=agent_patch if cfg.include_agent_patch and agent_patch else "(not available)",
-                gold=gold if cfg.include_gold and gold else "(not available)",
-                feedback=feedback if cfg.include_exec_feedback and feedback else "(not available)",
-                turns=self._render_turns(turns, obs_cap, resp_cap),
-            )
-            messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        for obs_cap, resp_cap in [(cfg.max_observation_chars, None), *cfg.shrink_ladder]:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": render_user(obs_cap, resp_cap)},
+            ]
             try:
                 # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
                 cache = await self.model.prepare_rollout_cache(messages, include_tools=False)
-                # the rollout request's response-length formula clamps to 1 token on long prompts, truncating the JSON
-                sampling_params = {**(getattr(self.model, "sampling_params", None) or {}), "max_tokens": 2048}
+                sampling_params = {
+                    **(getattr(self.model, "sampling_params", None) or {}),
+                    "max_tokens": max_output_tokens or cfg.max_output_tokens,
+                }
                 text, _, _, _ = await self.model.query(
                     messages=messages, rollout_cache=cache, sampling_params=sampling_params,
                     max_model_len=cfg.max_model_len,
                 )
+                return text
             except MaxTokenExceededError as exc:
                 self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
                 continue
             except Exception as exc:
                 self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
-                return {}
-            valid_steps = {turn["step"] for turn in turns}
-            hints = {
-                step: self._clip_diagnosis(diagnosis)
-                for step, diagnosis in self._parse(text).items()
-                if step in valid_steps
-            }
-            # over-selection guard: keep the earliest K
-            if len(hints) > cfg.max_selected_turns:
-                hints = dict(sorted(hints.items())[: cfg.max_selected_turns])
-            return hints
+                return None
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
-        return {}
+        return None
+
+    def _keep_valid(self, hints: dict[int, str], turns: list[dict]) -> dict[int, str]:
+        """Hints for real turns only, capped at the configured budget, earliest first."""
+        valid = {turn["step"] for turn in turns}
+        kept = {step: self._clip_diagnosis(text) for step, text in hints.items() if step in valid}
+        if len(kept) > self.config.max_selected_turns:
+            kept = dict(sorted(kept.items())[: self.config.max_selected_turns])
+        return kept
 
     def _clip_diagnosis(self, text: str) -> str:
         """Suffix-cut an over-long hint, marking the cut so the teacher knows it is incomplete."""
@@ -173,10 +186,10 @@ class Reflector:
             return text
         return self._clip(text, cap)
 
-    def _clip(self, text: str, cap: int) -> str:
+    def _clip(self, text: str, cap: int | None) -> str:
         """Middle-out truncation: a failing turn's signal is often at the observation's tail
-        (traceback, assertion), so keep both ends and elide the middle."""
-        if len(text) <= cap:
+        (traceback, assertion), so keep both ends and elide the middle. ``None`` is uncapped."""
+        if cap is None or len(text) <= cap:
             return text
         head = cap // 2
         return f"{text[:head]}\n[... {len(text) - cap} chars elided ...]\n{text[-(cap - head):]}"
@@ -192,9 +205,15 @@ class Reflector:
                 idx = text.find("{", idx + 1)
         return None
 
-    @staticmethod
-    def _parse(text: str) -> dict[int, str]:
-        raw = Reflector._extract_json_object(text)
+    @classmethod
+    def _parse(cls, text: str) -> dict[int, str]:
+        # After the last marker first, so an audit's own braces cannot shadow the answer; the
+        # unanchored scan stays as the fallback for a reply that omitted the marker entirely.
+        raw = None
+        if FINAL_MARKER in (text or ""):
+            raw = cls._extract_json_object(text.rsplit(FINAL_MARKER, 1)[1])
+        if not isinstance(raw, dict):
+            raw = cls._extract_json_object(text)
         if not isinstance(raw, dict):
             return {}
         hints: dict[int, str] = {}
@@ -205,4 +224,3 @@ class Reflector:
         return hints
 
 
-register_langfuse_op("Reflector.reflect_trajectory", name="reflection", as_type="evaluator")
