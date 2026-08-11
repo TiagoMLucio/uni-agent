@@ -45,6 +45,8 @@ def build_reflection_config(config: dict[str, Any] | None) -> BaseReflectionConf
     return _reflector_class(config.get("name", "single")).Config(**config)
 
 
-def load_reflector(model: Any, config: BaseReflectionConfig, run_id: str = "") -> AbstractReflector:
+def load_reflector(model: Any, config: BaseReflectionConfig, run_id: str = "",
+                   record_path=None, identity: dict | None = None) -> AbstractReflector:
     """Instantiate the reflector a validated config selects."""
-    return _reflector_class(config.name)(model, config, run_id=run_id)
+    return _reflector_class(config.name)(
+        model, config, run_id=run_id, record_path=record_path, identity=identity)

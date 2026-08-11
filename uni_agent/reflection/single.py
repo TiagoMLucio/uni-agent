@@ -43,7 +43,7 @@ class Reflector(AbstractReflector):
                 turns=self._render_turns(turns, obs_cap, resp_cap),
             )
 
-        text = await self._ask(cfg.system_template.replace("{k}", k), render_user)
+        text = await self._ask(cfg.system_template.replace("{k}", k), render_user, stage="single")
         if text is None:
             return {}
         return self._keep_valid(self._parse(text), turns)

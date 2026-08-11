@@ -374,7 +374,9 @@ class UniAgentLoop(AgentLoopBase):
 
             if should_break("reflection"):
                 breakpoint()
-            reflector = load_reflector(self.chat_model, config, run_id=self.run_id)
+            reflector = load_reflector(
+                self.chat_model, config, run_id=self.run_id,
+                record_path=self.output_dir / "reflection.jsonl.gz", identity=self.identity)
             return await reflector.reflect_trajectory(
                 task=task,
                 turns=turns,

@@ -7,14 +7,17 @@ hint per selected turn. Hints condition the distillation teacher and are never a
 target. Guidance only: the prompt forbids revealing the fix itself.
 """
 
+import gzip
 import json
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction.model import MaxTokenExceededError
+from uni_agent.tracing import rollout_trace_span
 
 DEFAULT_SYSTEM_TEMPLATE = (
     "You are a hindsight coach reviewing a software-engineering agent's failed attempt at a "
@@ -108,10 +111,14 @@ class AbstractReflector(ABC):
 
     Config: ClassVar[type[BaseReflectionConfig]] = BaseReflectionConfig
 
-    def __init__(self, model: Any, config: BaseReflectionConfig, run_id: str = ""):
+    def __init__(self, model: Any, config: BaseReflectionConfig, run_id: str = "",
+                 record_path: Path | None = None, identity: dict | None = None):
         self.model = model
         self.config = config
         self.logger = get_logger("reflection", run_id=run_id)
+        self._record_path = Path(record_path) if record_path else None
+        self.identity = {k: v for k, v in (identity or {}).items()
+                         if k in ("uid", "instance_id", "run_id")}
 
     @abstractmethod
     async def reflect_trajectory(
@@ -119,7 +126,8 @@ class AbstractReflector(ABC):
     ) -> dict[int, str]:
         """Hints keyed by step index; empty on any failure, since hints are optional supervision."""
 
-    async def _ask(self, system: str, render_user, max_output_tokens: int | None = None) -> str | None:
+    async def _ask(self, system: str, render_user, max_output_tokens: int | None = None,
+                   stage: str = "", step: int | None = None) -> str | None:
         """One call, retried down the shrink ladder. ``render_user(obs_cap, resp_cap) -> str``."""
         cfg = self.config
         for obs_cap, resp_cap in [(cfg.max_observation_chars, None), *cfg.shrink_ladder]:
@@ -127,32 +135,68 @@ class AbstractReflector(ABC):
                 {"role": "system", "content": system},
                 {"role": "user", "content": render_user(obs_cap, resp_cap)},
             ]
+            # every call reaches Langfuse as an identical model_call, so a pipeline's stages are
+            # indistinguishable there without a span naming the one they belong to
+            label = "reflect:{}".format(stage or "call") + ("" if step is None else f"@turn{step}")
             try:
-                # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
-                cache = await self.model.prepare_rollout_cache(messages, include_tools=False)
-                # the engine is sized for this call, not for a rollout: rollouts condense to the
-                # agent's budget while a reflector prompt is the whole trajectory at once, so its
-                # prefill is what sets the peak activation the rollout engine has to fit
-                prompt_tokens = len(cache.get("prompt_ids") or ())
-                sampling_params = {
-                    **(getattr(self.model, "sampling_params", None) or {}),
-                    "max_tokens": max_output_tokens or cfg.max_output_tokens,
-                }
-                text, _, _, _ = await self.model.query(
-                    messages=messages, rollout_cache=cache, sampling_params=sampling_params,
-                    max_model_len=cfg.max_model_len,
-                )
+                with rollout_trace_span(label, metadata={"obs_cap": obs_cap, "resp_cap": resp_cap}):
+                    # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
+                    cache = await self.model.prepare_rollout_cache(messages, include_tools=False)
+                    # the engine is sized for this call, not for a rollout: rollouts condense to the
+                    # agent's budget while a reflector prompt is the whole trajectory at once, so its
+                    # prefill is what sets the peak activation the rollout engine has to fit
+                    prompt_tokens = len(cache.get("prompt_ids") or ())
+                    sampling_params = {
+                        **(getattr(self.model, "sampling_params", None) or {}),
+                        "max_tokens": max_output_tokens or cfg.max_output_tokens,
+                    }
+                    text, _, _, _ = await self.model.query(
+                        messages=messages, rollout_cache=cache, sampling_params=sampling_params,
+                        max_model_len=cfg.max_model_len,
+                    )
                 self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
                                  f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
+                self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap)
                 return text
             except MaxTokenExceededError as exc:
                 self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
+                self._record(stage, step, messages, None, None, obs_cap, resp_cap, error="over budget")
                 continue
             except Exception as exc:
                 self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
+                self._record(stage, step, messages, None, None, obs_cap, resp_cap, error=repr(exc))
                 return None
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
         return None
+
+    def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error=""):
+        """Append one call to the rollout's reflection log, if the loop asked for one.
+
+        What each stage was shown and answered is not recoverable from anything else the
+        rollout writes, so it is captured here or not at all. Never raises: a reflector
+        that dies over its own bookkeeping would cost the rollout its supervision.
+        """
+        if self._record_path is None:
+            return
+        try:
+            row = {
+                **self.identity,
+                "stage": stage,
+                "step": step,
+                "obs_cap": obs_cap,
+                "resp_cap": resp_cap,
+                "prompt_tokens": prompt_tokens,
+                "system": messages[0]["content"],
+                "user": messages[1]["content"],
+                "output": text,
+                "error": error,
+            }
+            self._record_path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(self._record_path, "at", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            self.logger.warning(f"Reflection record not written: {exc!r}")
+            self._record_path = None
 
     def _keep_valid(self, hints: dict[int, str], turns: list[dict]) -> dict[int, str]:
         """Hints for real turns only, capped at the configured budget, earliest first."""
