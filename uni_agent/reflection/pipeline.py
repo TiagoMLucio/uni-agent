@@ -204,6 +204,10 @@ class PipelineReflector(AbstractReflector):
         if text == " ".join(original.split()):
             return original, "unchanged"
         if edit == "delete_only" and not is_deletion_of(text, original):
+            # the lab sees no rewrites at all on this prompt, so when training sees nothing but,
+            # the reply itself is the only evidence of what the stage is really being asked
+            self.logger.info(f"Reflection rewrote, draft kept | draft={original[:160]!r} "
+                             f"| reply={text[:220]!r}")
             return (original or None), "rewrote"
         return text, "edited"
 
