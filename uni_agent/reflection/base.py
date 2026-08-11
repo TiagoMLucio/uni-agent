@@ -130,6 +130,10 @@ class AbstractReflector(ABC):
             try:
                 # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
                 cache = await self.model.prepare_rollout_cache(messages, include_tools=False)
+                # the engine is sized for this call, not for a rollout: rollouts condense to the
+                # agent's budget while a reflector prompt is the whole trajectory at once, so its
+                # prefill is what sets the peak activation the rollout engine has to fit
+                prompt_tokens = len(cache.get("prompt_ids") or ())
                 sampling_params = {
                     **(getattr(self.model, "sampling_params", None) or {}),
                     "max_tokens": max_output_tokens or cfg.max_output_tokens,
@@ -138,6 +142,8 @@ class AbstractReflector(ABC):
                     messages=messages, rollout_cache=cache, sampling_params=sampling_params,
                     max_model_len=cfg.max_model_len,
                 )
+                self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
+                                 f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
                 return text
             except MaxTokenExceededError as exc:
                 self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
