@@ -29,6 +29,9 @@ PREV_FIELD = "prev"
 
 _JSON_DECODER = json.JSONDecoder()
 _DROP = {"DROP", "NONE", "REMOVE"}
+#: chat-template control tokens survive in the raw completion; a trailing <|im_end|>
+#: made every reply look like a rewrite, since it is a word the draft cannot contain
+_SPECIAL = re.compile(r"<\|[^|]*\|>")
 
 
 def _fields(template: str) -> set[str]:
@@ -196,7 +199,7 @@ class PipelineReflector(AbstractReflector):
             text = raw.rsplit(FINAL_MARKER, 1)[1]
         else:
             text = next((line for line in reversed((raw or "").splitlines()) if line.strip()), "")
-        text = " ".join(text.split()).strip().strip('"')
+        text = " ".join(_SPECIAL.sub(" ", text).split()).strip().strip('"')
         if not text:
             return (original or None), "empty"
         if text.upper() in _DROP:
