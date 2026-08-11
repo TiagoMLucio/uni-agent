@@ -182,11 +182,10 @@ REPAIR = CallSpec(id="repair", per="turn", parse="hints", edit="delete_only", sy
                   user="{task}\nprefix:\n{prefix}\nturn {turn}\nhint: {hint}")
 
 
-def test_pipeline_drafts_then_deletes_from_each_hint():
+def test_a_per_turn_stage_replaces_each_hint_with_what_it_returns():
     replies = {
         "DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py because the gold says so", '
                  '"turn4": "run the reproduction script first"}',
-        # a true deletion of turn1's draft, and an untouched turn4
         "REPAIR": lambda user: ("FINAL_HINTS_JSON:\nopen parser.py" if "turn 1" in user
                                 else "FINAL_HINTS_JSON:\nrun the reproduction script first"),
     }
@@ -194,13 +193,42 @@ def test_pipeline_drafts_then_deletes_from_each_hint():
     assert hints == {1: "open parser.py", 4: "run the reproduction script first"}
 
 
-def test_delete_only_rejects_a_rewrite_and_drops_the_hint():
+def test_a_rewrite_is_refused_and_the_draft_stands():
+    """The stage sees a draft written with the patch, so a rewrite can restate what it never saw."""
     replies = {
         "DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}',
-        "REPAIR": "FINAL_HINTS_JSON:\ninstead you should edit the compiler",
+        "REPAIR": "FINAL_HINTS_JSON:\nthe reference patch shows you should edit the compiler",
     }
     hints, _ = _pipeline(replies, [DRAFT, REPAIR])
+    assert hints == {1: "open parser.py"}
+
+
+def test_a_failed_repair_call_drops_the_hint_rather_than_keeping_it():
+    class _Flaky(_ScriptedModel):
+        async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
+            if "REPAIR" in messages[0]["content"]:
+                raise RuntimeError("boom")
+            return await super().query(messages, rollout_cache, sampling_params, max_model_len)
+
+    model = _Flaky({"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}'})
+    reflector = PipelineReflector(model, PipelineReflectionConfig(enabled=True, name="pipeline",
+                                                                 calls=[DRAFT, REPAIR]))
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
     assert hints == {}
+
+
+def test_a_stage_that_says_drop_removes_the_hint():
+    replies = {"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}',
+               "REPAIR": "nothing here is quotable\nFINAL_HINTS_JSON:\nDROP"}
+    hints, _ = _pipeline(replies, [DRAFT, REPAIR])
+    assert hints == {}
+
+
+def test_a_stage_that_forgets_the_marker_yields_its_last_line():
+    replies = {"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}',
+               "REPAIR": "clause one: fine\nclause two: unsupported\nopen parser.py"}
+    hints, _ = _pipeline(replies, [DRAFT, REPAIR])
+    assert hints == {1: "open parser.py"}
 
 
 def test_a_per_turn_call_sees_only_its_own_prefix():

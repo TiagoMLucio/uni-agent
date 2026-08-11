@@ -9,6 +9,7 @@ express, since ``{prefix}`` is the trajectory truncated to the hinted turn.
 import asyncio
 import json
 import re
+from collections import Counter
 from string import Formatter
 from typing import Any, ClassVar, Literal
 
@@ -52,7 +53,9 @@ class CallSpec(BaseModel):
     user: str
     per: Literal["trace", "turn"] = "trace"
     parse: Literal["text", "turns", "hints"] = "text"
-    #: ``delete_only`` rejects any reply introducing a word the draft did not have
+    #: ``delete_only`` refuses a reply that introduces a word the draft did not have. The stage
+    #: sees the draft, which was written with the patch, so an unconstrained rewrite can restate
+    #: privileged content the stage itself never saw.
     edit: Literal["free", "delete_only"] = "free"
     max_output_tokens: int | None = None
 
@@ -144,14 +147,24 @@ class PipelineReflector(AbstractReflector):
         )
         if call.parse != "hints":
             return hints
-        out = dict(hints)
+        out, tally = dict(hints), Counter()
         for step, reply in zip(selected, replies, strict=True):
-            # a stage that exists to strip privileged content must not ship it when the call fails
-            adopted = None if reply is None else self._adopt(reply, hints.get(step, ""), call.edit)
-            if adopted is None or not adopted:
+            # a failed call leaves nothing to judge the hint by, so it goes; a rewrite leaves the
+            # drafted hint standing, which is the worst case this stage can produce
+            if reply is None:
                 out.pop(step, None)
+                tally["failed"] += 1
+                continue
+            text, outcome = self._adopt(reply, hints.get(step, ""), call.edit)
+            tally[outcome] += 1
+            if text:
+                out[step] = self._clip_diagnosis(text)
             else:
-                out[step] = self._clip_diagnosis(adopted)
+                out.pop(step, None)
+        # "unchanged" is the stage saying there is nothing to cut; "rewrote" is the guard firing.
+        # Reporting them together once hid a run where every reply was a rewrite.
+        summary = ", ".join(f"{n} {k}" for k, n in sorted(tally.items()))
+        self.logger.info(f"Reflection {call.id}: {summary}")
         return out
 
     def _render(self, template, k, base, turns, obs_cap, resp_cap, prev="", step=None, hint="") -> str:
@@ -170,16 +183,27 @@ class PipelineReflector(AbstractReflector):
             values[PREV_FIELD] = prev
         return template.replace("{k}", k).format(**values)
 
-    def _adopt(self, raw: str, original: str, edit: str) -> str | None:
-        """The stage's replacement for one hint: ``None`` drops it, ``""`` drops it, else the text."""
-        text = raw.rsplit(FINAL_MARKER, 1)[1] if FINAL_MARKER in raw else raw
+    def _adopt(self, raw: str, original: str, edit: str) -> tuple[str | None, str]:
+        """The stage's hint for one turn, with what it did: the text, or ``original`` when it
+        declines to edit, or None to drop.
+
+        Without the marker the reply is taken as its last line: a stage that writes its audit and
+        forgets the marker would otherwise ship the whole audit as the hint.
+        """
+        if FINAL_MARKER in raw:
+            text = raw.rsplit(FINAL_MARKER, 1)[1]
+        else:
+            text = next((line for line in reversed((raw or "").splitlines()) if line.strip()), "")
         text = " ".join(text.split()).strip().strip('"')
-        if not text or text.upper() in _DROP:
-            return None
+        if not text:
+            return (original or None), "empty"
+        if text.upper() in _DROP:
+            return None, "dropped"
+        if text == " ".join(original.split()):
+            return original, "unchanged"
         if edit == "delete_only" and not is_deletion_of(text, original):
-            self.logger.info("Reflection repair rewrote instead of deleting; hint dropped")
-            return None
-        return text
+            return (original or None), "rewrote"
+        return text, "edited"
 
     @staticmethod
     def _parse_turns(text: str) -> list[int]:
