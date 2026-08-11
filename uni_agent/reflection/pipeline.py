@@ -16,12 +16,13 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from uni_agent.reflection.base import FINAL_MARKER, AbstractReflector, BaseReflectionConfig
+from uni_agent.reflection.facts import turn_candidates
 from uni_agent.reflection.registry import register_reflector
 from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
 TURNS_MARKER = "FINAL_TURNS_JSON:"
 
-TRACE_FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns"})
+TRACE_FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns", "candidates"})
 TURN_FIELDS = frozenset({"prefix", "turn", "hint"})
 #: the previous call's reply, so a stage can react to one without being handed the trajectory
 PREV_FIELD = "prev"
@@ -103,6 +104,7 @@ class PipelineReflector(AbstractReflector):
             "agent_patch": agent_patch if cfg.include_agent_patch and agent_patch else "(not available)",
             "gold": gold if cfg.include_gold and gold else "(not available)",
             "feedback": feedback if cfg.include_exec_feedback and feedback else "(not available)",
+            "candidates": turn_candidates(turns),
         }
         hints: dict[int, str] = {}
         selected: list[int] = []
