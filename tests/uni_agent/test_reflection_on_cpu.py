@@ -271,3 +271,18 @@ def test_the_last_call_must_produce_hints():
         PipelineReflectionConfig(name="pipeline", calls=[
             CallSpec(id="draft", parse="text", system="s", user="{task}"),
         ])
+
+
+def test_chat_control_tokens_do_not_look_like_a_rewrite():
+    """The raw completion keeps <|im_end|>; leaving it in made every reply fail the edit check."""
+    replies = {"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py and run the snippet"}',
+               "REPAIR": "FINAL_HINTS_JSON:\nopen parser.py<|im_end|>"}
+    hints, _ = _pipeline(replies, [DRAFT, REPAIR])
+    assert hints == {1: "open parser.py"}
+
+
+def test_a_drop_carrying_a_control_token_still_drops():
+    replies = {"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}',
+               "REPAIR": "FINAL_HINTS_JSON:\nDROP<|im_end|>"}
+    hints, _ = _pipeline(replies, [DRAFT, REPAIR])
+    assert hints == {}
