@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 
+from uni_agent.interaction.model import MaxTokenExceededError
 from uni_agent.reflection import ReflectionConfig, Reflector
 
 
@@ -286,3 +289,81 @@ def test_a_drop_carrying_a_control_token_still_drops():
                "REPAIR": "FINAL_HINTS_JSON:\nDROP<|im_end|>"}
     hints, _ = _pipeline(replies, [DRAFT, REPAIR])
     assert hints == {}
+
+
+def test_records_every_call_with_its_prompt_and_reply(tmp_path):
+    path = tmp_path / "reflection.jsonl.gz"
+    model = _Model()
+    reflector = Reflector(model, ReflectionConfig(enabled=True), record_path=path,
+                          identity={"uid": "u1", "instance_id": "repo.abc", "junk": "dropped"})
+    asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+
+    rows = [json.loads(l) for l in gzip.open(path, "rt")]
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["uid"], row["instance_id"], row["stage"]) == ("u1", "repo.abc", "single")
+    assert "junk" not in row
+    assert row["output"] == '{"turn0": "run the failing test"}'
+    assert "Full trajectory:" in row["user"] and row["system"].startswith("You are a hindsight coach")
+    assert row["error"] == ""
+
+
+def test_recording_failure_never_costs_the_rollout_its_hints(tmp_path):
+    model = _Model()
+    # a directory where the file should be: opening it raises on every call
+    (tmp_path / "reflection.jsonl.gz").mkdir()
+    reflector = Reflector(model, ReflectionConfig(enabled=True),
+                          record_path=tmp_path / "reflection.jsonl.gz")
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+    assert hints == {0: "run the failing test"}
+
+
+def test_no_record_path_writes_nothing(tmp_path):
+    reflector = Reflector(_Model(), ReflectionConfig(enabled=True))
+    asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_pipeline_records_each_stage_separately(tmp_path):
+    path = tmp_path / "reflection.jsonl.gz"
+    model = _ScriptedModel({
+        "DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py", "turn4": "run the repro"}',
+        "REPAIR": "FINAL_HINTS_JSON:\nDELETE",
+    })
+    reflector = PipelineReflector(
+        model, PipelineReflectionConfig(enabled=True, name="pipeline", calls=[DRAFT, REPAIR]),
+        record_path=path, identity={"uid": "u9"})
+    asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="G", feedback="f"))
+
+    rows = [json.loads(l) for l in gzip.open(path, "rt")]
+    # one draft over the whole trajectory, then one repair call per selected turn
+    assert [r["stage"] for r in rows] == ["draft", "repair", "repair"]
+    assert [r["step"] for r in rows] == [None, 1, 4]
+    assert all(r["uid"] == "u9" for r in rows)
+    assert rows[0]["user"].startswith("t\nG\n") and rows[1]["output"] == "FINAL_HINTS_JSON:\nDELETE"
+
+
+def test_the_shrink_ladder_still_retries_through_the_trace_span(tmp_path):
+    """The ladder depends on MaxTokenExceededError escaping the span wrapping each call."""
+    path = tmp_path / "reflection.jsonl.gz"
+
+    class _Overflows(_Model):
+        calls = 0
+
+        async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise MaxTokenExceededError("prompt_ids length 200000 exceeds max_model_len")
+            return '{"turn0": "run the failing test"}', None, None, None
+
+    model = _Overflows()
+    reflector = Reflector(model, ReflectionConfig(enabled=True), record_path=path,
+                          identity={"uid": "u1"})
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+
+    assert hints == {0: "run the failing test"}, "the second rung's hints were lost"
+    assert model.calls == 2, "the ladder did not retry after the overflow"
+    rows = [json.loads(l) for l in gzip.open(path, "rt")]
+    # both attempts are on record: the rung that overflowed and the one that answered
+    assert [r["error"] for r in rows] == ["over budget", ""]
+    assert [r["obs_cap"] for r in rows] == [1000, 2000]

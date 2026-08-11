@@ -125,6 +125,7 @@ class PipelineReflector(AbstractReflector):
                 call.system.replace("{k}", k),
                 lambda obs, resp, c=call, p=prev: self._render(c.user, k, base, turns, obs, resp, prev=p),
                 call.max_output_tokens,
+                stage=call.id,
             )
             if text is None:
                 return {}
@@ -148,6 +149,8 @@ class PipelineReflector(AbstractReflector):
                     call.user, k, base, turns, obs, resp, prev=prev, step=s, hint=hints.get(s, "")
                 ),
                 call.max_output_tokens,
+                stage=call.id,
+                step=step,
             ) for step in selected)
         )
         if call.parse != "hints":
