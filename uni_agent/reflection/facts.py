@@ -12,7 +12,7 @@ CMD_RE = re.compile(r"str_replace_editor\s+(\w+)")
 EDIT_CMDS = {"str_replace", "insert", "create"}
 
 
-def _call_facts(call: dict) -> tuple:
+def call_facts(call: dict) -> tuple:
     action = call.get("action") or ""
     cmd = (CMD_RE.match(action) or [None, None])[1] if CMD_RE.match(action) else None
     path = (ARG_PATH_RE.search(action) or [None, None])[1] if ARG_PATH_RE.search(action) else None
@@ -30,7 +30,7 @@ def turn_candidates(turns: list[dict]) -> str:
     for turn in turns:
         step = turn.get("step")
         for call in turn.get("tools") or []:
-            cmd, path, action, obs = _call_facts(call)
+            cmd, path, action, obs = call_facts(call)
             # on the basename, not the path: every task lives under /testbed/, so matching
             # "test" anywhere killed this branch and with it the two placement signals below
             name = path.rsplit("/", 1)[-1] if path else ""
