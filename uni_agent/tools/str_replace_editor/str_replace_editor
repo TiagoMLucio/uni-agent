@@ -420,21 +420,47 @@ class EditTool:
 
     def str_replace(self, path: Path, old_str: str, new_str: Optional[str]):
         """Implement the str_replace command, which replaces old_str with new_str in the file content"""
-        # Read the file content
-        file_content = self.read_file(path).expandtabs()
-        old_str = old_str.expandtabs()
-        new_str = new_str.expandtabs() if new_str is not None else ""
+        if new_str is None:
+            new_str = ""
 
-        # Check if old_str is unique in the file
-        occurrences = file_content.count(old_str)
-        if occurrences == 0:
-            safe_print(f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}.")
-            sys.exit()
-        elif occurrences > 1:
-            file_content_lines = file_content.split("\n")
-            lines = [idx + 1 for idx, line in enumerate(file_content_lines) if old_str in line]
+        ## "Loose Tools" change
+        old_str = old_str.strip("\n\r")
+        new_str = new_str.strip("\n\r")
+
+        file_content = self.read_file(path)
+
+        pattern = re.escape(old_str)
+        occurrences = [
+            (
+                file_content.count("\n", 0, match.start()) + 1,  # line number
+                match.group(),  # matched text
+                match.start(),  # start position
+            )
+            for match in re.finditer(pattern, file_content)
+        ]
+
+        if not occurrences:
+            # We found no occurrences, possibly because of extra white spaces at either the front or back of the string.
+            # Remove the white spaces and try again.
+            old_str = old_str.strip()
+            new_str = new_str.strip()
+            pattern = re.escape(old_str)
+            occurrences = [
+                (
+                    file_content.count("\n", 0, match.start()) + 1,  # line number
+                    match.group(),  # matched text
+                    match.start(),  # start position
+                )
+                for match in re.finditer(pattern, file_content)
+            ]
+            if not occurrences:
+                safe_print(f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}.")
+                sys.exit()
+
+        if len(occurrences) > 1:
+            line_numbers = sorted({line for line, _, _ in occurrences})
             safe_print(
-                f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {lines}. Please ensure it is unique"
+                f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {line_numbers}. Please ensure it is unique."
             )
             sys.exit()
 
@@ -442,8 +468,11 @@ class EditTool:
             safe_print(f"No replacement was performed, old_str `{old_str}` is the same as new_str `{new_str}`.")
             sys.exit()
 
-        # Replace old_str with new_str
-        new_file_content = file_content.replace(old_str, new_str)
+        # We found exactly one occurrence
+        replacement_line, matched_text, idx = occurrences[0]
+
+        # Create new content by replacing just the matched text
+        new_file_content = file_content[:idx] + new_str + file_content[idx + len(matched_text) :]
 
         # Write the new content to the file
         self.write_file(path, new_file_content)
@@ -452,7 +481,7 @@ class EditTool:
         self._file_history[path].append(file_content)
 
         # Create a snippet of the edited section
-        replacement_line = file_content.split(old_str)[0].count("\n")
+        replacement_line = file_content.count("\n", 0, idx)
         start_line = max(1, replacement_line - SNIPPET_LINES)
         end_line = min(replacement_line + SNIPPET_LINES + new_str.count("\n"), len(new_file_content.splitlines()))
         start_line, end_line = WindowExpander(suffix=path.suffix).expand_window(
