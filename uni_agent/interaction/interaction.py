@@ -38,6 +38,11 @@ CONDENSE_MARGIN_TOKENS = 1024
 CONDENSE_MIN_CHARS = 2000
 
 
+def _clip(text: str, limit: int = 80) -> str:
+    """Command echo for protocol messages: repeated full echoes bloat the context."""
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 class ToolResult(BaseModel):
     """Per-tool-call result inside a single step. ``observation`` is the
     string sent back to the model as the ``role="tool"`` content (error
@@ -480,10 +485,13 @@ class AgentInteraction:
 
         attached = getattr(self.env, "attached_command", None)
         if attached and not action.is_input:
+            cancel_example = self.tools_manager.format_args_example({"command": "C-c", "is_input": True})
             observation = (
-                f'Your command "{action.command}" is NOT executed. The previous command '
-                f'"{attached}" is still running, so you cannot start a new one. Set is_input=true '
-                'to interact with it: send text as input, "C-c" to cancel it, or "C-d" for EOF.'
+                f'Your command "{_clip(action.command)}" is NOT executed. The previous command '
+                f'"{_clip(attached)}" is still running, so you cannot start a new one. To cancel it, '
+                f"call this tool again with exactly these arguments: {cancel_example} -- is_input "
+                'must be a tool argument, not part of the command text. Send input the same way, '
+                'or "C-d" for EOF.'
             )
             self.logger.error(observation)
             # a protocol correction, not a dead session: "skipped" would trip the
@@ -493,9 +501,13 @@ class AgentInteraction:
                 observation=observation, status="syntax_error", execution_time=0.0,
             )
         if action.is_input and not attached:
+            rerun_example = self.tools_manager.format_args_example(
+                {"command": action.command, "is_input": False}
+            )
             observation = (
                 "A command was expected but is_input was set. Nothing is currently running in the "
-                "session, so there is nothing to send input to. Re-send with is_input=false."
+                "session, so there is nothing to send input to. To run it as a command, resend "
+                f"exactly these arguments: {rerun_example}"
             )
             self.logger.error(observation)
             return ToolResult(
@@ -533,11 +545,12 @@ class AgentInteraction:
             elif status == "yielded":
                 # one note, built here because this is where the balance is known: the
                 # model cannot judge whether to keep waiting on a wall it is not told about
+                cancel_example = self.tools_manager.format_args_example({"command": "C-c", "is_input": True})
                 observation += (
                     f"\n<NOTE>Still running: {self.env.attached_seconds:.2f}s of "
                     f"{self.attached_kill_timeout:g}s used before it is cancelled, and no new command "
-                    'can run until then. Send it input with is_input=true, "C-c" to cancel, "C-d" for '
-                    'EOF, or "" to wait.</NOTE>'
+                    "can run until then. Send it input with is_input=true -- to cancel, resend exactly "
+                    f'these arguments: {cancel_example} -- "C-d" for EOF, or "" to wait.</NOTE>'
                 )
         return ToolResult(
             tool_call_id=tool_call.id,
