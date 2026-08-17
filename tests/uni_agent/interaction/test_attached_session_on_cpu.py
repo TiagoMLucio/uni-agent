@@ -230,7 +230,8 @@ def test_an_action_cannot_outlive_what_is_left_of_the_kill_wall():
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 5.0, 1
     it.tools_manager = _t.SimpleNamespace(
-        get_tool_action=lambda _tc: _t.SimpleNamespace(command="teste", is_input=True, timeout=10)
+        get_tool_action=lambda _tc: _t.SimpleNamespace(command="teste", is_input=True, timeout=10),
+        format_args_example=lambda args: str(args),
     )
     tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
     _run(AgentInteraction._execute_tool_call(it, tc))
@@ -259,7 +260,8 @@ def test_a_yield_reports_the_balance_but_a_kill_does_not_bother():
         it.action_timeout, it.yield_timeout = 30, 5
         it.attached_kill_timeout, it.timeout_budget = wall, 1
         it.tools_manager = _t.SimpleNamespace(
-            get_tool_action=lambda _tc: _t.SimpleNamespace(command="x", is_input=True, timeout=1)
+            get_tool_action=lambda _tc: _t.SimpleNamespace(command="x", is_input=True, timeout=1),
+            format_args_example=lambda args: str(args),
         )
         return it
 
@@ -309,7 +311,8 @@ def test_the_kill_note_states_the_real_remaining_allowance(budget, expected):
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 45.0, budget
     it.tools_manager = _t.SimpleNamespace(
-        get_tool_action=lambda _tc: _t.SimpleNamespace(command="x", is_input=True, timeout=1)
+        get_tool_action=lambda _tc: _t.SimpleNamespace(command="x", is_input=True, timeout=1),
+        format_args_example=lambda args: str(args),
     )
     tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
     r = _run(AgentInteraction._execute_tool_call(it, tc))
@@ -492,3 +495,95 @@ def test_a_requested_send_timeout_is_honoured():
     env.deployment.runtime = _Rt()
     _run(AgentEnv.send_input.__wrapped__(env, "hello", action_timeout=20))
     assert seen["timeout"] == 20
+
+
+def test_format_args_example_follows_the_parser():
+    from uni_agent.interaction.tools_manager import ToolsManager, ToolsManagerConfig
+
+    tm = ToolsManager.__new__(ToolsManager)
+    tm.tools_manager_config = ToolsManagerConfig.model_construct(tools=[], parser="hermes")
+    assert tm.format_args_example({"command": "C-c", "is_input": True}) == '{"command": "C-c", "is_input": true}'
+    tm.tools_manager_config = ToolsManagerConfig.model_construct(tools=[], parser="qwen3_coder")
+    assert (
+        tm.format_args_example({"command": "C-c", "is_input": True})
+        == "<parameter=command>C-c</parameter> <parameter=is_input>true</parameter>"
+    )
+
+
+def test_attached_refusal_quotes_a_literal_cancel_call_and_clips_echoes():
+    import types as _t
+
+    from uni_agent.interaction.interaction import AgentInteraction
+
+    class _Env:
+        attached_command = "find /testbed -type f -name '*.py' " + "x" * 200
+        attached_seconds = 0.0
+
+    noop = lambda *a, **k: None  # noqa: E731
+    it = AgentInteraction.__new__(AgentInteraction)
+    it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
+    it.action_timeout, it.yield_timeout = 30, 5
+    it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    long_cmd = "grep -rn pattern " + "y" * 200
+    it.tools_manager = _t.SimpleNamespace(
+        get_tool_action=lambda _tc: _t.SimpleNamespace(command=long_cmd, is_input=False, timeout=None),
+        format_args_example=lambda args: '{"command": "C-c", "is_input": true}',
+    )
+    tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
+    result = _run(AgentInteraction._execute_tool_call(it, tc))
+    assert result.status == "syntax_error"
+    assert '{"command": "C-c", "is_input": true}' in result.observation
+    assert "not part of the command text" in result.observation
+    assert "y" * 200 not in result.observation  # command echo is clipped
+    assert "x" * 200 not in result.observation  # attached echo is clipped
+
+
+def test_input_without_attached_quotes_a_literal_rerun_call():
+    import types as _t
+
+    from uni_agent.interaction.interaction import AgentInteraction
+
+    class _Env:
+        attached_command = None
+        attached_seconds = 0.0
+
+    noop = lambda *a, **k: None  # noqa: E731
+    it = AgentInteraction.__new__(AgentInteraction)
+    it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
+    it.action_timeout, it.yield_timeout = 30, 5
+    it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.tools_manager = _t.SimpleNamespace(
+        get_tool_action=lambda _tc: _t.SimpleNamespace(command="ls", is_input=True, timeout=None),
+        format_args_example=lambda args: f"EXAMPLE({args['command']}, {args['is_input']})",
+    )
+    tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
+    result = _run(AgentInteraction._execute_tool_call(it, tc))
+    assert result.status == "syntax_error"
+    assert "EXAMPLE(ls, False)" in result.observation
+
+
+def test_yield_note_quotes_a_literal_cancel_call():
+    import types as _t
+
+    from uni_agent.interaction.interaction import AgentInteraction
+
+    class _Env:
+        attached_command, attached_at_prompt = "cat", False
+        attached_seconds = 2.0
+
+        async def send_input(self, command, action_timeout):
+            raise ActionTimeoutError("partial output")
+
+    noop = lambda *a, **k: None  # noqa: E731
+    it = AgentInteraction.__new__(AgentInteraction)
+    it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
+    it.action_timeout, it.yield_timeout = 30, 5
+    it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.tools_manager = _t.SimpleNamespace(
+        get_tool_action=lambda _tc: _t.SimpleNamespace(command="", is_input=True, timeout=1),
+        format_args_example=lambda args: '{"command": "C-c", "is_input": true}',
+    )
+    tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
+    result = _run(AgentInteraction._execute_tool_call(it, tc))
+    assert result.status == "yielded"
+    assert '{"command": "C-c", "is_input": true}' in result.observation
