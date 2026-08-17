@@ -29,6 +29,12 @@ MAX_RESPONSE_LEN = 16000
 MAX_WINDOW_EXPANSION_VIEW = int(os.getenv("MAX_WINDOW_EXPANSION_VIEW", "0"))
 MAX_WINDOW_EXPANSION_EDIT_CONFIRM = int(os.getenv("MAX_WINDOW_EXPANSION_EDIT_CONFIRM", "0"))
 USE_FILEMAP = os.getenv("USE_FILEMAP", "true").lower() == "true"
+# Failed str_replace calls get a diagnosis (closest region + exact difference) instead of an
+# echo of old_str; "false" restores the legacy echo messages byte-for-byte.
+EXPLAIN_EDIT_FAILURES = os.getenv("EXPLAIN_EDIT_FAILURES", "true").lower() == "true"
+EXPLAIN_MAX_FILE_BYTES = 2000000
+EXPLAIN_MAX_OLD_LINES = 200
+EXPLAIN_MAX_DIFF_LINES = 5
 
 
 if hasattr(sys.stdout, "buffer"):
@@ -74,6 +80,166 @@ def save_history(history: Dict[str, List[str]]):
             json.dump(history, f)
     except Exception:
         pass
+
+
+def _describe_old_str(old_str: str) -> str:
+    """Compact identifier for a failed old_str, replacing the full echo."""
+    lines = old_str.split("\n")
+    first = lines[0].strip()[:60] if lines else ""
+    return f"old_str ({len(lines)} lines, {len(old_str)} chars, starting `{first}`)"
+
+
+def _unique_match_line(needle: str, haystack: str) -> Optional[int]:
+    """1-based start line of the only occurrence of needle, else None."""
+    idx = haystack.find(needle)
+    if idx < 0 or haystack.find(needle, idx + 1) >= 0:
+        return None
+    return haystack.count("\n", 0, idx) + 1
+
+
+def _shift_indent(lines: List[str], delta: int) -> Optional[List[str]]:
+    """Every non-blank line shifted by delta leading spaces; None if a line is too shallow."""
+    out = []
+    for line in lines:
+        if not line.strip():
+            out.append(line)
+        elif delta >= 0:
+            out.append(" " * delta + line)
+        elif line.startswith(" " * -delta):
+            out.append(line[-delta:])
+        else:
+            return None
+    return out
+
+
+def _probe_transforms(old_str: str, file_content: str) -> Optional[Tuple[int, int, str]]:
+    """First invertible repair of old_str that matches the file exactly once.
+
+    Returns (start_line, end_line, description-of-what-was-wrong), or None. Probes only
+    diagnose; the edit is never applied with a transformed string.
+    """
+    lines = old_str.split("\n")
+    probes: List[Tuple[str, str]] = []
+    if "\\n" in old_str:
+        n = old_str.count("\\n")
+        probes.append(
+            (
+                old_str.replace("\\n", "\n"),
+                f"your old_str contains the 2-character sequence `\\n` ({n}x) where the file "
+                "has a real line break -- the escaping collapsed your newlines",
+            )
+        )
+    if "\\t" in old_str:
+        probes.append(
+            (old_str.replace("\\t", "\t"), "your old_str has literal `\\t` where the file has real tab characters")
+        )
+    for k in (1, 2, 3, 4, 5, 6, 8, 12):
+        for delta in (-k, k):
+            shifted = _shift_indent(lines, delta)
+            if shifted is None:
+                continue
+            direction = f"{-delta} extra" if delta < 0 else f"{delta} missing"
+            probes.append(
+                ("\n".join(shifted), f"every line of your old_str has {direction} leading space(s)")
+            )
+    stripped = "\n".join(line.rstrip() for line in lines)
+    if stripped != old_str:
+        probes.append((stripped, "your old_str has trailing whitespace the file does not have"))
+    for candidate, description in probes:
+        start = _unique_match_line(candidate, file_content)
+        if start is not None:
+            return start, start + len(lines) - 1, description
+    return None
+
+
+def _match_lenient_lines(old_str: str, file_content: str) -> Optional[Tuple[int, int, str]]:
+    """Per-line whitespace-lenient regex match, used to diagnose tab/space and edge-blank mixes."""
+    lines = old_str.split("\n")
+    pattern = "\n".join("[ \t]*" + re.escape(line.strip()) + "[ \t]*" for line in lines)
+    try:
+        matches = list(re.finditer(pattern, file_content))
+    except re.error:
+        return None
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    start = file_content.count("\n", 0, match.start()) + 1
+    detail = "only the line-edge whitespace differs"
+    for k, (file_line, old_line) in enumerate(zip(match.group().split("\n"), lines)):
+        file_ws = file_line[: len(file_line) - len(file_line.lstrip(" \t"))]
+        old_ws = old_line[: len(old_line) - len(old_line.lstrip(" \t"))]
+        if file_ws != old_ws:
+            kind = "tabs" if "\t" in file_ws else f"{len(file_ws)} space(s)"
+            detail = (
+                f"only the line-edge whitespace differs; e.g. line {start + k} is indented "
+                f"with {kind} in the file, not `{old_ws}`"
+            )
+            break
+    return start, start + len(lines) - 1, detail
+
+
+def _closest_window(old_str: str, file_content: str) -> Optional[Tuple[int, float, List[Tuple[int, str, str]]]]:
+    """Best same-length window in the file: (1-based start, ratio, differing line triples)."""
+    import difflib
+
+    old_lines = old_str.split("\n")
+    file_lines = file_content.split("\n")
+    n = len(old_lines)
+    starts = set()
+    anchors = sorted({line for line in old_lines if len(line.strip()) >= 8}, key=len, reverse=True)
+    for anchor in anchors[:5]:
+        offset = old_lines.index(anchor)
+        for i, file_line in enumerate(file_lines):
+            if file_line == anchor or file_line.strip() == anchor.strip():
+                starts.add(max(0, i - offset))
+        if starts:
+            break
+    if not starts:
+        seed = next((line for line in old_lines if line.strip()), "")
+        for close in difflib.get_close_matches(seed, file_lines, n=3, cutoff=0.6):
+            starts.add(max(0, file_lines.index(close) - old_lines.index(seed) if seed in old_lines else 0))
+    best = None
+    for start in sorted(starts):
+        window = file_lines[start : start + n]
+        ratio = difflib.SequenceMatcher(None, "\n".join(window), old_str, autojunk=False).ratio()
+        if best is None or ratio > best[1]:
+            best = (start, ratio, window)
+    if best is None or best[1] < 0.7:
+        return None
+    start, ratio, window = best
+    diffs = [
+        (start + k + 1, file_line, old_line)
+        for k, (file_line, old_line) in enumerate(zip(window, old_lines))
+        if file_line != old_line
+    ]
+    return start + 1, ratio, diffs
+
+
+def explain_edit_failure(old_str: str, file_content: str) -> str:
+    """One compact paragraph saying where old_str nearly matches and how it differs."""
+    if len(file_content) > EXPLAIN_MAX_FILE_BYTES or len(old_str.split("\n")) > EXPLAIN_MAX_OLD_LINES:
+        return ""
+    for finder in (_probe_transforms, _match_lenient_lines):
+        found = finder(old_str, file_content)
+        if found is not None:
+            start, end, description = found
+            return f"Closest match: lines {start}-{end} match exactly except {description}."
+    window = _closest_window(old_str, file_content)
+    if window is None:
+        return (
+            "No similar region found. View the file or `grep -n` a distinctive line "
+            "before retrying, and copy the text exactly as shown."
+        )
+    start, ratio, diffs = window
+    end = start + len(old_str.split("\n")) - 1
+    shown = [
+        f"  line {line_no}: file has `{file_line.strip()[:70]}`, your old_str has `{old_line.strip()[:70]}`"
+        for line_no, file_line, old_line in diffs[:EXPLAIN_MAX_DIFF_LINES]
+    ]
+    if len(diffs) > EXPLAIN_MAX_DIFF_LINES:
+        shown.append(f"  ... and {len(diffs) - EXPLAIN_MAX_DIFF_LINES} more differing line(s)")
+    lines = "\n".join(shown) if shown else "  (differences are within lines' whitespace)"
+    return f"Closest match: lines {start}-{end} ({ratio:.0%} similar). Differing lines:\n{lines}"
 
 
 class Filemap:
@@ -416,7 +582,13 @@ class EditTool:
 
         self.write_file(path, file_text)
         self._file_history[str(path)].append(file_text)
-        safe_print(f"File created successfully at: {path}")
+        message = f"File created successfully at: {path}"
+        if EXPLAIN_EDIT_FAILURES and path.suffix == ".py":
+            lint_error = self._lint_check(file_text, str(path))
+            if lint_error:
+                # e.g. a literal `\n` from collapsed JSON escaping writes broken code silently
+                message += f"\nWarning: the created file does not parse as Python: {lint_error[:200]}"
+        safe_print(message)
 
     def str_replace(self, path: Path, old_str: str, new_str: Optional[str]):
         """Implement the str_replace command, which replaces old_str with new_str in the file content"""
@@ -442,6 +614,7 @@ class EditTool:
         if not occurrences:
             # We found no occurrences, possibly because of extra white spaces at either the front or back of the string.
             # Remove the white spaces and try again.
+            original_old_str = old_str
             old_str = old_str.strip()
             new_str = new_str.strip()
             pattern = re.escape(old_str)
@@ -454,18 +627,41 @@ class EditTool:
                 for match in re.finditer(pattern, file_content)
             ]
             if not occurrences:
-                safe_print(f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}.")
+                if EXPLAIN_EDIT_FAILURES:
+                    # No echo of old_str: the agent just wrote it, and repeated copies both
+                    # bloat the context and prime the model to repeat the same failed call.
+                    # Diagnose the pre-strip string: the strip() fallback de-indents only the
+                    # first line, which would break the uniform-indent probe.
+                    message = (
+                        f"No replacement was performed, {_describe_old_str(original_old_str)} "
+                        f"did not appear verbatim in {path}."
+                    )
+                    explanation = explain_edit_failure(original_old_str, file_content)
+                    if explanation:
+                        message += "\n" + explanation
+                    safe_print(message)
+                else:
+                    safe_print(f"No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}.")
                 sys.exit()
 
         if len(occurrences) > 1:
             line_numbers = sorted({line for line, _, _ in occurrences})
-            safe_print(
-                f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {line_numbers}. Please ensure it is unique."
-            )
+            if EXPLAIN_EDIT_FAILURES:
+                safe_print(
+                    f"No replacement was performed. Multiple occurrences of {_describe_old_str(old_str)} "
+                    f"in lines {line_numbers}. Please include enough surrounding context to make it unique."
+                )
+            else:
+                safe_print(
+                    f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {line_numbers}. Please ensure it is unique."
+                )
             sys.exit()
 
         if new_str == old_str:
-            safe_print(f"No replacement was performed, old_str `{old_str}` is the same as new_str `{new_str}`.")
+            if EXPLAIN_EDIT_FAILURES:
+                safe_print("No replacement was performed, old_str is the same as new_str (nothing would change).")
+            else:
+                safe_print(f"No replacement was performed, old_str `{old_str}` is the same as new_str `{new_str}`.")
             sys.exit()
 
         # We found exactly one occurrence
@@ -493,6 +689,10 @@ class EditTool:
         success_msg = f"The file {path} has been edited. "
         success_msg += self._make_output(snippet, f"a snippet of {path}", start_line)
         success_msg += "Review the changes and make sure they are as expected. Edit the file again if necessary."
+        if EXPLAIN_EDIT_FAILURES and path.suffix == ".py" and not self._lint_check(file_content, str(path)):
+            lint_error = self._lint_check(new_file_content, str(path))
+            if lint_error:
+                success_msg += f"\nWarning: this edit introduced a Python syntax error: {lint_error[:200]}"
 
         safe_print(success_msg)
 
