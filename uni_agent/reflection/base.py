@@ -98,8 +98,12 @@ class BaseReflectionConfig(BaseModel):
     # None means uncapped. The first attempt always uses max_observation_chars, so these are what
     # it falls back to. Deriving them from that field instead made the first rungs no-ops
     # whenever it was set high.
+    # Rungs are token budgets approximated in chars at ~3.8 chars/token: observations shrink
+    # first (2k -> 1k tokens), then the agent's own responses (2k -> 1k), since the responses
+    # are what the hints are about. Responses drive the worst case (4k tok/turn x 50 turns vs
+    # a measured 77k-token observation ceiling), so only the last rung provably fits 131k.
     shrink_ladder: list[tuple[int | None, int | None]] = [
-        (2000, None), (1000, None), (1000, 2000), (1000, 1000),
+        (7600, None), (3800, None), (3800, 7600), (3800, 3800),
     ]
 
 
