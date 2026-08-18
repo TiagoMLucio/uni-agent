@@ -478,3 +478,76 @@ def test_the_route_is_recorded(tmp_path):
     rows = [json.loads(line) for line in gzip.open(path, "rt")]
     assert [(r["stage"], r["step"], r["uid"]) for r in rows] == [("loop_router", 2, "u2")]
     assert rows[0]["output"] == REORIENT_HINT and "loop signature:" in rows[0]["user"]
+
+
+# --- tool diag ----------------------------------------------------------------------------
+
+from uni_agent.reflection import ToolDiagReflectionConfig, ToolDiagReflector  # noqa: E402
+from uni_agent.reflection.tool_diag import first_failed_edit  # noqa: E402
+
+FAIL_OBS = "No replacement was performed, old_str `x` did not appear verbatim in /f.py."
+
+
+def _sr(obs, action="str_replace_editor str_replace --path /f.py"):
+    return {"name": "str_replace_editor", "action": action, "observation": obs}
+
+
+def _diag(turns):
+    reflector = ToolDiagReflector(None, ToolDiagReflectionConfig(enabled=True, name="tool_diag"))
+    return asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))
+
+
+def test_the_first_failed_edit_gets_its_class_hint():
+    turns = [
+        {"step": 0, "tokens": 5, "response": "view", "tools": [_sr("ok", "str_replace_editor view --path /f.py")]},
+        {"step": 3, "tokens": 5, "response": "edit",
+         "tools": [_sr(FAIL_OBS + " Closest match: lines 10-14 (90% similar).")]},
+        {"step": 5, "tokens": 5, "response": "edit",
+         "tools": [_sr(FAIL_OBS + " has a real line break -- the escaping collapsed your newlines")]},
+    ]
+    hints = _diag(turns)
+    assert list(hints) == [3] and "most recent view" in hints[3]
+
+
+def test_each_diagnosis_class_maps_to_its_own_hint():
+    cases = {
+        "the escaping collapsed your newlines": "real newline",
+        "every line of your old_str has 2 extra leading space(s)": "leading whitespace",
+        "your old_str has trailing whitespace the file does not have": "trailing spaces",
+        "Multiple occurrences of old_str": "unique",
+        "old_str `x` is the same as new_str": "identical",
+        "Closest match: lines 1-3 (80% similar)": "most recent view",
+    }
+    for frag, expect in cases.items():
+        hints = _diag([{"step": 1, "tokens": 5, "response": "e", "tools": [_sr(FAIL_OBS + " " + frag)]}])
+        assert expect in hints[1], (frag, hints)
+
+
+def test_an_unclassified_failure_gets_the_generic_hint():
+    hints = _diag([{"step": 2, "tokens": 5, "response": "e", "tools": [_sr(FAIL_OBS)]}])
+    assert "copy old_str" in hints[2]
+
+
+def test_a_failed_view_is_not_a_failed_edit():
+    turns = [{"step": 1, "tokens": 5, "response": "v",
+              "tools": [_sr(FAIL_OBS, "str_replace_editor view --path /f.py")]}]
+    assert _diag(turns) == {}
+
+
+def test_no_failed_edit_and_no_fallback_yields_no_hints():
+    assert _diag([{"step": 0, "tokens": 5, "response": "ok", "tools": [_sr("edited fine")]}]) == {}
+
+
+def test_tool_diag_delegates_clean_traces_to_the_fallback():
+    model = _Model()
+    config = ToolDiagReflectionConfig(enabled=True, name="tool_diag", fallback={"enabled": True})
+    reflector = ToolDiagReflector(model, config)
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+    assert hints == {0: "run the failing test"}
+
+
+def test_first_failed_edit_reports_the_class():
+    step, cls, _ = first_failed_edit(
+        [{"step": 4, "tokens": 5, "response": "e",
+          "tools": [_sr(FAIL_OBS + " every line of your old_str has 1 missing leading space(s)")]}])
+    assert (step, cls) == (4, "indent")
