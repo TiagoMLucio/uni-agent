@@ -128,7 +128,9 @@ def test_output_budget_is_configurable():
 def test_shrink_ladder_is_configurable_and_starts_uncapped():
     cfg = ReflectionConfig(enabled=True, max_observation_chars=50, shrink_ladder=[(10, None)])
     assert cfg.shrink_ladder == [(10, None)]
-    assert ReflectionConfig().shrink_ladder[0] == (2000, None)
+    # token-denominated rungs, char-approximated at ~3.8 chars/token
+    assert ReflectionConfig().shrink_ladder[0] == (7600, None)
+    assert len(ReflectionConfig().shrink_ladder) == 4
 
 
 def test_an_unknown_key_is_rejected():
@@ -366,4 +368,113 @@ def test_the_shrink_ladder_still_retries_through_the_trace_span(tmp_path):
     rows = [json.loads(l) for l in gzip.open(path, "rt")]
     # both attempts are on record: the rung that overflowed and the one that answered
     assert [r["error"] for r in rows] == ["over budget", ""]
-    assert [r["obs_cap"] for r in rows] == [1000, 2000]
+    assert [r["obs_cap"] for r in rows] == [1000, 7600]
+
+
+# --- loop router --------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from uni_agent.reflection import LoopRouterReflectionConfig, LoopRouterReflector, build_reflection_config  # noqa: E402
+from uni_agent.reflection.loop_router import REORIENT_HINT, first_loop  # noqa: E402
+
+
+def _edit(action):
+    return {"name": "str_replace_editor", "action": action, "observation": "No replacement was performed"}
+
+
+def _loop_turns(steps=(2, 5, 8), action="str_replace --path /testbed/x.py --old_str a --new_str b"):
+    turns = [{"step": s, "tokens": 5, "response": "explore", "tools": [_edit(f"view --path /f{s}.py")]}
+             for s in range(2)]
+    turns += [{"step": s, "tokens": 5, "response": "edit", "tools": [_edit(action)]} for s in steps]
+    return sorted(turns, key=lambda t: t["step"])
+
+
+def _route(turns, **cfg):
+    # no model: a routed trace must never cost an LLM call
+    reflector = LoopRouterReflector(None, LoopRouterReflectionConfig(enabled=True, name="loop_router", **cfg))
+    return asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))
+
+
+def test_a_loop_gets_the_reorient_hint_at_its_first_turn():
+    assert _route(_loop_turns()) == {2: REORIENT_HINT}
+
+
+def test_whitespace_drift_still_counts_as_the_same_call():
+    turns = _loop_turns(steps=(2,)) + [
+        {"step": s, "tokens": 5, "response": "edit",
+         "tools": [_edit("str_replace  --path /testbed/x.py --old_str a\n--new_str b")]}
+        for s in (5, 8)
+    ]
+    assert _route(turns) == {2: REORIENT_HINT}
+
+
+def test_distinct_calls_are_not_a_loop():
+    turns = _loop_turns(steps=(2,)) + [
+        {"step": s, "tokens": 5, "response": "edit", "tools": [_edit(f"str_replace --old_str a{s}")]}
+        for s in (5, 8)
+    ]
+    assert _route(turns) == {}
+
+
+def test_the_earliest_completing_loop_wins():
+    slow, fast = "str_replace --old_str slow", "str_replace --old_str fast"
+    turns = [{"step": s, "tokens": 5, "response": "r", "tools": [_edit(a)]}
+             for s, a in [(0, slow), (1, fast), (2, slow), (3, fast), (4, fast), (6, slow)]]
+    assert first_loop(turns, 3) == (1, "str_replace_editor str_replace --old_str fast")
+
+
+def test_route_drop_returns_no_hints_for_a_loop():
+    assert _route(_loop_turns(), route="drop") == {}
+
+
+def test_no_loop_and_no_fallback_yields_no_hints():
+    assert _route(_loop_turns(steps=(2,))) == {}
+
+
+def test_no_loop_delegates_to_the_fallback():
+    model = _Model()
+    config = LoopRouterReflectionConfig(enabled=True, name="loop_router", fallback={"enabled": True})
+    reflector = LoopRouterReflector(model, config)
+    hints = asyncio.run(
+        reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f", outcome="o"))
+    assert hints == {0: "run the failing test"}
+    assert "Full trajectory:" in model.messages[-1]["content"]
+
+
+def test_a_loop_never_reaches_the_fallback():
+    class _Bomb(_Model):
+        async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
+            raise AssertionError("a routed trace must not consult the fallback reflector")
+
+    config = LoopRouterReflectionConfig(enabled=True, name="loop_router", fallback={"enabled": True})
+    reflector = LoopRouterReflector(_Bomb(), config)
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=_loop_turns(), gold="g", feedback="f"))
+    assert hints == {2: REORIENT_HINT}
+
+
+def test_the_registry_builds_a_loop_router():
+    config = build_reflection_config({"name": "loop_router", "enabled": True, "min_repeats": 2})
+    assert isinstance(config, LoopRouterReflectionConfig) and config.min_repeats == 2
+
+
+def test_min_repeats_below_two_is_rejected():
+    with pytest.raises(ValueError, match="min_repeats"):
+        LoopRouterReflectionConfig(name="loop_router", min_repeats=1)
+
+
+def test_a_fallback_typo_is_rejected_at_config_time():
+    with pytest.raises(ValueError):
+        LoopRouterReflectionConfig(name="loop_router", fallback={"enabled": True, "sytem_template": "x"})
+
+
+def test_the_route_is_recorded(tmp_path):
+    path = tmp_path / "reflection.jsonl.gz"
+    reflector = LoopRouterReflector(
+        None, LoopRouterReflectionConfig(enabled=True, name="loop_router"),
+        record_path=path, identity={"uid": "u2"})
+    asyncio.run(reflector.reflect_trajectory(task="t", turns=_loop_turns(), gold="g", feedback="f"))
+
+    rows = [json.loads(line) for line in gzip.open(path, "rt")]
+    assert [(r["stage"], r["step"], r["uid"]) for r in rows] == [("loop_router", 2, "u2")]
+    assert rows[0]["output"] == REORIENT_HINT and "loop signature:" in rows[0]["user"]

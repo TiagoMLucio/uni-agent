@@ -6,7 +6,8 @@ outcome, and writes one hint per selected turn. Hints condition the distillation
 never a training target.
 
 ``reflection.name`` picks the strategy: ``single`` is one call per rollout, ``pipeline`` runs
-several, including per-turn calls whose context is truncated to that turn's prefix.
+several, including per-turn calls whose context is truncated to that turn's prefix, and
+``loop_router`` deterministically handles loop-pattern trajectories, delegating the rest.
 """
 
 from uni_agent.reflection.base import (
@@ -18,6 +19,7 @@ from uni_agent.reflection.base import (
     AbstractReflector,
     BaseReflectionConfig,
 )
+from uni_agent.reflection.loop_router import LoopRouterReflectionConfig, LoopRouterReflector
 from uni_agent.reflection.pipeline import CallSpec, PipelineReflectionConfig, PipelineReflector
 from uni_agent.reflection.registry import (
     REFLECTOR_REGISTRY,
@@ -39,6 +41,8 @@ __all__ = [
     "TURN_TEMPLATE",
     "AbstractReflector",
     "CallSpec",
+    "LoopRouterReflectionConfig",
+    "LoopRouterReflector",
     "PipelineReflectionConfig",
     "PipelineReflector",
     "BaseReflectionConfig",
