@@ -13,7 +13,7 @@ to integrate with an LLM reflector once the targeted hints prove out.
 """
 
 import re
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from uni_agent.reflection.base import AbstractReflector, BaseReflectionConfig
 from uni_agent.reflection.registry import build_reflection_config, load_reflector, register_reflector
@@ -21,6 +21,28 @@ from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
 FAIL_MARK = "No replacement was performed"
 EDIT_RE = re.compile(r"str_replace_editor\s+str_replace\b")
+
+FINAL_HINT_MARKER = "FINAL_HINT:"
+#: a hint carrying any of these reads as hindsight ("your attempt failed"), which the student
+#: cannot square with a context where nothing has happened yet; the class hint takes over
+BANNED_WORDS = ("fail", "error", "attempt", "previous", "tried")
+
+DEFAULT_LLM_SYSTEM = (
+    "You see one editing call a software-engineering agent is about to make in a repository, "
+    "and the diagnosis its editor produced for exactly that call. The agent has not acted yet "
+    "and knows none of this: your hint is read immediately before it acts.\n"
+    "Write one hint, a single line, that makes the mistake the diagnosis describes unlikely. "
+    "Use the diagnosis's specifics (which lines differ, what whitespace is off, what is "
+    "ambiguous), but phrase everything as forward guidance about how to write the call "
+    "correctly: never mention an attempt, anything having failed or happened, and never hand "
+    "over a corrected old_str or new_str outright. Present tense, addressed to you, no labels.\n"
+    f"Reason first if useful, then write the exact marker {FINAL_HINT_MARKER} on its own line, "
+    "then the hint as one line of plain text and nothing after it."
+)
+DEFAULT_LLM_USER = (
+    "The call about to be made:\n{action}\n\n"
+    "The editor's diagnosis of that call:\n{observation}"
+)
 
 #: diagnosis-message fragment -> hint, checked in order; texts for the four measured classes
 #: are the counterfactual-gate winners verbatim, the rest follow their style
@@ -49,8 +71,8 @@ DEFAULT_HINT = ("verbatim",
                 "verbatim from that output, including every space and line break.")
 
 
-def first_failed_edit(turns: list[dict]) -> tuple[int, str, str] | None:
-    """``(step, class, hint)`` for the first str_replace whose observation reports a failure."""
+def first_failed_edit(turns: list[dict]) -> tuple[int, str, str, dict] | None:
+    """``(step, class, hint, call)`` for the first str_replace whose observation reports a failure."""
     for turn in turns:
         for call in turn.get("tools") or []:
             obs = call.get("observation") or ""
@@ -59,11 +81,17 @@ def first_failed_edit(turns: list[dict]) -> tuple[int, str, str] | None:
             if not EDIT_RE.match(call.get("action") or ""):
                 continue
             cls, hint = next(((c, h) for frag, c, h in CLASS_HINTS if frag in obs), DEFAULT_HINT)
-            return turn["step"], cls, hint
+            return turn["step"], cls, hint, call
     return None
 
 
 class ToolDiagReflectionConfig(BaseReflectionConfig):
+    #: `class` = the fixed per-class texts above; `llm` = a restricted call that sees ONLY the
+    #: failing call and its diagnosis (no gold, no outcome, no later turns, by template
+    #: construction) and falls back to the class hint whenever it fails or reads as hindsight
+    source: Literal["class", "llm"] = "class"
+    system: str = DEFAULT_LLM_SYSTEM
+    user: str = DEFAULT_LLM_USER
     #: reflection block for traces with no failed edit; None leaves them unhinted
     fallback: dict[str, Any] | None = None
 
@@ -96,15 +124,36 @@ class ToolDiagReflector(AbstractReflector):
             return await self._fallback.reflect_trajectory(
                 task=task, turns=turns, gold=gold, feedback=feedback,
                 outcome=outcome, agent_patch=agent_patch)
-        step, cls, hint = hit
+        step, cls, hint, call = hit
+        if self.config.source == "llm":
+            hint = await self._llm_hint(call, step) or hint
         hints = self._keep_valid({step: hint}, turns)
-        # no model call happens on this path, so the routing decision is logged here or nowhere
+        # the class path makes no model call, so the routing decision is logged here or nowhere
         self._record(
             "tool_diag", step,
-            [{"role": "system", "content": "(deterministic: first failed str_replace)"},
+            [{"role": "system", "content": f"(source={self.config.source}: first failed str_replace)"},
              {"role": "user", "content": f"class: {cls}"}],
             hints.get(step, ""), None, None, None)
         return hints
+
+    async def _llm_hint(self, call: dict, step: int) -> str | None:
+        """One restricted call; None (class-hint fallback) on any failure or hindsight wording."""
+        cfg = self.config
+
+        def render_user(obs_cap, resp_cap):
+            return cfg.user.format(
+                action=self._clip(call.get("action") or "", resp_cap or 4000),
+                observation=self._clip(call.get("observation") or "", obs_cap),
+            )
+
+        text = await self._ask(cfg.system, render_user, stage="tool_diag_llm", step=step)
+        if not text or FINAL_HINT_MARKER not in text:
+            return None
+        tail = text.rsplit(FINAL_HINT_MARKER, 1)[1]
+        hint = next((line.strip() for line in tail.splitlines() if line.strip()), "")
+        if not hint or any(word in hint.lower() for word in BANNED_WORDS):
+            return None
+        return hint
 
 
 register_langfuse_op("ToolDiagReflector.reflect_trajectory", name="reflection", as_type="evaluator")

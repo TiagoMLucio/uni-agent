@@ -547,7 +547,49 @@ def test_tool_diag_delegates_clean_traces_to_the_fallback():
 
 
 def test_first_failed_edit_reports_the_class():
-    step, cls, _ = first_failed_edit(
+    step, cls, _, _ = first_failed_edit(
         [{"step": 4, "tokens": 5, "response": "e",
           "tools": [_sr(FAIL_OBS + " every line of your old_str has 1 missing leading space(s)")]}])
     assert (step, cls) == (4, "indent")
+
+
+def _llm_diag(reply, turns):
+    model = _ScriptedModel({"TDIAG": reply})
+    config = ToolDiagReflectionConfig(enabled=True, name="tool_diag", source="llm",
+                                      system="TDIAG", user="{action}\n{observation}")
+    reflector = ToolDiagReflector(model, config)
+    return asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f")), model
+
+
+def test_llm_source_uses_the_reply_after_the_marker():
+    turns = [{"step": 2, "tokens": 5, "response": "e",
+              "tools": [_sr(FAIL_OBS + " Closest match: lines 10-14 (90% similar).")]}]
+    hints, model = _llm_diag("the window is off\nFINAL_HINT:\nCopy lines 10-14 exactly as the view shows them.", turns)
+    assert hints == {2: "Copy lines 10-14 exactly as the view shows them."}
+    assert "Closest match" in model.seen[0]["user"]
+
+
+def test_a_hindsight_worded_llm_hint_falls_back_to_the_class_hint():
+    turns = [{"step": 1, "tokens": 5, "response": "e",
+              "tools": [_sr(FAIL_OBS + " Closest match: lines 1-3 (80% similar).")]}]
+    hints, _ = _llm_diag("FINAL_HINT:\nYour previous attempt went wrong on whitespace.", turns)
+    assert "most recent view" in hints[1]
+
+
+def test_an_llm_reply_without_the_hint_marker_falls_back():
+    turns = [{"step": 3, "tokens": 5, "response": "e", "tools": [_sr(FAIL_OBS)]}]
+    hints, _ = _llm_diag("no marker here", turns)
+    assert "copy old_str" in hints[3]
+
+
+def test_a_dead_llm_call_still_ships_the_class_hint():
+    class _Dead(_Model):
+        async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
+            raise RuntimeError("engine gone")
+
+    config = ToolDiagReflectionConfig(enabled=True, name="tool_diag", source="llm")
+    reflector = ToolDiagReflector(_Dead(), config)
+    hints = asyncio.run(reflector.reflect_trajectory(
+        task="t", turns=[{"step": 0, "tokens": 5, "response": "e", "tools": [_sr(FAIL_OBS)]}],
+        gold="g", feedback="f"))
+    assert "copy old_str" in hints[0]
