@@ -11,6 +11,7 @@ REFLECTOR_REGISTRY: dict[str, type[AbstractReflector]] = {}
 REFLECTOR_MODULES: dict[str, str] = {
     "single": "uni_agent.reflection.single",
     "pipeline": "uni_agent.reflection.pipeline",
+    "loop_router": "uni_agent.reflection.loop_router",
 }
 
 
