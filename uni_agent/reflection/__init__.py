@@ -29,6 +29,7 @@ from uni_agent.reflection.registry import (
 )
 from uni_agent.reflection.single import Reflector, SingleCallReflectionConfig
 from uni_agent.reflection.tool_diag import ToolDiagReflectionConfig, ToolDiagReflector
+from uni_agent.reflection.tool_fix import ToolFixReflectionConfig, ToolFixReflector
 
 #: the block a plain `reflection:` config validates against, kept as the historical name
 ReflectionConfig = SingleCallReflectionConfig
@@ -52,6 +53,8 @@ __all__ = [
     "SingleCallReflectionConfig",
     "ToolDiagReflectionConfig",
     "ToolDiagReflector",
+    "ToolFixReflectionConfig",
+    "ToolFixReflector",
     "build_reflection_config",
     "load_reflector",
     "register_reflector",

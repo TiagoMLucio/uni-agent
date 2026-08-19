@@ -13,6 +13,7 @@ REFLECTOR_MODULES: dict[str, str] = {
     "pipeline": "uni_agent.reflection.pipeline",
     "loop_router": "uni_agent.reflection.loop_router",
     "tool_diag": "uni_agent.reflection.tool_diag",
+    "tool_fix": "uni_agent.reflection.tool_fix",
 }
 
 

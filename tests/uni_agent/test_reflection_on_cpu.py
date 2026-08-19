@@ -593,3 +593,83 @@ def test_a_dead_llm_call_still_ships_the_class_hint():
         task="t", turns=[{"step": 0, "tokens": 5, "response": "e", "tools": [_sr(FAIL_OBS)]}],
         gold="g", feedback="f"))
     assert "copy old_str" in hints[0]
+
+
+# --- tool fix -----------------------------------------------------------------------------
+
+from uni_agent.reflection import ToolFixReflectionConfig, ToolFixReflector  # noqa: E402
+from uni_agent.reflection.tool_fix import corrected_call  # noqa: E402
+
+
+def _fix_call(old, new):
+    return ('<tool_call>\n{"name": "str_replace_editor", "arguments": {"command": "str_replace", '
+            '"path": "/f.py", "old_str": ' + json.dumps(old) + ', "new_str": ' + json.dumps(new) + '}}\n</tool_call>')
+
+
+def _fix_turn(step, old, new, diag, response_prefix="fixing it now:\n"):
+    return {"step": step, "tokens": 5, "response": response_prefix + _fix_call(old, new),
+            "tools": [{"name": "str_replace_editor",
+                       "action": "str_replace_editor str_replace --path /f.py",
+                       "observation": "No replacement was performed, " + diag}]}
+
+
+def _fix(turns, **cfg):
+    reflector = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix", **cfg))
+    return asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))
+
+
+def test_indent_correction_fixes_both_strings_and_marks_call_placement():
+    old, new = "    a()\n    b()", "    a()\n    c()"
+    turns = [_fix_turn(2, old, new, "Closest match: lines 1-2 match exactly except every line "
+                                    "of your old_str has 4 extra leading space(s).")]
+    hints = _fix(turns)
+    assert list(hints) == [2] and hints[2]["at"] == "call"
+    assert json.dumps("a()\nb()")[1:-1] in hints[2]["text"], "old_str must be shifted"
+    assert json.dumps("a()\nc()")[1:-1] in hints[2]["text"], "new_str must be shifted too"
+
+
+def test_escape_correction_restores_real_newlines():
+    old = "x = 1\\ny = 2"
+    turns = [_fix_turn(0, old, "z", "Closest match: lines 1-2 match exactly except your old_str contains "
+                                    "the 2-character sequence `\\n` (1x) where the file has a real line "
+                                    "break -- the escaping collapsed your newlines.")]
+    hints = _fix(turns)
+    assert json.dumps("x = 1\ny = 2")[1:-1] in hints[0]["text"]
+
+
+def test_window_correction_comes_from_the_viewed_file_and_needs_the_diag_check():
+    view = {"step": 0, "tokens": 5, "response": "look",
+            "tools": [{"name": "str_replace_editor", "action": "str_replace_editor view --path /f.py",
+                       "observation": "Here's the result of running `cat -n` on /f.py:\n"
+                                      "     1\tdef f():\n     2\t    return 2\n     3\tprint(f())\n"}]}
+    fail = _fix_turn(1, "def f():\n    return 3\nprint(f())", "new",
+                     "old_str (3 lines) did not appear verbatim in /f.py. Closest match: lines 1-3 "
+                     "(92% similar). Differing lines:\n  line 2: file has `return 2`, your old_str has `return 3`")
+    hints = _fix([view, fail])
+    assert json.dumps("def f():\n    return 2\nprint(f())")[1:-1] in hints[1]["text"]
+
+
+def test_low_similarity_ships_no_hint():
+    turns = [_fix_turn(0, "    a()", "b", "Closest match: lines 1-1 (72% similar). Differing lines:\n"
+                                          "  line 1: file has `q`, your old_str has `a()`")]
+    assert _fix(turns) == {}
+
+
+def test_clean_traces_delegate_to_the_fallback():
+    reflector = ToolFixReflector(_Model(), ToolFixReflectionConfig(
+        enabled=True, name="tool_fix", fallback={"enabled": True}))
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+    assert hints == {0: "run the failing test"}
+
+
+def test_hint_template_must_carry_the_corrected_call():
+    with pytest.raises(ValueError, match="corrected_call"):
+        ToolFixReflectionConfig(name="tool_fix", hint_template="be careful")
+
+
+def test_corrected_call_reports_class():
+    old = "a \nb"
+    turns = [_fix_turn(4, old, "n", "Closest match: lines 1-2 match exactly except your old_str has "
+                                    "trailing whitespace the file does not have.")]
+    step, cls, call = corrected_call(turns, 0.8)
+    assert (step, cls) == (4, "trailing") and json.dumps("a\nb")[1:-1] in call
