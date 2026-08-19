@@ -219,8 +219,9 @@ class ToolFixReflectionConfig(BaseReflectionConfig):
     fallback: dict[str, Any] | None = None
 
     def model_post_init(self, _ctx):
-        if "{corrected_call}" not in self.hint_template:
-            raise ValueError("tool_fix hint_template must format on {corrected_call}")
+        if not any(k in self.hint_template for k in ("{corrected_call}", "{corrected_old_wire}")):
+            raise ValueError(
+                "tool_fix hint_template must format on {corrected_call} or {corrected_old_wire}")
         if self.fallback is not None:
             build_reflection_config(self.fallback)
 
@@ -250,7 +251,12 @@ class ToolFixReflector(AbstractReflector):
                 task=task, turns=turns, gold=gold, feedback=feedback,
                 outcome=outcome, agent_patch=agent_patch)
         step, cls, call = hit
-        text = self.config.hint_template.format(corrected_call=call)
+        # the wire old_str (escaped JSON value) measured as the strongest conditioning form
+        m = re.search(r'"old_str":\s*("(?:[^"\\]|\\.)*")', call)
+        old_wire = m.group(1) if m else json.dumps("")
+        text = self.config.hint_template.format(
+            **{k: v for k, v in (("corrected_call", call), ("corrected_old_wire", old_wire))
+               if "{" + k + "}" in self.config.hint_template})
         # `at: call` routes the trainer to the mid-turn splice (between reasoning and call)
         # with the distillation mask on the call tokens alone; never clipped, since a cut
         # corrected call teaches a truncation
