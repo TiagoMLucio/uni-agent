@@ -711,3 +711,23 @@ def test_rebase_transfers_an_insertion_with_reindent():
     from uni_agent.reflection.tool_fix import _rebase_new
     out = _rebase_new("    a()\n    b()", "    a()\n    mid()\n    b()", "  a()\n  b()")
     assert out == "  a()\n  mid()\n  b()"
+
+
+def test_tool_fix_old_wire_hint_template():
+    old, new = "    a()\n    b()", "    a()\n    c()"
+    turns = [_fix_turn(3, old, new, "Closest match: lines 1-2 match exactly except every line "
+                                    "of your old_str has 4 extra leading space(s).")]
+    cfg = ToolFixReflectionConfig(
+        enabled=True, name="tool_fix", target_mask=True,
+        hint_template='Your next edit must use exactly this value:\n"old_str": {corrected_old_wire}')
+    h = asyncio.run(ToolFixReflector(None, cfg).reflect_trajectory(
+        task="t", turns=turns, gold="g", feedback="f"))[3]
+    assert h["text"].endswith(json.dumps("a()\nb()")), h["text"]
+    assert "new_str" not in h["text"], "old-wire hint carries no new_str"
+    assert "target" in h and json.dumps("a()\nb()")[1:-1] in h["target"], "mask target still the full call"
+
+
+def test_tool_fix_template_validation_accepts_either_placeholder():
+    ToolFixReflectionConfig(name="tool_fix", hint_template="x {corrected_old_wire}")
+    with pytest.raises(ValueError):
+        ToolFixReflectionConfig(name="tool_fix", hint_template="no placeholder")
