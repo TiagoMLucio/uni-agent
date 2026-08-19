@@ -687,3 +687,27 @@ def test_tool_fix_ships_the_target_when_configured():
     without = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix"))
     h2 = asyncio.run(without.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))[1]
     assert "target" not in h2, "default ships no target (p1toolfix3 reproducible)"
+
+
+def test_tool_fix_prefers_the_editor_printed_region_and_rebases_new_str():
+    old = "        a()\n        b()"
+    new = "        a()\n        c()"
+    obs_tail = ("Closest match: lines 1-2 match exactly except every line of your old_str has "
+                "4 extra leading space(s).\nThe matching region of the file reads exactly:\n"
+                "    a()\n    b()\nResend the call with this, copied character for character, as your old_str.")
+    turns = [_fix_turn(0, old, new, obs_tail)]
+    reflector = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix", target_mask=True))
+    h = asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))[0]
+    assert json.dumps("    a()\n    b()")[1:-1] in h["target"], "old_str from the printed region"
+    assert json.dumps("    a()\n    c()")[1:-1] in h["target"], "new_str rebased to the verified indent"
+
+
+def test_rebase_falls_back_when_line_counts_differ():
+    from uni_agent.reflection.tool_fix import _rebase_new
+    assert _rebase_new("a\nb", "a\nc", "x\ny\nz") is None
+
+
+def test_rebase_transfers_an_insertion_with_reindent():
+    from uni_agent.reflection.tool_fix import _rebase_new
+    out = _rebase_new("    a()\n    b()", "    a()\n    mid()\n    b()", "  a()\n  b()")
+    assert out == "  a()\n  mid()\n  b()"

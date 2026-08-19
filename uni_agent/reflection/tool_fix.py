@@ -100,6 +100,60 @@ def _call_blocks(response: str):
     return out
 
 
+OBS_REGION_MARK = "The matching region of the file reads exactly:\n"
+
+
+def _obs_region(obs: str) -> str | None:
+    """The editor-verified matching region printed into the failure observation (present
+    when the sandbox runs with STR_REPLACE_DID_YOU_MEAN): file-true at failure time, so it
+    beats any reconstruction."""
+    if OBS_REGION_MARK not in obs:
+        return None
+    region = obs.split(OBS_REGION_MARK, 1)[1]
+    region = region.split("\nResend the call", 1)[0]
+    return region.strip("\n") or None
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _rebase_new(old: str, new: str, verified_old: str) -> str | None:
+    """Re-base the model's intended change (old -> new) onto the verified region.
+
+    Line-count-matching fast path only: each verified line corresponds to the same-index
+    old line, so intent opcodes transfer positionally and inserted/replaced lines are
+    re-indented by the local old->verified indent delta. Anything else returns None and
+    the caller keeps the model's new_str untouched.
+    """
+    import difflib
+
+    old_lines, ver_lines = old.split("\n"), verified_old.split("\n")
+    if len(old_lines) != len(ver_lines):
+        return None
+    deltas = [_indent_of(v) - _indent_of(o) if o.strip() and v.strip() else 0
+              for o, v in zip(old_lines, ver_lines, strict=True)]
+
+    def shift(line: str, d: int) -> str:
+        if not line.strip():
+            return line
+        if d >= 0:
+            return " " * d + line
+        return line[-d:] if line.startswith(" " * -d) else line
+
+    out: list[str] = []
+    sm = difflib.SequenceMatcher(None, old_lines, new.split("\n"), autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.extend(ver_lines[i1:i2])
+        elif tag == "delete":
+            continue
+        else:  # replace / insert: the model's own lines, re-indented to the verified offset
+            d = deltas[i1] if i1 < len(deltas) else (deltas[i1 - 1] if i1 else 0)
+            out.extend(shift(line, d) for line in new.split("\n")[j1:j2])
+    return "\n".join(out)
+
+
 def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | None:
     """``(step, class, corrected call text)`` for the first confidently-fixable failed edit."""
     blob_parts: list[str] = []
@@ -129,11 +183,18 @@ def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | 
         raw, args = blocks[0]
         old, new = str(args.get("old_str", "")), str(args.get("new_str", ""))
         cls = _classify(diag)
-        fixed = _transform(cls, old, diag)
-        fixed_new = _transform(cls, new, diag) if fixed is not None else None
-        if fixed is None and cls == "window":
-            fixed = _window(old, "\n".join(blob_parts)[-40000:], diag)
-        if fixed is None:
+        # the editor-printed region (did-you-mean environments) is file-verified at failure
+        # time: prefer it for every class, then the mechanical transforms, then the blob
+        fixed = _obs_region(hit)
+        fixed_new = None
+        if fixed is not None:
+            fixed_new = _rebase_new(old, new, fixed)
+        else:
+            fixed = _transform(cls, old, diag)
+            fixed_new = _transform(cls, new, diag) if fixed is not None else None
+            if fixed is None and cls == "window":
+                fixed = _window(old, "\n".join(blob_parts)[-40000:], diag)
+        if fixed is None or fixed == old:
             return None
         fo = json.dumps(old)[1:-1]
         if fo not in raw:
