@@ -740,8 +740,12 @@ class UniAgentLoop(AgentLoopBase):
             if start < len(response_ids)
         ]
         turn_feedback = turn_feedback or {}
+        # a reflector may return {"text": ..., "at": "call"} instead of plain text; the
+        # placement rides as a third element so the trainer can splice mid-turn
         extra_fields["turn_feedback"] = [
-            [step, turn_feedback[step]] for step, _, _ in extra_fields["turn_spans"] if step in turn_feedback
+            [step, hint["text"], hint["at"]] if isinstance(hint, dict) else [step, hint]
+            for step, _, _ in extra_fields["turn_spans"]
+            if (hint := turn_feedback.get(step)) is not None
         ]
         extra_fields.update(shared_extra)
         extra_fields["segment_index"] = seg_idx
