@@ -257,3 +257,43 @@ def test_non_python_files_never_lint(tmp_path):
     out = run_edit(f, "some ( unbalanced", "still ( unbalanced")
     assert "has been edited" in out
     assert "syntax" not in out
+
+
+# --- did-you-mean suggestion (STR_REPLACE_DID_YOU_MEAN=true) ------------------------------
+
+def run_edit_dym(path: Path, old: str, dym: bool = True):
+    env = {**os.environ, "EXPLAIN_EDIT_FAILURES": "true",
+           "STR_REPLACE_DID_YOU_MEAN": "true" if dym else "false"}
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "str_replace", "--path", str(path),
+         "--old_str", old, "--new_str", "REPLACED"],
+        capture_output=True, text=True, timeout=30, env=env,
+    ).stdout
+
+
+def test_did_you_mean_prints_the_region_for_an_indent_miss(tmp_path):
+    f = write(tmp_path, "def g():\n    a()\n    b()\n")
+    out = run_edit_dym(f, "        a()\n        b()")
+    assert "The matching region of the file reads exactly:" in out
+    assert "\n    a()\n    b()\n" in out
+    assert "copied character for character" in out
+
+
+def test_did_you_mean_stays_off_without_the_flag(tmp_path):
+    f = write(tmp_path, "def g():\n    a()\n    b()\n")
+    out = run_edit_dym(f, "        a()\n        b()", dym=False)
+    assert "matching region" not in out and "Closest match" in out
+
+
+def test_did_you_mean_prints_for_a_close_window(tmp_path):
+    body = "def g():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n"
+    f = write(tmp_path, body)
+    out = run_edit_dym(f, "def g():\n    x = 1\n    y = 9\n    z = 3\n    return x + y + z")
+    assert "The matching region of the file reads exactly:" in out
+    assert "    y = 2" in out
+
+
+def test_did_you_mean_skips_a_weak_window(tmp_path):
+    f = write(tmp_path, "alpha\nbeta\ngamma\ndelta\n" * 3)
+    out = run_edit_dym(f, "alpha\nBETA9\nGAMMA9\nDELTA9")
+    assert "matching region" not in out
