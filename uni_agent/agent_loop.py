@@ -743,7 +743,8 @@ class UniAgentLoop(AgentLoopBase):
         # a reflector may return {"text": ..., "at": "call"} instead of plain text; the
         # placement rides as a third element so the trainer can splice mid-turn
         extra_fields["turn_feedback"] = [
-            [step, hint["text"], hint["at"]] if isinstance(hint, dict) else [step, hint]
+            [step, hint["text"], hint["at"], *([hint["target"]] if hint.get("target") else [])]
+            if isinstance(hint, dict) else [step, hint]
             for step, _, _ in extra_fields["turn_spans"]
             if (hint := turn_feedback.get(step)) is not None
         ]

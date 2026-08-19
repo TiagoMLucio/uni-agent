@@ -150,6 +150,9 @@ def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | 
 class ToolFixReflectionConfig(BaseReflectionConfig):
     #: below this editor-reported similarity the correction is a guess, not a fix
     min_sim: float = 0.8
+    #: also ship the corrected call as `target`, so the trainer can narrow the distillation
+    #: mask to the tokens it changes (actor.self_distillation.call_mask=first|all)
+    target_mask: bool = False
     hint_template: str = DEFAULT_HINT_TEMPLATE
     #: reflection block for traces with no confident correction; None leaves them unhinted
     fallback: dict[str, Any] | None = None
@@ -190,7 +193,10 @@ class ToolFixReflector(AbstractReflector):
         # `at: call` routes the trainer to the mid-turn splice (between reasoning and call)
         # with the distillation mask on the call tokens alone; never clipped, since a cut
         # corrected call teaches a truncation
-        hints = {step: {"text": text, "at": "call"}} if step in {t["step"] for t in turns} else {}
+        hint: dict[str, Any] = {"text": text, "at": "call"}
+        if self.config.target_mask:
+            hint["target"] = call
+        hints = {step: hint} if step in {t["step"] for t in turns} else {}
         self._record(
             "tool_fix", step,
             [{"role": "system", "content": f"(deterministic: corrected call, min_sim={self.config.min_sim})"},

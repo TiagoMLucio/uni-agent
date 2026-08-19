@@ -673,3 +673,17 @@ def test_corrected_call_reports_class():
                                     "trailing whitespace the file does not have.")]
     step, cls, call = corrected_call(turns, 0.8)
     assert (step, cls) == (4, "trailing") and json.dumps("a\nb")[1:-1] in call
+
+
+def test_tool_fix_ships_the_target_when_configured():
+    old, new = "    a()", "    b()"
+    turns = [_fix_turn(1, old, new, "Closest match: lines 1-1 match exactly except every line "
+                                    "of your old_str has 4 extra leading space(s).")]
+    reflector = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix", target_mask=True))
+    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))
+    h = hints[1]
+    assert h["at"] == "call" and "target" in h
+    assert json.dumps("a()")[1:-1] in h["target"], "target is the corrected call"
+    without = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix"))
+    h2 = asyncio.run(without.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))[1]
+    assert "target" not in h2, "default ships no target (p1toolfix3 reproducible)"
