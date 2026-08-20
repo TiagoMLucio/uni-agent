@@ -813,3 +813,68 @@ def test_hint_at_retry_ships_the_same_corrected_call_and_target():
 def test_hint_at_validation():
     with pytest.raises(ValueError, match="hint_at"):
         ToolFixReflectionConfig(name="tool_fix", hint_at="somewhere")
+
+
+# --- tool fix: which failures get hinted --------------------------------------------------
+
+INDENT_DIAG = ("Closest match: lines 1-2 match exactly except every line of your old_str "
+               "has 4 extra leading space(s).")
+
+
+def test_hint_failures_first_keeps_one_hint_at_the_earliest_failure():
+    turns = [_fix_turn(1, "    a()\n    b()", "    a()\n    c()", INDENT_DIAG),
+             _fix_turn(3, "    x()\n    y()", "    x()\n    z()", INDENT_DIAG)]
+    assert list(_fix(turns)) == [1]
+
+
+def test_hint_failures_all_reaches_the_later_failures():
+    turns = [_fix_turn(1, "    a()\n    b()", "    a()\n    c()", INDENT_DIAG),
+             _fix_turn(3, "    x()\n    y()", "    x()\n    z()", INDENT_DIAG),
+             _fix_turn(5, "    p()\n    q()", "    p()\n    r()", INDENT_DIAG)]
+    hints = _fix(turns, hint_failures="all")
+    assert list(hints) == [1, 3, 5]
+    assert json.dumps("x()\ny()")[1:-1] in hints[3]["text"], "each hint carries its own correction"
+
+
+def test_max_hints_caps_the_all_mode():
+    turns = [_fix_turn(s, "    a()\n    b()", f"    a()\n    c{s}()", INDENT_DIAG) for s in (1, 2, 3, 4)]
+    assert list(_fix(turns, hint_failures="all", max_hints=2)) == [1, 2]
+
+
+def test_hint_failures_all_skips_uncorrectable_failures_instead_of_stopping():
+    weak = _fix_turn(1, "    a()", "b", "Closest match: lines 1-1 (72% similar). Differing lines:\n"
+                                        "  line 1: file has `q`, your old_str has `a()`")
+    good = _fix_turn(4, "    x()\n    y()", "    x()\n    z()", INDENT_DIAG)
+    assert list(_fix([weak, good], hint_failures="all")) == [4]
+    assert _fix([weak, good]) == {}, "first mode still stops at an uncorrectable first failure"
+
+
+def test_hint_failures_repeat_targets_the_loop_point():
+    old, new = "    a()\n    b()", "    a()\n    c()"
+    turns = [_fix_turn(1, old, new, INDENT_DIAG),          # first attempt
+             _fix_turn(2, "    q()\n    w()", "    q()\n    e()", INDENT_DIAG),
+             _fix_turn(3, old, new, INDENT_DIAG)]          # same call again: the loop point
+    hints = _fix(turns, hint_failures="repeat")
+    assert list(hints) == [3], "the hint lands where the model repeated itself"
+
+
+def test_hint_failures_repeat_ships_nothing_without_a_repeat():
+    turns = [_fix_turn(1, "    a()\n    b()", "    a()\n    c()", INDENT_DIAG),
+             _fix_turn(3, "    x()\n    y()", "    x()\n    z()", INDENT_DIAG)]
+    assert _fix(turns, hint_failures="repeat") == {}
+
+
+def test_repeat_mode_sees_repeats_of_uncorrectable_calls():
+    weak = "Closest match: lines 1-1 (72% similar). Differing lines:\n  line 1: file has `q`, your old_str has `a()`"
+    turns = [_fix_turn(1, "    a()", "b", weak),
+             _fix_turn(2, "    a()", "b", weak),
+             _fix_turn(3, "    x()\n    y()", "    x()\n    z()", INDENT_DIAG),
+             _fix_turn(4, "    x()\n    y()", "    x()\n    z()", INDENT_DIAG)]
+    assert list(_fix(turns, hint_failures="repeat")) == [4]
+
+
+def test_hint_failures_is_validated():
+    with pytest.raises(ValueError, match="hint_failures"):
+        ToolFixReflectionConfig(name="tool_fix", hint_failures="everywhere")
+    with pytest.raises(ValueError, match="max_hints"):
+        ToolFixReflectionConfig(name="tool_fix", max_hints=0)

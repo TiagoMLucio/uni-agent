@@ -188,8 +188,9 @@ def _rebase_new(old: str, new: str, verified_old: str) -> str | None:
     return "\n".join(out)
 
 
-def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | None:
-    """``(step, class, corrected call text)`` for the first confidently-fixable failed edit."""
+def _failed_edits(turns: list[dict]):
+    """``(turn, failure observation, view blob so far)`` for each turn whose first
+    str_replace failed, with the file text viewed up to that point."""
     blob_parts: list[str] = []
     for turn in turns:
         hit = None
@@ -205,46 +206,87 @@ def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | 
                 if "cat -n" in obs or "\t" in obs:
                     blob_parts.append(GUTTER.sub("", obs))
             continue
+        yield turn, hit, "\n".join(blob_parts)[-40000:]
 
-        diag = hit[hit.find(FAIL_MARK):][:800]
-        m = SIM_RE.search(diag)
-        sim = int(m.group(1)) / 100 if m else (0.99 if "match exactly except" in diag else 0.0)
-        if sim < min_sim:
-            return None
-        blocks = _call_blocks(turn.get("response") or "")
-        if not blocks:
-            return None
-        raw, args = blocks[0]
-        old, new = str(args.get("old_str", "")), str(args.get("new_str", ""))
-        cls = _classify(diag)
-        # the editor-printed region (did-you-mean environments) is file-verified at failure
-        # time: prefer it for every class, then the mechanical transforms, then the blob
-        fixed = _obs_region(hit)
-        fixed_new = None
-        if fixed is not None:
-            fixed_new = _rebase_new(old, new, fixed)
-        else:
-            fixed = _transform(cls, old, diag)
-            fixed_new = _transform(cls, new, diag) if fixed is not None else None
-            if fixed is None and cls == "window":
-                fixed = _window(old, "\n".join(blob_parts)[-40000:], diag)
-        if fixed is None or fixed == old:
-            return None
-        # a correction that collapses old_str into new_str teaches a call the editor rejects
-        # outright ("old_str is the same as new_str"): the mechanical transforms hit this
-        # whenever the edit's only intended change WAS the whitespace or the escaping
-        if fixed == (fixed_new if fixed_new else new):
-            return None
-        fo = json.dumps(old)[1:-1]
-        if fo not in raw:
-            return None
-        raw = raw.replace(fo, json.dumps(fixed)[1:-1])
-        if fixed_new and fixed_new != new:
-            fn = json.dumps(new)[1:-1]
-            if fn in raw:
-                raw = raw.replace(fn, json.dumps(fixed_new)[1:-1])
-        return turn["step"], cls, raw
-    return None
+
+def _correct_one(turn: dict, hit: str, blob: str, min_sim: float):
+    """``(class, corrected call, the model's own raw call)`` for one failed edit.
+
+    ``corrected call`` is empty when no correction is trustworthy; the raw call is still
+    returned (when parseable) so callers can detect a repeat of an uncorrectable failure.
+    """
+    diag = hit[hit.find(FAIL_MARK):][:800]
+    m = SIM_RE.search(diag)
+    sim = int(m.group(1)) / 100 if m else (0.99 if "match exactly except" in diag else 0.0)
+    blocks = _call_blocks(turn.get("response") or "")
+    if not blocks:
+        return "", "", ""
+    raw, args = blocks[0]
+    if sim < min_sim:
+        return "", "", raw
+    old, new = str(args.get("old_str", "")), str(args.get("new_str", ""))
+    cls = _classify(diag)
+    # the editor-printed region (did-you-mean environments) is file-verified at failure
+    # time: prefer it for every class, then the mechanical transforms, then the blob
+    fixed = _obs_region(hit)
+    fixed_new = None
+    if fixed is not None:
+        fixed_new = _rebase_new(old, new, fixed)
+    else:
+        fixed = _transform(cls, old, diag)
+        fixed_new = _transform(cls, new, diag) if fixed is not None else None
+        if fixed is None and cls == "window":
+            fixed = _window(old, blob, diag)
+    if fixed is None or fixed == old:
+        return cls, "", raw
+    # a correction that collapses old_str into new_str teaches a call the editor rejects
+    # outright ("old_str is the same as new_str"): the mechanical transforms hit this
+    # whenever the edit's only intended change WAS the whitespace or the escaping
+    if fixed == (fixed_new if fixed_new else new):
+        return cls, "", raw
+    fo = json.dumps(old)[1:-1]
+    if fo not in raw:
+        return cls, "", raw
+    corrected = raw.replace(fo, json.dumps(fixed)[1:-1])
+    if fixed_new and fixed_new != new:
+        fn = json.dumps(new)[1:-1]
+        if fn in corrected:
+            corrected = corrected.replace(fn, json.dumps(fixed_new)[1:-1])
+    return cls, corrected, raw
+
+
+def corrected_calls(turns: list[dict], min_sim: float, select: str = "first",
+                    max_hints: int = 1) -> list[tuple[int, str, str]]:
+    """``(step, class, corrected call)`` per failed edit selected by ``select``.
+
+    ``first`` keeps the trajectory's first failed edit only, and ships nothing when that
+    one is not correctable (the original behaviour: one hint, at the earliest failure).
+    ``all`` hints every correctable failure, up to ``max_hints`` — coverage reaches the
+    later failures, which is where repeat loops form. ``repeat`` hints the loop point
+    instead: the first failure whose call the model had already tried verbatim.
+    """
+    out: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    for turn, hit, blob in _failed_edits(turns):
+        cls, corrected, raw = _correct_one(turn, hit, blob, min_sim)
+        if select == "first":
+            return [(turn["step"], cls, corrected)] if corrected else []
+        if select == "repeat":
+            if raw and raw in seen and corrected:
+                return [(turn["step"], cls, corrected)]
+        elif corrected:
+            out.append((turn["step"], cls, corrected))
+            if len(out) >= max_hints:
+                break
+        if raw:
+            seen.add(raw)
+    return out
+
+
+def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | None:
+    """``(step, class, corrected call text)`` for the first confidently-fixable failed edit."""
+    hits = corrected_calls(turns, min_sim, "first", 1)
+    return hits[0] if hits else None
 
 
 class ToolFixReflectionConfig(BaseReflectionConfig):
@@ -253,6 +295,11 @@ class ToolFixReflectionConfig(BaseReflectionConfig):
     #: also ship the corrected call as `target`, so the trainer can narrow the distillation
     #: mask to the tokens it changes (actor.self_distillation.call_mask=first|all)
     target_mask: bool = False
+    #: which failed edits to hint: the trajectory's first, every correctable one, or the
+    #: loop point (the first failure repeating a call the model already tried verbatim)
+    hint_failures: str = "first"
+    #: cap on hints per trajectory under hint_failures=all (each costs a teacher sub-row)
+    max_hints: int = 3
     hint_template: str = DEFAULT_HINT_TEMPLATE
     #: where the corrected call is taught: at the failed call (`call`), at the retry that
     #: failed again (`retry`, which trains recovery from the editor's error message), or both
@@ -266,6 +313,11 @@ class ToolFixReflectionConfig(BaseReflectionConfig):
                 "tool_fix hint_template must format on {corrected_call} or {corrected_old_wire}")
         if self.hint_at not in ("call", "retry", "both"):
             raise ValueError(f"tool_fix hint_at must be call|retry|both, got {self.hint_at!r}")
+        if self.hint_failures not in ("first", "all", "repeat"):
+            raise ValueError(
+                f"tool_fix hint_failures must be first|all|repeat, got {self.hint_failures!r}")
+        if self.max_hints < 1:
+            raise ValueError(f"tool_fix max_hints must be >= 1, got {self.max_hints}")
         if self.fallback is not None:
             build_reflection_config(self.fallback)
 
@@ -287,38 +339,43 @@ class ToolFixReflector(AbstractReflector):
     async def reflect_trajectory(
         self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = "", agent_patch: str = ""
     ) -> dict[int, Any]:
-        hit = corrected_call(turns, self.config.min_sim)
-        if hit is None:
+        found = corrected_calls(
+            turns, self.config.min_sim, self.config.hint_failures, self.config.max_hints)
+        if not found:
             if self._fallback is None:
                 return {}
             return await self._fallback.reflect_trajectory(
                 task=task, turns=turns, gold=gold, feedback=feedback,
                 outcome=outcome, agent_patch=agent_patch)
-        step, cls, call = hit
-        # the wire old_str (escaped JSON value) measured as the strongest conditioning form
-        m = re.search(r'"old_str":\s*("(?:[^"\\]|\\.)*")', call)
-        old_wire = m.group(1) if m else json.dumps("")
-        text = self.config.hint_template.format(
-            **{k: v for k, v in (("corrected_call", call), ("corrected_old_wire", old_wire))
-               if "{" + k + "}" in self.config.hint_template})
-        # `at: call` routes the trainer to the mid-turn splice (between reasoning and call)
-        # with the distillation mask on the call tokens alone; never clipped, since a cut
-        # corrected call teaches a truncation
-        hint: dict[str, Any] = {"text": text, "at": "call"}
-        if self.config.target_mask:
-            hint["target"] = call
         known = {t["step"] for t in turns}
-        steps = [step] if self.config.hint_at in ("call", "both") else []
-        if self.config.hint_at in ("retry", "both"):
-            again = retry_step(turns, step, _call_path(call))
-            if again is not None:
-                steps.append(again)
-        hints = {s: dict(hint) for s in steps if s in known}
-        self._record(
-            "tool_fix", step,
-            [{"role": "system", "content": f"(deterministic: corrected call, min_sim={self.config.min_sim})"},
-             {"role": "user", "content": f"class: {cls}"}],
-            text if hints else "", None, None, None)
+        hints: dict[int, Any] = {}
+        for step, cls, call in found:
+            # the wire old_str (escaped JSON value) measured as the strongest conditioning form
+            m = re.search(r'"old_str":\s*("(?:[^"\\]|\\.)*")', call)
+            old_wire = m.group(1) if m else json.dumps("")
+            text = self.config.hint_template.format(
+                **{k: v for k, v in (("corrected_call", call), ("corrected_old_wire", old_wire))
+                   if "{" + k + "}" in self.config.hint_template})
+            # `at: call` routes the trainer to the mid-turn splice (between reasoning and call)
+            # with the distillation mask on the call tokens alone; never clipped, since a cut
+            # corrected call teaches a truncation
+            hint: dict[str, Any] = {"text": text, "at": "call"}
+            if self.config.target_mask:
+                hint["target"] = call
+            steps = [step] if self.config.hint_at in ("call", "both") else []
+            if self.config.hint_at in ("retry", "both"):
+                again = retry_step(turns, step, _call_path(call))
+                if again is not None:
+                    steps.append(again)
+            for s in steps:
+                if s in known and s not in hints:
+                    hints[s] = dict(hint)
+            self._record(
+                "tool_fix", step,
+                [{"role": "system",
+                  "content": f"(deterministic: corrected call, min_sim={self.config.min_sim})"},
+                 {"role": "user", "content": f"class: {cls}"}],
+                text if hints else "", None, None, None)
         return hints
 
 
