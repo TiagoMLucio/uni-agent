@@ -114,6 +114,40 @@ def _obs_region(obs: str) -> str | None:
     return region.strip("\n") or None
 
 
+def _call_path(raw: str) -> str | None:
+    """The edited path of a rendered ``<tool_call>`` block."""
+    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", raw, re.S)
+    if not m:
+        return None
+    try:
+        return str((json.loads(m.group(1)).get("arguments") or {}).get("path", "")) or None
+    except json.JSONDecodeError:
+        return None
+
+
+def retry_step(turns: list[dict], after_step: int, path: str | None) -> int | None:
+    """The step of the retry that failed again on the same file, or None.
+
+    Only a retry that ALSO failed is a recovery target: the file is then still what the
+    correction was derived from, and the model is demonstrably stuck. A retry that
+    succeeded needs no teaching (and would have changed the file underneath the
+    correction), and an edit that moves to another file means the model moved on.
+    """
+    if path is None:
+        return None
+    for turn in turns:
+        if turn["step"] <= after_step:
+            continue
+        for call in turn.get("tools") or []:
+            if call.get("name") != "str_replace_editor" or not EDIT_RE.match(call.get("action") or ""):
+                continue
+            blocks = _call_blocks(turn.get("response") or "")
+            if not blocks or str(blocks[0][1].get("path", "")) != path:
+                return None
+            return turn["step"] if FAIL_MARK in (call.get("observation") or "") else None
+    return None
+
+
 def _indent_of(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
@@ -220,6 +254,9 @@ class ToolFixReflectionConfig(BaseReflectionConfig):
     #: mask to the tokens it changes (actor.self_distillation.call_mask=first|all)
     target_mask: bool = False
     hint_template: str = DEFAULT_HINT_TEMPLATE
+    #: where the corrected call is taught: at the failed call (`call`), at the retry that
+    #: failed again (`retry`, which trains recovery from the editor's error message), or both
+    hint_at: str = "call"
     #: reflection block for traces with no confident correction; None leaves them unhinted
     fallback: dict[str, Any] | None = None
 
@@ -227,6 +264,8 @@ class ToolFixReflectionConfig(BaseReflectionConfig):
         if not any(k in self.hint_template for k in ("{corrected_call}", "{corrected_old_wire}")):
             raise ValueError(
                 "tool_fix hint_template must format on {corrected_call} or {corrected_old_wire}")
+        if self.hint_at not in ("call", "retry", "both"):
+            raise ValueError(f"tool_fix hint_at must be call|retry|both, got {self.hint_at!r}")
         if self.fallback is not None:
             build_reflection_config(self.fallback)
 
@@ -268,7 +307,13 @@ class ToolFixReflector(AbstractReflector):
         hint: dict[str, Any] = {"text": text, "at": "call"}
         if self.config.target_mask:
             hint["target"] = call
-        hints = {step: hint} if step in {t["step"] for t in turns} else {}
+        known = {t["step"] for t in turns}
+        steps = [step] if self.config.hint_at in ("call", "both") else []
+        if self.config.hint_at in ("retry", "both"):
+            again = retry_step(turns, step, _call_path(call))
+            if again is not None:
+                steps.append(again)
+        hints = {s: dict(hint) for s in steps if s in known}
         self._record(
             "tool_fix", step,
             [{"role": "system", "content": f"(deterministic: corrected call, min_sim={self.config.min_sim})"},
