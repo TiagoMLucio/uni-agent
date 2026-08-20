@@ -222,15 +222,22 @@ def _closest_window(old_str: str, file_content: str) -> Optional[Tuple[int, floa
 
 
 def _did_you_mean(file_content: str, start: int, end: int) -> str:
-    """The matching region verbatim plus the resend instruction; empty when disabled or the
-    region is too large for an observation."""
+    """The matching region as the JSON value to resend; empty when disabled or the region is
+    too large for an observation.
+
+    The region is printed escaped rather than raw because the differences that cause these
+    failures are the ones raw text cannot show: a trailing space, a tab, a literal ``\\n``.
+    Printed raw, a whitespace-only near-miss renders identically to what the model already
+    sent, which reads as "resend the same thing" -- and the model does.
+    """
     if not STR_REPLACE_DID_YOU_MEAN:
         return ""
     region = "\n".join(file_content.split("\n")[start - 1 : end])
     if not region or len(region) > DID_YOU_MEAN_MAX_CHARS:
         return ""
-    return ("\nThe matching region of the file reads exactly:\n" + region
-            + "\nResend the call with this, copied character for character, as your old_str.")
+    return ("\nThe matching region of the file is exactly this JSON value:\n"
+            + '"old_str": ' + json.dumps(region)
+            + "\nResend the call with this as your old_str, copied character for character.")
 
 
 def explain_edit_failure(old_str: str, file_content: str) -> str:

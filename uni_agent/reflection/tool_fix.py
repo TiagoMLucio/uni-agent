@@ -101,12 +101,27 @@ def _call_blocks(response: str):
 
 
 OBS_REGION_MARK = "The matching region of the file reads exactly:\n"
+OBS_REGION_WIRE_MARK = "The matching region of the file is exactly this JSON value:\n"
+OBS_WIRE_RE = re.compile(r'"old_str":\s*("(?:[^"\\]|\\.)*")')
 
 
 def _obs_region(obs: str) -> str | None:
     """The editor-verified matching region printed into the failure observation (present
     when the sandbox runs with STR_REPLACE_DID_YOU_MEAN): file-true at failure time, so it
-    beats any reconstruction."""
+    beats any reconstruction.
+
+    The editor prints it as an escaped JSON value; the older raw form is still read so
+    dumps and sandboxes from before that change keep working.
+    """
+    if OBS_REGION_WIRE_MARK in obs:
+        tail = obs.split(OBS_REGION_WIRE_MARK, 1)[1].split("\nResend the call", 1)[0]
+        m = OBS_WIRE_RE.search(tail)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(1)) or None
+        except json.JSONDecodeError:
+            return None
     if OBS_REGION_MARK not in obs:
         return None
     region = obs.split(OBS_REGION_MARK, 1)[1]
