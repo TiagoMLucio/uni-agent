@@ -898,3 +898,29 @@ def test_obs_region_still_reads_the_older_raw_form():
            "    x = (0,)\n    return x\n"
            "Resend the call with this, copied character for character, as your old_str.")
     assert _obs_region(obs) == "    x = (0,)\n    return x"
+
+
+def test_window_never_overruns_into_observation_wrapper_text():
+    """A candidate window that includes an observation header or truncation notice is a
+    reconstruction overrun, never file content: 1.7% of live targets carried
+    "Observation:" inside old_str before this guard."""
+    view = {"step": 0, "tokens": 5, "response": "look",
+            "tools": [{"name": "str_replace_editor", "action": "str_replace_editor view --path /f.py",
+                       "observation": "Observation:\n     1\tdef f():\n     2\t    return 2\n"}]}
+    # old_str drifts toward a window that would have to include the "Observation:" line
+    fail = _fix_turn(1, "Observation:\ndef f():", "new",
+                     "old_str (2 lines) did not appear verbatim in /f.py. Closest match: lines 1-2 "
+                     "(95% similar). Differing lines:\n  line 2: file has `def f():`, your old_str has `def g():`")
+    assert _fix([view, fail]) == {}
+
+
+def test_window_cannot_span_two_view_observations():
+    """Two views joined in the blob are different tool results; whatever window wins must
+    sit inside one of them, never bridge the boundary between them."""
+    from uni_agent.reflection.tool_fix import BLOB_BOUNDARY, _window
+    blob = "alpha_one()\nalpha_two()\n" + BLOB_BOUNDARY + "\nbeta_one()\nbeta_two()"
+    diag = ("Closest match: lines 2-3 (93% similar). Differing lines:\n"
+            "  line 2: file has `alpha_two()`, your old_str has `alpha_2()`")
+    got = _window("alpha_two()\nbeta_one()", blob, diag)
+    assert got is None or (BLOB_BOUNDARY not in got and not
+                           ("alpha_two()" in got and "beta_one()" in got))

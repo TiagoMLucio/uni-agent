@@ -50,6 +50,15 @@ def _transform(cls: str, text: str, diag: str) -> str | None:
     return None
 
 
+#: separates the view blob's observations; a window crossing it spans two different
+#: tool results and cannot be a region of one file
+BLOB_BOUNDARY = "\x00"
+#: lines the blob carries that are never file content (observation headers, truncation
+#: notices); a window touching one is a reconstruction overrun, not file text
+_BLOB_NOISE = ("Observation:", "<tool_response", "</tool_response", "<NOTE>",
+               "[... TRUNCATED ...]", "[The observation")
+
+
 def _window(old: str, blob: str, diag: str) -> str | None:
     """The blob window closest to old_str, kept only when the diagnosis's quoted
     fragments all appear in it (the cross-check that makes a guess trustworthy)."""
@@ -58,10 +67,16 @@ def _window(old: str, blob: str, diag: str) -> str | None:
     n = len(old_lines)
     if not blob_lines or n > len(blob_lines) or n > 60:
         return None
+    noisy = [0]
+    for line in blob_lines:
+        bad = BLOB_BOUNDARY in line or any(marker in line for marker in _BLOB_NOISE)
+        noisy.append(noisy[-1] + bad)
     sm = difflib.SequenceMatcher(None, autojunk=False)
     sm.set_seq2(old)
     best, best_r = None, 0.0
     for s in range(len(blob_lines) - n + 1):
+        if noisy[s + n] - noisy[s]:
+            continue
         w = "\n".join(blob_lines[s: s + n])
         sm.set_seq1(w)
         if sm.real_quick_ratio() <= best_r or sm.quick_ratio() <= best_r:
@@ -221,7 +236,7 @@ def _failed_edits(turns: list[dict]):
                 if "cat -n" in obs or "\t" in obs:
                     blob_parts.append(GUTTER.sub("", obs))
             continue
-        yield turn, hit, "\n".join(blob_parts)[-40000:]
+        yield turn, hit, ("\n" + BLOB_BOUNDARY + "\n").join(blob_parts)[-40000:]
 
 
 def _correct_one(turn: dict, hit: str, blob: str, min_sim: float):
