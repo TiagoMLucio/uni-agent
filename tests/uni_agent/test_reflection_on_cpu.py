@@ -878,3 +878,23 @@ def test_hint_failures_is_validated():
         ToolFixReflectionConfig(name="tool_fix", hint_failures="everywhere")
     with pytest.raises(ValueError, match="max_hints"):
         ToolFixReflectionConfig(name="tool_fix", max_hints=0)
+
+
+def test_obs_region_reads_the_escaped_json_form():
+    from uni_agent.reflection.tool_fix import _obs_region
+    obs = ("No replacement was performed, old_str did not appear verbatim in /f.py.\n"
+           "Closest match: lines 1-2 match exactly except your old_str has trailing whitespace "
+           "the file does not have.\n"
+           "The matching region of the file is exactly this JSON value:\n"
+           '"old_str": "    x = (0,)\\n    return x"\n'
+           "Resend the call with this as your old_str, copied character for character.")
+    assert _obs_region(obs) == "    x = (0,)\n    return x"
+
+
+def test_obs_region_still_reads_the_older_raw_form():
+    from uni_agent.reflection.tool_fix import _obs_region
+    obs = ("No replacement was performed.\n"
+           "The matching region of the file reads exactly:\n"
+           "    x = (0,)\n    return x\n"
+           "Resend the call with this, copied character for character, as your old_str.")
+    assert _obs_region(obs) == "    x = (0,)\n    return x"
