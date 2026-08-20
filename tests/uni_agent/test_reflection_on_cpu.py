@@ -751,3 +751,65 @@ def test_trailing_correction_that_collapses_ships_no_hint():
     diag = ("Closest match: lines 1-2 match exactly except your old_str has trailing whitespace "
             "the file does not have.")
     assert corrected_call([_fix_turn(0, old, new, diag)], 0.8) is None
+
+
+def _fix_retry_turn(step, old, new, diag=None):
+    """A later edit on the same file; `diag=None` makes it succeed."""
+    obs = "No replacement was performed, " + diag if diag else "The file /f.py has been edited."
+    return {"step": step, "tokens": 5, "response": "trying again:\n" + _fix_call(old, new),
+            "tools": [{"name": "str_replace_editor",
+                       "action": "str_replace_editor str_replace --path /f.py", "observation": obs}]}
+
+
+INDENT_DIAG = ("Closest match: lines 1-1 match exactly except every line of your old_str has "
+               "4 extra leading space(s).")
+
+
+def test_hint_at_retry_targets_the_retry_that_failed_again():
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
+             _fix_retry_turn(1, "    a()", "    b()", INDENT_DIAG)]
+    assert list(_fix(turns, hint_at="call")) == [0]
+    assert list(_fix(turns, hint_at="retry")) == [1], "recovery is taught at the retry turn"
+    assert sorted(_fix(turns, hint_at="both")) == [0, 1]
+
+
+def test_hint_at_retry_skips_a_retry_that_succeeded():
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
+             _fix_retry_turn(1, "a()", "b()")]
+    assert _fix(turns, hint_at="retry") == {}, "a recovered model needs no correction"
+    assert list(_fix(turns, hint_at="both")) == [0], "the failed call is still taught"
+
+
+def test_hint_at_retry_skips_when_the_model_moved_to_another_file():
+    other = {"step": 1, "tokens": 5,
+             "response": 'trying:\n<tool_call>\n{"name": "str_replace_editor", "arguments": '
+                         '{"command": "str_replace", "path": "/other.py", "old_str": "q", '
+                         '"new_str": "r"}}\n</tool_call>',
+             "tools": [{"name": "str_replace_editor",
+                        "action": "str_replace_editor str_replace --path /other.py",
+                        "observation": "No replacement was performed, " + INDENT_DIAG}]}
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG), other]
+    assert _fix(turns, hint_at="retry") == {}
+
+
+def test_hint_at_retry_reaches_past_a_view_turn():
+    view = {"step": 1, "tokens": 5, "response": "let me look",
+            "tools": [{"name": "str_replace_editor", "action": "str_replace_editor view --path /f.py",
+                       "observation": "Here's the result of running `cat -n` on /f.py:\n     1\ta()\n"}]}
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG), view,
+             _fix_retry_turn(2, "    a()", "    b()", INDENT_DIAG)]
+    assert list(_fix(turns, hint_at="retry")) == [2]
+
+
+def test_hint_at_retry_ships_the_same_corrected_call_and_target():
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
+             _fix_retry_turn(1, "    a()", "    b()", INDENT_DIAG)]
+    hints = _fix(turns, hint_at="both", target_mask=True)
+    assert hints[0]["text"] == hints[1]["text"] and hints[0]["at"] == hints[1]["at"] == "call"
+    assert hints[0]["target"] == hints[1]["target"]
+    assert hints[0] is not hints[1], "each step carries its own hint dict"
+
+
+def test_hint_at_validation():
+    with pytest.raises(ValueError, match="hint_at"):
+        ToolFixReflectionConfig(name="tool_fix", hint_at="somewhere")
