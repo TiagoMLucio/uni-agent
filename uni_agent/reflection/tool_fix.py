@@ -196,6 +196,11 @@ def corrected_call(turns: list[dict], min_sim: float) -> tuple[int, str, str] | 
                 fixed = _window(old, "\n".join(blob_parts)[-40000:], diag)
         if fixed is None or fixed == old:
             return None
+        # a correction that collapses old_str into new_str teaches a call the editor rejects
+        # outright ("old_str is the same as new_str"): the mechanical transforms hit this
+        # whenever the edit's only intended change WAS the whitespace or the escaping
+        if fixed == (fixed_new if fixed_new else new):
+            return None
         fo = json.dumps(old)[1:-1]
         if fo not in raw:
             return None

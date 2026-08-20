@@ -731,3 +731,23 @@ def test_tool_fix_template_validation_accepts_either_placeholder():
     ToolFixReflectionConfig(name="tool_fix", hint_template="x {corrected_old_wire}")
     with pytest.raises(ValueError):
         ToolFixReflectionConfig(name="tool_fix", hint_template="no placeholder")
+
+
+def test_correction_that_collapses_old_into_new_ships_no_hint():
+    """The escape/whitespace transforms hit both strings, so an edit whose only intended
+    change WAS the escaping corrects into old_str == new_str: a call the editor rejects."""
+    old, new = "x = 1\\ny = 2", "x = 1\ny = 2"
+    diag = ("Closest match: lines 1-2 match exactly except your old_str contains the 2-character "
+            "sequence `\\n` (1x) where the file has a real line break -- the escaping collapsed "
+            "your newlines.")
+    assert corrected_call([_fix_turn(0, old, new, diag)], 0.8) is None
+    # the same edit with a real change still gets its hint
+    step, _, call = corrected_call([_fix_turn(0, old, "x = 1\nY = 2", diag)], 0.8)
+    assert step == 0 and json.dumps("x = 1\ny = 2")[1:-1] in call
+
+
+def test_trailing_correction_that_collapses_ships_no_hint():
+    old, new = "a \nb", "a\nb"
+    diag = ("Closest match: lines 1-2 match exactly except your old_str has trailing whitespace "
+            "the file does not have.")
+    assert corrected_call([_fix_turn(0, old, new, diag)], 0.8) is None
