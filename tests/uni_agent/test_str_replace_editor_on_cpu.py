@@ -328,3 +328,20 @@ def test_no_op_edit_asks_for_the_intended_change(tmp_path):
     out = run_edit(f, "    x = 1", "    x = 1")
     assert "byte-identical" in out and "leave the file unchanged" in out
     assert "State the change you intend" in out, "the message must instruct, not just report"
+
+
+def test_create_on_existing_file_does_not_overwrite(tmp_path):
+    """The refusal used to fall through to the write: the model was told 'Cannot overwrite'
+    and the file was replaced anyway."""
+    f = write(tmp_path, "def critical():\n    return 'ORIGINAL'\n")
+    before = f.read_text()
+    out = run_create(f, "print('CLOBBERED')\n")
+    assert "Cannot overwrite" in out
+    assert "created successfully" not in out, "a refused create must not also report success"
+    assert f.read_text() == before, "the file must be untouched"
+
+
+def test_view_of_a_missing_path_stops(tmp_path):
+    out = run_edit(tmp_path / "nope.py", "x")
+    assert "does not exist" in out
+    assert "No replacement was performed" not in out, "the refusal must stop the command body"

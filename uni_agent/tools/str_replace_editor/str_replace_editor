@@ -500,12 +500,23 @@ class EditTool:
             )
 
     def validate_path(self, command: str, path: Path):
+        """Reject the call and stop. These printed refusals used to fall through to the
+        command body, so `create` on an existing file told the model "Cannot overwrite"
+        and then overwrote it -- the observation said the edit was rejected while the file
+        was silently replaced."""
         if not path.exists() and command != "create":
             safe_print(f"The path `{path}` does not exist. Please provide a valid path.")
+            sys.exit()
         if path.exists() and command == "create":
-            safe_print(f"File already exists at: `{path}`. Cannot overwrite files using command `create`.")
+            safe_print(
+                f"File already exists at: `{path}`. Cannot overwrite files using command "
+                f"`create`. Nothing was written. Use str_replace to change part of it, or "
+                f"delete it first if you meant to replace the whole file."
+            )
+            sys.exit()
         if path.is_dir() and command != "view":
             safe_print(f"The path `{path}` is a directory and only the `view` command can be used on directories")
+            sys.exit()
 
     def read_file(self, path: Path):
         encodings = [
