@@ -95,6 +95,31 @@ def _describe_old_str(old_str: str) -> str:
     return f"old_str ({len(lines)} lines, {len(old_str)} chars, starting `{first}`)"
 
 
+OCCURRENCE_CONTEXT_LINES = 2
+MAX_OCCURRENCES_SHOWN = 4
+
+
+def _occurrence_context(file_content: str, occurrences: list, old_str: str) -> str:
+    """Each match with its neighbouring lines, so the model can pick one and extend.
+
+    "Make it unique" is an underspecified instruction: the tool knows where the matches
+    are and what distinguishes them, the model does not. Showing the surroundings turns
+    the retry into a selection rather than a guess.
+    """
+    lines = file_content.split("\n")
+    span = len(old_str.split("\n"))
+    out = []
+    for line_no, _text, _pos in occurrences[:MAX_OCCURRENCES_SHOWN]:
+        lo = max(1, line_no - OCCURRENCE_CONTEXT_LINES)
+        hi = min(len(lines), line_no + span - 1 + OCCURRENCE_CONTEXT_LINES)
+        body = "\n".join(f"{n:>6}\t{lines[n - 1]}" for n in range(lo, hi + 1))
+        out.append(f"  occurrence at line {line_no}:\n{body}")
+    more = len(occurrences) - MAX_OCCURRENCES_SHOWN
+    if more > 0:
+        out.append(f"  ... and {more} more occurrence(s)")
+    return "\n".join(out)
+
+
 def _unique_match_line(needle: str, haystack: str) -> Optional[int]:
     """1-based start line of the only occurrence of needle, else None."""
     idx = haystack.find(needle)
@@ -674,10 +699,14 @@ class EditTool:
         if len(occurrences) > 1:
             line_numbers = sorted({line for line, _, _ in occurrences})
             if EXPLAIN_EDIT_FAILURES:
-                safe_print(
+                message = (
                     f"No replacement was performed. Multiple occurrences of {_describe_old_str(old_str)} "
-                    f"in lines {line_numbers}. Please include enough surrounding context to make it unique."
+                    f"in lines {line_numbers}.\nEach match with its surrounding lines:\n"
+                    + _occurrence_context(file_content, occurrences, old_str)
+                    + "\nPick the one you mean and extend your old_str with the neighbouring lines "
+                      "shown above until it matches only there."
                 )
+                safe_print(message)
             else:
                 safe_print(
                     f"No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {line_numbers}. Please ensure it is unique."
@@ -686,7 +715,15 @@ class EditTool:
 
         if new_str == old_str:
             if EXPLAIN_EDIT_FAILURES:
-                safe_print("No replacement was performed, old_str is the same as new_str (nothing would change).")
+                # this branch is reached only when the two strings are byte-identical.
+                # It was the one message that stated a fact without an instruction, and the
+                # model answered it with another blind str_replace 37.5% of the time.
+                safe_print(
+                    "No replacement was performed: your old_str and new_str are byte-identical, "
+                    "so this edit would leave the file unchanged.\nState the change you intend to "
+                    "make to this code, then write new_str as old_str with exactly that change "
+                    "applied."
+                )
             else:
                 safe_print(f"No replacement was performed, old_str `{old_str}` is the same as new_str `{new_str}`.")
             sys.exit()

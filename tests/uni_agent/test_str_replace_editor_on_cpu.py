@@ -70,7 +70,7 @@ def test_multiple_occurrences_error_with_lines(tmp_path):
 def test_same_string_guard(tmp_path):
     f = write(tmp_path, "a = 1\n")
     out = run_edit(f, "a = 1", "a = 1")
-    assert "is the same as new_str" in out
+    assert "byte-identical" in out and "leave the file unchanged" in out
     assert f.read_text() == "a = 1\n"
 
 
@@ -204,7 +204,8 @@ def test_multiple_occurrences_without_echo(tmp_path):
     out = run_edit(f, "x = 0")
     assert "Multiple occurrences" in out
     assert "[1, 3]" in out
-    assert "surrounding context" in out
+    assert "extend your old_str with the neighbouring lines" in out
+    assert "occurrence at line 1:" in out and "occurrence at line 3:" in out
 
 
 def test_probe_never_claims_ambiguous_match(tmp_path):
@@ -307,3 +308,23 @@ def test_did_you_mean_skips_a_weak_window(tmp_path):
     f = write(tmp_path, "alpha\nbeta\ngamma\ndelta\n" * 3)
     out = run_edit_dym(f, "alpha\nBETA9\nGAMMA9\nDELTA9")
     assert "matching region" not in out
+
+
+def test_multiple_occurrences_shows_each_match_in_context(tmp_path):
+    """'Make it unique' is underspecified: the tool knows where the matches are, so it
+    shows them and the retry becomes a choice."""
+    body = ("class A:\n    def run(self):\n        pass\n\n"
+            "class B:\n    def run(self):\n        pass\n")
+    f = write(tmp_path, body)
+    out = run_edit(f, "    def run(self):\n        pass", "    def run(self):\n        return 1")
+    assert "Multiple occurrences" in out
+    assert "occurrence at line 2:" in out and "occurrence at line 6:" in out
+    assert "class A:" in out and "class B:" in out, "the disambiguating context must be shown"
+    assert "extend your old_str with the neighbouring lines" in out
+
+
+def test_no_op_edit_asks_for_the_intended_change(tmp_path):
+    f = write(tmp_path, "def g():\n    x = 1\n    return x\n")
+    out = run_edit(f, "    x = 1", "    x = 1")
+    assert "byte-identical" in out and "leave the file unchanged" in out
+    assert "State the change you intend" in out, "the message must instruct, not just report"
