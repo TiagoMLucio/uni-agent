@@ -345,3 +345,14 @@ def test_view_of_a_missing_path_stops(tmp_path):
     out = run_edit(tmp_path / "nope.py", "x")
     assert "does not exist" in out
     assert "No replacement was performed" not in out, "the refusal must stop the command body"
+
+
+def test_did_you_mean_region_spans_the_restored_lines_not_the_collapsed_count(tmp_path):
+    """An escape-class old_str holds literal 2-char `\\n` sequences, so its own line count
+    is collapsed; the matched region's extent must come from the restored candidate or the
+    suggestion truncates to a fraction of the true region."""
+    body = "def f():\n    a()\n    b()\n    c()\n    d()\n"
+    f = write(tmp_path, body)
+    out = run_edit_dym(f, "def f():\\n    a()\\n    b()\\n    c()\\n    d()")
+    assert "collapsed your newlines" in out
+    assert '"old_str": "def f():\\n    a()\\n    b()\\n    c()\\n    d()"' in out
