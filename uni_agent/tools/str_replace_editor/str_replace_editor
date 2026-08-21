@@ -179,7 +179,10 @@ def _probe_transforms(old_str: str, file_content: str) -> Optional[Tuple[int, in
     for candidate, description in probes:
         start = _unique_match_line(candidate, file_content)
         if start is not None:
-            return start, start + len(lines) - 1, description
+            # the matched region's extent comes from the CANDIDATE: an escape probe
+            # restores real newlines, so the student's collapsed line count would
+            # truncate the region (and the did-you-mean suggestion built from it)
+            return start, start + candidate.count("\n"), description
     return None
 
 
