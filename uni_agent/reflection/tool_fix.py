@@ -129,7 +129,8 @@ def _obs_region(obs: str) -> str | None:
     dumps and sandboxes from before that change keep working.
     """
     if OBS_REGION_WIRE_MARK in obs:
-        tail = obs.split(OBS_REGION_WIRE_MARK, 1)[1].split("\nResend the call", 1)[0]
+        tail = obs.split(OBS_REGION_WIRE_MARK, 1)[1]
+        tail = re.split(r"\n(?:Resend the call|If this is the region)", tail, maxsplit=1)[0]
         m = OBS_WIRE_RE.search(tail)
         if not m:
             return None
@@ -140,7 +141,7 @@ def _obs_region(obs: str) -> str | None:
     if OBS_REGION_MARK not in obs:
         return None
     region = obs.split(OBS_REGION_MARK, 1)[1]
-    region = region.split("\nResend the call", 1)[0]
+    region = re.split(r"\n(?:Resend the call|If this is the region)", region, maxsplit=1)[0]
     return region.strip("\n") or None
 
 
