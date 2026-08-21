@@ -279,7 +279,9 @@ def _did_you_mean(file_content: str, start: int, end: int) -> str:
         return ""
     return ("\nThe matching region of the file is exactly this JSON value:\n"
             + '"old_str": ' + json.dumps(region)
-            + "\nResend the call with this as your old_str, copied character for character.")
+            + "\nIf this is the region you meant to change, resend the call with this as "
+              "your old_str, copied character for character; if it is not, view the file "
+              "and locate the right region before editing.")
 
 
 def _anchor_positions(file_lines: List[str], line: str) -> List[int]:
@@ -875,9 +877,11 @@ class EditTool:
                 # model answered it with another blind str_replace 37.5% of the time.
                 safe_print(
                     "No replacement was performed: your old_str and new_str are byte-identical, "
-                    "so this edit would leave the file unchanged.\nState the change you intend to "
-                    "make to this code, then write new_str as old_str with exactly that change "
-                    "applied."
+                    "so this edit would leave the file unchanged.\nOften this means the change "
+                    "you intend is ALREADY in the file: view or grep this region again and check "
+                    "before retrying. If the code does still need a modification, state the "
+                    "change you intend to make, then resend with new_str written as old_str "
+                    "with exactly that change applied."
                 )
             else:
                 safe_print(f"No replacement was performed, old_str `{old_str}` is the same as new_str `{new_str}`.")

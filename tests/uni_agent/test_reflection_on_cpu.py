@@ -933,3 +933,16 @@ def test_noop_calls_get_no_corrected_target():
     turns = [_fix_turn(0, old, old, "Closest match: lines 1-2 match exactly except your "
                                     "old_str has trailing whitespace the file does not have.")]
     assert _fix(turns) == {}
+
+
+def test_obs_region_reads_the_conditional_resend_wording():
+    """The suggestion line became conditional ("If this is the region you meant to
+    change, resend..."); the region parser must strip it like the old imperative."""
+    from uni_agent.reflection.tool_fix import _obs_region
+    obs = ("No replacement was performed, old_str did not appear verbatim in /f.py.\n"
+           "The matching region of the file is exactly this JSON value:\n"
+           '"old_str": "    x = 1\\n    return x"\n'
+           "If this is the region you meant to change, resend the call with this as "
+           "your old_str, copied character for character; if it is not, view the file "
+           "and locate the right region before editing.")
+    assert _obs_region(obs) == "    x = 1\n    return x"

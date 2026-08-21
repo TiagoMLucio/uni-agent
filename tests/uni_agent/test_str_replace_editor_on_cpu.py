@@ -327,7 +327,7 @@ def test_no_op_edit_asks_for_the_intended_change(tmp_path):
     f = write(tmp_path, "def g():\n    x = 1\n    return x\n")
     out = run_edit(f, "    x = 1", "    x = 1")
     assert "byte-identical" in out and "leave the file unchanged" in out
-    assert "State the change you intend" in out, "the message must instruct, not just report"
+    assert "state the change you intend" in out.lower(), "the message must instruct, not just report"
 
 
 def test_create_on_existing_file_does_not_overwrite(tmp_path):
@@ -392,3 +392,16 @@ def test_multiple_occurrences_elide_the_matched_middle(tmp_path):
     assert "Multiple occurrences" in out
     assert "elided" in out, "long matched body must be elided"
     assert out.count("occurrence at line") == 2
+
+
+def test_noop_message_says_the_change_may_already_be_there(tmp_path):
+    f = write(tmp_path, "def g():\n    return 2\n")
+    out = run_edit(f, "def g():\n    return 2", "def g():\n    return 2")
+    assert "ALREADY in the file" in out and "view or grep" in out
+
+
+def test_did_you_mean_resend_is_conditional(tmp_path):
+    f = write(tmp_path, "def g():\n    a()\n    b()\n")
+    out = run_edit_dym(f, "        a()\n        b()")
+    assert "If this is the region you meant to change" in out
+    assert "view the file and locate the right region" in out
