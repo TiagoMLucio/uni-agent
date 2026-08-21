@@ -95,8 +95,9 @@ def _describe_old_str(old_str: str) -> str:
     return f"old_str ({len(lines)} lines, {len(old_str)} chars, starting `{first}`)"
 
 
-OCCURRENCE_CONTEXT_LINES = 2
+OCCURRENCE_CONTEXT_LINES = 3
 MAX_OCCURRENCES_SHOWN = 4
+OCCURRENCE_EDGE_LINES = 3
 
 
 def _occurrence_context(file_content: str, occurrences: list, old_str: str) -> str:
@@ -112,7 +113,20 @@ def _occurrence_context(file_content: str, occurrences: list, old_str: str) -> s
     for line_no, _text, _pos in occurrences[:MAX_OCCURRENCES_SHOWN]:
         lo = max(1, line_no - OCCURRENCE_CONTEXT_LINES)
         hi = min(len(lines), line_no + span - 1 + OCCURRENCE_CONTEXT_LINES)
-        body = "\n".join(f"{n:>6}\t{lines[n - 1]}" for n in range(lo, hi + 1))
+        rows = list(range(lo, hi + 1))
+        # a long occurrence body says nothing the model does not already know: what
+        # disambiguates is the surroundings, so elide the middle of the match itself
+        if span > 2 * OCCURRENCE_EDGE_LINES + 1:
+            head_end = line_no + OCCURRENCE_EDGE_LINES - 1
+            tail_start = line_no + span - OCCURRENCE_EDGE_LINES
+            rows = [n for n in rows if n <= head_end or n >= tail_start]
+            body = "\n".join(
+                f"{n:>6}\t{lines[n - 1]}"
+                + ("\n     ...\t({} matched line(s) elided)".format(tail_start - head_end - 1)
+                   if n == head_end else "")
+                for n in rows)
+        else:
+            body = "\n".join(f"{n:>6}\t{lines[n - 1]}" for n in rows)
         out.append(f"  occurrence at line {line_no}:\n{body}")
     more = len(occurrences) - MAX_OCCURRENCES_SHOWN
     if more > 0:
@@ -268,6 +282,117 @@ def _did_you_mean(file_content: str, start: int, end: int) -> str:
             + "\nResend the call with this as your old_str, copied character for character.")
 
 
+def _anchor_positions(file_lines: List[str], line: str) -> List[int]:
+    if not line.strip():
+        return []
+    exact = [k for k, fl in enumerate(file_lines) if fl == line]
+    return exact or [k for k, fl in enumerate(file_lines) if fl.strip() == line.strip()]
+
+
+def _aligned_window_end(file_lines: List[str], i: int, old: List[str], slack: int) -> int:
+    import difflib
+
+    seg = [fl.strip() for fl in file_lines[i: i + len(old) + slack]]
+    sm = difflib.SequenceMatcher(None, seg, [ol.strip() for ol in old], autojunk=False)
+    end, tail = min(len(old), len(seg)) - 1, 0
+    for a, b, size in sm.get_matching_blocks():
+        if size:
+            end, tail = a + size - 1, len(old) - (b + size)
+    return min(i + end + tail, len(file_lines) - 1)
+
+
+def _aligned_window_start(file_lines: List[str], j: int, old: List[str], slack: int) -> int:
+    import difflib
+
+    lo = max(0, j - len(old) - slack + 1)
+    seg = [fl.strip() for fl in file_lines[lo: j + 1]]
+    sm = difflib.SequenceMatcher(None, seg, [ol.strip() for ol in old], autojunk=False)
+    blocks = [(a, b, size) for a, b, size in sm.get_matching_blocks() if size]
+    if not blocks:
+        return max(0, j - len(old) + 1)
+    a, b, _size = blocks[0]
+    return max(0, lo + a - b)
+
+
+def _preserved_chars(old_str: str, region: str) -> int:
+    import difflib
+
+    sm = difflib.SequenceMatcher(None, old_str, region, autojunk=False)
+    return sum(b.size for b in sm.get_matching_blocks())
+
+
+def _anchored_window(old_str: str, file_content: str, slack: int = 40, min_ratio: float = 0.5,
+                     guard_region: Optional[str] = None):
+    """Variable-length window pinned to the model's own first/last lines.
+
+    The same-length selector shifts the whole window whenever the model's old_str skipped
+    an inner block (a docstring, a sibling method), and then reports the model's real
+    anchor lines as wrong text. Sticking to the model-chosen boundaries turns a skipped
+    block into an INSERT correction instead. Returns (start_line, end_line, ratio,
+    stripped-line opcodes) 1-based inclusive, or None when neither boundary anchors or a
+    guard region preserves more of the model's characters (coincidental anchors).
+    """
+    import difflib
+
+    old = old_str.split("\n")
+    fl = file_content.split("\n")
+    n = len(old)
+    firsts, lasts = _anchor_positions(fl, old[0]), _anchor_positions(fl, old[-1])
+    cands = set()
+    for i in firsts:
+        paired = False
+        for j in lasts:
+            if i <= j < i + n + slack:
+                cands.add((i, j, True))
+                paired = True
+        if not paired:
+            cands.add((i, _aligned_window_end(fl, i, old, slack), False))
+    if not firsts:
+        for j in lasts:
+            cands.add((_aligned_window_start(fl, j, old, slack), j, False))
+    best = None
+    for i, j, paired in cands:
+        r = difflib.SequenceMatcher(None, "\n".join(fl[i: j + 1]), old_str, autojunk=False).ratio()
+        key = r - 0.002 * abs(j - i + 1 - n)
+        if best is None or key > best[0]:
+            best = (key, i, j, r, paired)
+    if best is None or best[3] < min_ratio:
+        return None
+    _key, i, j, r, paired = best
+    if guard_region is not None and _preserved_chars(old_str, guard_region) > _preserved_chars(
+        old_str, "\n".join(fl[i: j + 1])
+    ):
+        return None
+    import difflib as _d
+
+    sm = _d.SequenceMatcher(None, [fl2.strip() for fl2 in fl[i: j + 1]],
+                            [ol.strip() for ol in old], autojunk=False)
+    ops = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    return i + 1, j + 1, r, ops, paired
+
+
+def _anchored_diff_lines(start: int, ops, file_lines: List[str], old: List[str]) -> List[str]:
+    """The anchored window's differences, spoken in the model's terms: replaced lines like
+    the same-length diagnosis, skipped file blocks and invented old_str lines by name."""
+    shown = []
+    for tag, a1, a2, b1, b2 in ops[:EXPLAIN_MAX_DIFF_LINES]:
+        if tag == "replace":
+            shown.append(f"  line {start + a1}: file has `{file_lines[start - 1 + a1].strip()[:70]}`, "
+                         f"your old_str has `{old[b1].strip()[:70]}`")
+        elif tag == "delete":
+            head = next((file_lines[start - 1 + k].strip() for k in range(a1, a2)
+                         if file_lines[start - 1 + k].strip()), "")
+            shown.append(f"  lines {start + a1}-{start + a2 - 1}: the file has "
+                         f"{a2 - a1} line(s) your old_str skips, starting `{head[:70]}`")
+        else:
+            head = next((old[k].strip() for k in range(b1, b2) if old[k].strip()), "")
+            shown.append(f"  near line {start + a1}: your old_str has {b2 - b1} line(s) "
+                         f"the file does not have, starting `{head[:70]}`")
+    if len(ops) > EXPLAIN_MAX_DIFF_LINES:
+        shown.append(f"  ... and {len(ops) - EXPLAIN_MAX_DIFF_LINES} more difference(s)")
+    return shown
+
+
 def explain_edit_failure(old_str: str, file_content: str) -> str:
     """One compact paragraph saying where old_str nearly matches and how it differs."""
     if len(file_content) > EXPLAIN_MAX_FILE_BYTES or len(old_str.split("\n")) > EXPLAIN_MAX_OLD_LINES:
@@ -279,6 +404,22 @@ def explain_edit_failure(old_str: str, file_content: str) -> str:
             return (f"Closest match: lines {start}-{end} match exactly except {description}."
                     + _did_you_mean(file_content, start, end))
     window = _closest_window(old_str, file_content)
+    file_lines = file_content.split("\n")
+    guard = None
+    if window is not None:
+        w_start = window[0]
+        guard = "\n".join(file_lines[w_start - 1: w_start - 1 + len(old_str.split("\n"))])
+    anchored = _anchored_window(old_str, file_content, guard_region=guard)
+    if anchored is not None:
+        a_start, a_end, a_ratio, ops, paired = anchored
+        shown = _anchored_diff_lines(a_start, ops, file_lines, old_str.split("\n"))
+        lines = "\n".join(shown) if shown else "  (differences are within lines' whitespace)"
+        # a both-edge-anchored window is trustworthy below the raw-ratio gate: skipped
+        # inner lines lengthen the window and depress the ratio without adding doubt
+        confident = a_ratio >= DID_YOU_MEAN_MIN_RATIO or (paired and a_ratio >= 0.6)
+        suggestion = _did_you_mean(file_content, a_start, a_end) if confident else ""
+        return (f"Closest match: lines {a_start}-{a_end} ({a_ratio:.0%} similar). "
+                f"Differing lines:\n{lines}{suggestion}")
     if window is None:
         return (
             "No similar region found. View the file or `grep -n` a distinctive line "

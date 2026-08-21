@@ -255,6 +255,12 @@ def _correct_one(turn: dict, hit: str, blob: str, min_sim: float):
     if sim < min_sim:
         return "", "", raw
     old, new = str(args.get("old_str", "")), str(args.get("new_str", ""))
+    # a call whose old_str equals its new_str carries no recoverable intent: the defect is
+    # in new_str, which no mechanical correction can supply. Reviewed live, every derived
+    # target for these was wrong (no-ops, deleted real lines, shifted windows); the no-op
+    # observation is the only sound teacher for them
+    if old == new:
+        return _classify(diag), "", raw
     cls = _classify(diag)
     # the editor-printed region (did-you-mean environments) is file-verified at failure
     # time: prefer it for every class, then the mechanical transforms, then the blob

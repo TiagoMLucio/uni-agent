@@ -924,3 +924,12 @@ def test_window_cannot_span_two_view_observations():
     got = _window("alpha_two()\nbeta_one()", blob, diag)
     assert got is None or (BLOB_BOUNDARY not in got and not
                            ("alpha_two()" in got and "beta_one()" in got))
+
+
+def test_noop_calls_get_no_corrected_target():
+    """old_str == new_str: the defect is in new_str and no mechanical correction can know
+    the intended change; every live-derived target for these was wrong."""
+    old = "a \nb"
+    turns = [_fix_turn(0, old, old, "Closest match: lines 1-2 match exactly except your "
+                                    "old_str has trailing whitespace the file does not have.")]
+    assert _fix(turns) == {}

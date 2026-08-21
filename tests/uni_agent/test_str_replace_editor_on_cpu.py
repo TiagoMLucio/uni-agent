@@ -356,3 +356,39 @@ def test_did_you_mean_region_spans_the_restored_lines_not_the_collapsed_count(tm
     out = run_edit_dym(f, "def f():\\n    a()\\n    b()\\n    c()\\n    d()")
     assert "collapsed your newlines" in out
     assert '"old_str": "def f():\\n    a()\\n    b()\\n    c()\\n    d()"' in out
+
+
+DC_FILE = ("    def _end_dc_subject(self):\n        self._end_category()\n\n"
+           "    def _end_dc_title(self):\n        pass\n\n"
+           "    def _end_dcterms_created(self):\n        self._end_created()\n\n"
+           "    def _end_dcterms_issued(self):\n        self._end_last_updated()\n\n"
+           "    def _end_dcterms_modified(self):\n        self._end_updated()\n")
+
+
+def test_anchored_window_reports_a_skipped_block_as_an_insert(tmp_path):
+    """The model's old_str spliced two real regions, skipping the method between them.
+    The same-length selector shifted the window and called the model's real anchor wrong;
+    the anchored selector keeps both model edges and names the skipped block."""
+    f = write(tmp_path, DC_FILE)
+    out = run_edit_dym(f, "    def _end_dc_title(self):\n        pass\n\n"
+                          "    def _end_dcterms_issued(self):\n        self._end_last_updated()")
+    assert "your old_str skips" in out and "_end_dcterms_created" in out
+    assert "your old_str has `    def _end_dc_title" not in out, "model's anchor called wrong"
+    region = out.split("matching region", 1)[1]
+    assert "_end_dcterms_created" in region, "suggestion must contain the missing block"
+
+
+def test_anchored_window_falls_back_when_no_edge_anchors(tmp_path):
+    f = write(tmp_path, "alpha\nbeta\ngamma\ndelta\n")
+    out = run_edit_dym(f, "alphX\nbetY\ngammZ")
+    assert "Closest match" in out or "No similar region" in out
+
+
+def test_multiple_occurrences_elide_the_matched_middle(tmp_path):
+    body = "def run(self):\n" + "".join(f"    line{i}()\n" for i in range(10))
+    f = write(tmp_path, "class A:\n" + indent(body, 4) + "\nclass B:\n" + indent(body, 4))
+    old = indent(body, 4).rstrip("\n")
+    out = run_edit(f, old, "new")
+    assert "Multiple occurrences" in out
+    assert "elided" in out, "long matched body must be elided"
+    assert out.count("occurrence at line") == 2
