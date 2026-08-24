@@ -808,6 +808,21 @@ class EditTool:
         old_str = old_str.strip("\n\r")
         new_str = new_str.strip("\n\r")
 
+        # an empty old_str matches at every position; without this guard the multiple-
+        # occurrence diagnosis enumerates the whole file
+        if not old_str.strip():
+            if EXPLAIN_EDIT_FAILURES:
+                safe_print(
+                    "No replacement was performed: your old_str is empty or only whitespace, "
+                    "which would match everywhere in the file.\nstr_replace replaces exact "
+                    "existing text. To insert new code, put the line(s) next to the insertion "
+                    "point in old_str and write new_str as those lines with your addition "
+                    "applied. To write a whole new file, use the create command."
+                )
+            else:
+                safe_print("No replacement was performed, old_str is empty.")
+            sys.exit()
+
         file_content = self.read_file(path)
 
         pattern = re.escape(old_str)

@@ -52,6 +52,17 @@ def test_outer_strip_fallback(tmp_path):
     assert f.read_text() == "a = 1\nb = 20\nc = 3\n"
 
 
+def test_empty_old_str_gets_its_own_message(tmp_path):
+    """An empty (or whitespace-only) old_str matches everywhere; it must get the insertion
+    guidance, never the multiple-occurrence enumeration of the whole file."""
+    f = write(tmp_path, "a = 1\nb = 2\nc = 3\n")
+    for old in ("", "\n", "   "):
+        out = run_edit(f, old, "x = 0")
+        assert "old_str is empty" in out
+        assert "Multiple occurrences" not in out
+    assert f.read_text() == "a = 1\nb = 2\nc = 3\n", "file untouched"
+
+
 def test_no_match_error(tmp_path):
     f = write(tmp_path, "a = 1\n")
     out = run_edit(f, "z = 9")
