@@ -28,6 +28,10 @@ class AgentChatModel:
     max_completion_tokens: int | None = None
     """Per-turn completion cap; None leaves the window as the only bound."""
 
+    chat_template_kwargs: dict[str, Any] | None = None
+    """Extra apply_chat_template kwargs (e.g. {"enable_thinking": False}); must match
+    what the trainer uses to derive template fragments."""
+
     tools_schemas: list[dict] = None
 
     def __init__(self, **data):
@@ -51,6 +55,7 @@ class AgentChatModel:
                 add_generation_prompt=True,
                 tokenize=True,
                 tools=tools,
+                **(self.chat_template_kwargs or {}),
             ),
         )
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -195,6 +200,7 @@ class AgentChatModel:
                 new_messages,
                 add_generation_prompt=True,
                 tokenize=True,
+                **(self.chat_template_kwargs or {}),
             ),
         )
         return self.message_boundary_tokens + normalize_token_ids(tokenized_prompt)
@@ -217,6 +223,7 @@ class AgentChatModel:
                     [dummy_next_message],
                     add_generation_prompt=True,
                     tokenize=True,
+                    **(self.chat_template_kwargs or {}),
                 )
             )
             with_boundary_ids = normalize_token_ids(
@@ -225,6 +232,7 @@ class AgentChatModel:
                     dummy_history + [dummy_next_message],
                     add_generation_prompt=True,
                     tokenize=True,
+                    **(self.chat_template_kwargs or {}),
                 )
             )
         except Exception:

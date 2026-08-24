@@ -580,6 +580,7 @@ class UniAgentLoop(AgentLoopBase):
             "max_model_len": max_model_len,
             "sampling_params": sampling_params,
             "max_completion_tokens": config_dict.get("max_completion_tokens"),
+            "chat_template_kwargs": config_dict.get("chat_template_kwargs"),
         }
 
         if not config_dict.get("reward"):
