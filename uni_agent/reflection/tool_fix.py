@@ -179,46 +179,6 @@ def retry_step(turns: list[dict], after_step: int, path: str | None) -> int | No
     return None
 
 
-def _indent_of(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _rebase_new(old: str, new: str, verified_old: str) -> str | None:
-    """Re-base the model's intended change (old -> new) onto the verified region.
-
-    Line-count-matching fast path only: each verified line corresponds to the same-index
-    old line, so intent opcodes transfer positionally and inserted/replaced lines are
-    re-indented by the local old->verified indent delta. Anything else returns None and
-    the caller keeps the model's new_str untouched.
-    """
-    import difflib
-
-    old_lines, ver_lines = old.split("\n"), verified_old.split("\n")
-    if len(old_lines) != len(ver_lines):
-        return None
-    deltas = [_indent_of(v) - _indent_of(o) if o.strip() and v.strip() else 0
-              for o, v in zip(old_lines, ver_lines, strict=True)]
-
-    def shift(line: str, d: int) -> str:
-        if not line.strip():
-            return line
-        if d >= 0:
-            return " " * d + line
-        return line[-d:] if line.startswith(" " * -d) else line
-
-    out: list[str] = []
-    sm = difflib.SequenceMatcher(None, old_lines, new.split("\n"), autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            out.extend(ver_lines[i1:i2])
-        elif tag == "delete":
-            continue
-        else:  # replace / insert: the model's own lines, re-indented to the verified offset
-            d = deltas[i1] if i1 < len(deltas) else (deltas[i1 - 1] if i1 else 0)
-            out.extend(shift(line, d) for line in new.split("\n")[j1:j2])
-    return "\n".join(out)
-
-
 def _failed_edits(turns: list[dict]):
     """``(turn, failure observation, view blob so far)`` for each turn whose first
     str_replace failed, with the file text viewed up to that point."""
@@ -266,12 +226,8 @@ def _correct_one(turn: dict, hit: str, blob: str, min_sim: float):
     # the editor-printed region (did-you-mean environments) is file-verified at failure
     # time: prefer it for every class, then the mechanical transforms, then the blob
     fixed = _obs_region(hit)
-    fixed_new = None
-    if fixed is not None:
-        fixed_new = _rebase_new(old, new, fixed)
-    else:
+    if fixed is None:
         fixed = _transform(cls, old, diag)
-        fixed_new = _transform(cls, new, diag) if fixed is not None else None
         if fixed is None and cls == "window":
             fixed = _window(old, blob, diag)
     if fixed is None or fixed == old:
@@ -279,16 +235,16 @@ def _correct_one(turn: dict, hit: str, blob: str, min_sim: float):
     # a correction that collapses old_str into new_str teaches a call the editor rejects
     # outright ("old_str is the same as new_str"): the mechanical transforms hit this
     # whenever the edit's only intended change WAS the whitespace or the escaping
-    if fixed == (fixed_new if fixed_new else new):
+    if fixed == new:
         return cls, "", raw
+    # only the old_str field is corrected: new_str stays the model's own intent, and the
+    # substitution is anchored to the field so a new_str repeating old_str is untouched
     fo = json.dumps(old)[1:-1]
-    if fo not in raw:
+    key = re.search(r'"old_str":\s*"', raw)
+    start = key.end() if key else -1
+    if start < 0 or not raw.startswith(fo + '"', start):
         return cls, "", raw
-    corrected = raw.replace(fo, json.dumps(fixed)[1:-1])
-    if fixed_new and fixed_new != new:
-        fn = json.dumps(new)[1:-1]
-        if fn in corrected:
-            corrected = corrected.replace(fn, json.dumps(fixed_new)[1:-1])
+    corrected = raw[:start] + json.dumps(fixed)[1:-1] + raw[start + len(fo):]
     return cls, corrected, raw
 
 

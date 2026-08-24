@@ -618,14 +618,14 @@ def _fix(turns, **cfg):
     return asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))
 
 
-def test_indent_correction_fixes_both_strings_and_marks_call_placement():
+def test_indent_correction_shifts_old_str_and_keeps_new_str():
     old, new = "    a()\n    b()", "    a()\n    c()"
     turns = [_fix_turn(2, old, new, "Closest match: lines 1-2 match exactly except every line "
                                     "of your old_str has 4 extra leading space(s).")]
     hints = _fix(turns)
     assert list(hints) == [2] and hints[2]["at"] == "call"
     assert json.dumps("a()\nb()")[1:-1] in hints[2]["text"], "old_str must be shifted"
-    assert json.dumps("a()\nc()")[1:-1] in hints[2]["text"], "new_str must be shifted too"
+    assert json.dumps(new)[1:-1] in hints[2]["text"], "new_str stays the model's own"
 
 
 def test_escape_correction_restores_real_newlines():
@@ -689,7 +689,7 @@ def test_tool_fix_ships_the_target_when_configured():
     assert "target" not in h2, "default ships no target (p1toolfix3 reproducible)"
 
 
-def test_tool_fix_prefers_the_editor_printed_region_and_rebases_new_str():
+def test_tool_fix_prefers_the_editor_printed_region_and_keeps_the_models_new_str():
     old = "        a()\n        b()"
     new = "        a()\n        c()"
     obs_tail = ("Closest match: lines 1-2 match exactly except every line of your old_str has "
@@ -699,18 +699,37 @@ def test_tool_fix_prefers_the_editor_printed_region_and_rebases_new_str():
     reflector = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix", target_mask=True))
     h = asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))[0]
     assert json.dumps("    a()\n    b()")[1:-1] in h["target"], "old_str from the printed region"
-    assert json.dumps("    a()\n    c()")[1:-1] in h["target"], "new_str rebased to the verified indent"
+    assert json.dumps(new)[1:-1] in h["target"], "new_str stays the model's own"
 
 
-def test_rebase_falls_back_when_line_counts_differ():
-    from uni_agent.reflection.tool_fix import _rebase_new
-    assert _rebase_new("a\nb", "a\nc", "x\ny\nz") is None
+def test_non_canonical_wire_ships_no_target():
+    """old_str escaped as \\u000a instead of \\n: the field splice cannot anchor on the
+    canonical wire, so no target ships (never a corrupted one)."""
+    raw = ('fixing:\n<tool_call>\n{"name": "str_replace_editor", "arguments": {"command": '
+           '"str_replace", "path": "/f.py", "old_str": "    a()\\u000a    b()", '
+           '"new_str": "n"}}\n</tool_call>')
+    turns = [{"step": 0, "tokens": 5, "response": raw,
+              "tools": [{"name": "str_replace_editor",
+                         "action": "str_replace_editor str_replace --path /f.py",
+                         "observation": "No replacement was performed, Closest match: lines 1-2 "
+                                        "match exactly except every line of your old_str has 4 "
+                                        "extra leading space(s)."}]}]
+    assert corrected_call(turns, 0.8) is None
 
 
-def test_rebase_transfers_an_insertion_with_reindent():
-    from uni_agent.reflection.tool_fix import _rebase_new
-    out = _rebase_new("    a()\n    b()", "    a()\n    mid()\n    b()", "  a()\n  b()")
-    assert out == "  a()\n  mid()\n  b()"
+def test_old_str_substitution_is_field_scoped():
+    """An insert-after edit repeats old_str as new_str's prefix; the correction must
+    replace only the old_str field and keep the model's new_str byte-exact."""
+    import re as _re
+
+    old = "    a()\n    b()"
+    new = old + "\n    c()"
+    turns = [_fix_turn(0, old, new, "Closest match: lines 1-2 match exactly except every line "
+                                    "of your old_str has 4 extra leading space(s).")]
+    _step, _cls, call = corrected_call(turns, 0.8)
+    m = _re.search(r'"old_str": ("(?:[^"\\]|\\.)*"), "new_str": ("(?:[^"\\]|\\.)*")', call)
+    assert json.loads(m.group(1)) == "a()\nb()", "old_str corrected"
+    assert json.loads(m.group(2)) == new, "new_str byte-exact, prefix not rewritten"
 
 
 def test_tool_fix_old_wire_hint_template():
