@@ -95,7 +95,7 @@ def _describe_old_str(old_str: str) -> str:
     return f"old_str ({len(lines)} lines, {len(old_str)} chars, starting `{first}`)"
 
 
-OCCURRENCE_CONTEXT_LINES = 3
+OCCURRENCE_CONTEXT_LINES = 5
 MAX_OCCURRENCES_SHOWN = 4
 OCCURRENCE_EDGE_LINES = 3
 
@@ -871,13 +871,48 @@ class EditTool:
         if len(occurrences) > 1:
             line_numbers = sorted({line for line, _, _ in occurrences})
             if EXPLAIN_EDIT_FAILURES:
-                message = (
+                head = (
                     f"No replacement was performed. Multiple occurrences of {_describe_old_str(old_str)} "
-                    f"in lines {line_numbers}.\nEach match with its surrounding lines:\n"
-                    + _occurrence_context(file_content, occurrences, old_str)
-                    + "\nPick the one you mean and extend your old_str with the neighbouring lines "
-                      "shown above until it matches only there."
+                    f"in lines {line_numbers}.\n"
                 )
+                all_lines = file_content.split("\n")
+                span = len(old_str.split("\n"))
+
+                def _ctx_text(line_no: int) -> str:
+                    # anchored fixed-height window (file edges padded), so two occurrences
+                    # compare equal only when their SURROUNDINGS repeat, never merely
+                    # because a small file puts them inside one shared window
+                    lo = line_no - OCCURRENCE_CONTEXT_LINES
+                    hi = line_no + span - 1 + OCCURRENCE_CONTEXT_LINES
+                    return "\n".join(
+                        all_lines[n - 1] if 1 <= n <= len(all_lines) else "\x00"
+                        for n in range(lo, hi + 1))
+
+                # a file full of consecutive repeats (typically pasted duplicates) makes
+                # every occurrence's surroundings identical: enumerating them is noise and
+                # "extend with nearby lines" cannot work inside the repeated region
+                if len({_ctx_text(n) for n, _t, _p in occurrences}) == 1:
+                    first, last = line_numbers[0], line_numbers[-1] + span - 1
+                    message = (
+                        head
+                        + f"All {len(occurrences)} occurrences are repeats of the same block and "
+                          "their surrounding lines are identical too, so extending old_str with "
+                          "nearby lines cannot make it unique. The repeats span lines "
+                          f"{first}-{last}. One copy with its surroundings:\n"
+                        + _occurrence_context(file_content, occurrences[:1], old_str)
+                        + "\nIf the duplication is itself the bug, make one edit whose old_str "
+                          f"covers the whole repeated region (start at the distinct code above "
+                          f"line {first} and end below line {last}) with new_str keeping a single "
+                          "copy. To change only one occurrence, extend old_str until it reaches "
+                          "the distinct code above the first or below the last repeat."
+                    )
+                else:
+                    message = (
+                        head + "Each match with its surrounding lines:\n"
+                        + _occurrence_context(file_content, occurrences, old_str)
+                        + "\nPick the one you mean and extend your old_str with the neighbouring lines "
+                          "shown above until it matches only there."
+                    )
                 safe_print(message)
             else:
                 safe_print(

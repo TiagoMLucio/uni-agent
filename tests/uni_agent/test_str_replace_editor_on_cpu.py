@@ -52,6 +52,27 @@ def test_outer_strip_fallback(tmp_path):
     assert f.read_text() == "a = 1\nb = 20\nc = 3\n"
 
 
+def test_consecutive_repeats_get_the_periodic_message(tmp_path):
+    """When every occurrence's surroundings are identical (pasted duplicates whose
+    repetition extends past the first and last match), the enumeration is noise; the
+    message must say so and describe the spanning edit."""
+    period = "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6\n"
+    content = "c = 3\nd = 4\ne = 5\nf = 6\n" + period * 4 + "a = 1\nb = 2\n"
+    f = write(tmp_path, content)
+    out = run_edit(f, "b = 2\nc = 3", "b = 20\nc = 3")
+    assert "Multiple occurrences" in out, "gallery marker stays"
+    assert "surrounding lines are identical" in out
+    assert "covers the whole repeated region" in out
+    assert out.count("occurrence at line") == 1, "one copy shown, not the enumeration"
+
+
+def test_distinct_surroundings_keep_the_enumeration(tmp_path):
+    f = write(tmp_path, "x = 1\nb = 2\ny = 3\nz = 4\nq = 5\nw = 6\nb = 2\nr = 7\n")
+    out = run_edit(f, "b = 2", "b = 20")
+    assert "Each match with its surrounding lines" in out
+    assert out.count("occurrence at line") == 2
+
+
 def test_empty_old_str_gets_its_own_message(tmp_path):
     """An empty (or whitespace-only) old_str matches everywhere; it must get the insertion
     guidance, never the multiple-occurrence enumeration of the whole file."""
