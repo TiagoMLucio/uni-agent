@@ -237,15 +237,41 @@ def _correct_one(turn: dict, hit: str, blob: str, min_sim: float):
     # whenever the edit's only intended change WAS the whitespace or the escaping
     if fixed == new:
         return cls, "", raw
-    # only the old_str field is corrected: new_str stays the model's own intent, and the
-    # substitution is anchored to the field so a new_str repeating old_str is untouched
+    corrected = _swap_old_str(raw, old, fixed)
+    if not corrected:
+        return cls, "", raw
+    return cls, corrected, raw
+
+
+def _swap_old_str(raw: str, old: str, fixed: str) -> str:
+    """``raw`` with only its old_str field value replaced, or "" when the canonical wire
+    does not sit at the field (a differently-escaped call must ship no target).
+
+    new_str stays the model's own intent, and the substitution is anchored to the field
+    so a new_str repeating old_str is untouched."""
     fo = json.dumps(old)[1:-1]
     key = re.search(r'"old_str":\s*"', raw)
     start = key.end() if key else -1
     if start < 0 or not raw.startswith(fo + '"', start):
-        return cls, "", raw
-    corrected = raw[:start] + json.dumps(fixed)[1:-1] + raw[start + len(fo):]
-    return cls, corrected, raw
+        return ""
+    return raw[:start] + json.dumps(fixed)[1:-1] + raw[start + len(fo):]
+
+
+def retry_call_target(turn: dict, fixed: str) -> str:
+    """The retry turn's own call with only its old_str swapped for the verified value.
+
+    A retry usually rewrites both fields, so the failed call's corrected form is the
+    wrong target there: its new_str would supervise the retry's own new_str toward
+    stale text. Returns "" when no sound target exists (already corrected, collapse,
+    no-op, or unanchorable)."""
+    blocks = _call_blocks(turn.get("response") or "")
+    if not blocks:
+        return ""
+    raw, args = blocks[0]
+    old, new = str(args.get("old_str", "")), str(args.get("new_str", ""))
+    if old == fixed or fixed == new or old == new:
+        return ""
+    return _swap_old_str(raw, old, fixed)
 
 
 def corrected_calls(turns: list[dict], min_sim: float, select: str = "first",
@@ -341,6 +367,7 @@ class ToolFixReflector(AbstractReflector):
                 task=task, turns=turns, gold=gold, feedback=feedback,
                 outcome=outcome, agent_patch=agent_patch)
         known = {t["step"] for t in turns}
+        by_step = {t["step"]: t for t in turns}
         hints: dict[int, Any] = {}
         for step, cls, call in found:
             # the wire old_str (escaped JSON value) measured as the strongest conditioning form
@@ -355,14 +382,23 @@ class ToolFixReflector(AbstractReflector):
             hint: dict[str, Any] = {"text": text, "at": "call"}
             if self.config.target_mask:
                 hint["target"] = call
-            steps = [step] if self.config.hint_at in ("call", "both") else []
+            placed: dict[int, dict[str, Any]] = (
+                {step: hint} if self.config.hint_at in ("call", "both") else {})
             if self.config.hint_at in ("retry", "both"):
                 again = retry_step(turns, step, _call_path(call))
                 if again is not None:
-                    steps.append(again)
-            for s in steps:
+                    retry_hint: dict[str, Any] | None = dict(hint)
+                    if self.config.target_mask:
+                        target = retry_call_target(by_step[again], json.loads(old_wire))
+                        if target:
+                            retry_hint["target"] = target
+                        else:
+                            retry_hint = None
+                    if retry_hint is not None:
+                        placed.setdefault(again, retry_hint)
+            for s, h in placed.items():
                 if s in known and s not in hints:
-                    hints[s] = dict(hint)
+                    hints[s] = dict(h)
             self._record(
                 "tool_fix", step,
                 [{"role": "system",

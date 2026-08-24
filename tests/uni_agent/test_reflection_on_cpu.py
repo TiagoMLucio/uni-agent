@@ -829,6 +829,26 @@ def test_hint_at_retry_ships_the_same_corrected_call_and_target():
     assert hints[0] is not hints[1], "each step carries its own hint dict"
 
 
+def test_hint_at_retry_target_is_reanchored_on_the_retry_call():
+    """A retry usually rewrites both fields; the retry-step target must keep the RETRY's
+    own new_str and swap only its old_str for the verified value."""
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
+             _fix_retry_turn(1, "  a()", "  c()", INDENT_DIAG)]
+    hints = _fix(turns, hint_at="both", target_mask=True)
+    assert '"old_str": ' + json.dumps("a()") in hints[1]["target"], "old_str swapped"
+    assert '"new_str": ' + json.dumps("  c()") in hints[1]["target"], "retry's new_str kept"
+    assert json.dumps("    b()") not in hints[1]["target"], "failed call's new_str gone"
+    assert hints[0]["text"] == hints[1]["text"], "hint text unchanged"
+
+
+def test_hint_at_retry_ships_no_target_when_the_retry_already_adopted():
+    """A retry that already wrote the verified old_str but still failed has nothing sound
+    to teach at that placement; ship no retry hint rather than a wrong target."""
+    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
+             _fix_retry_turn(1, "a()", "b()", "old_str `a()` did not appear verbatim in /f.py.")]
+    assert _fix(turns, hint_at="retry", target_mask=True) == {}
+
+
 def test_hint_at_validation():
     with pytest.raises(ValueError, match="hint_at"):
         ToolFixReflectionConfig(name="tool_fix", hint_at="somewhere")
