@@ -43,11 +43,18 @@ class AgentChatModel:
         self.tools_schemas = tools_schemas
 
     async def prepare_rollout_cache(
-        self, messages: list[dict[str, str]], include_tools: bool = True
+        self,
+        messages: list[dict[str, str]],
+        include_tools: bool = True,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """``chat_template_kwargs`` overrides the model's own for this call only: the
+        reflector is a separate, untrained call and may need a different template mode
+        (reasoning on, say) from the rollout it is diagnosing."""
         from verl.utils.tokenizer import normalize_token_ids
 
         tools = self.tools_schemas if include_tools else None
+        template_kwargs = self.chat_template_kwargs if chat_template_kwargs is None else chat_template_kwargs
         prompt_ids = await self.loop.run_in_executor(
             None,
             lambda: self.tokenizer.apply_chat_template(
@@ -55,7 +62,7 @@ class AgentChatModel:
                 add_generation_prompt=True,
                 tokenize=True,
                 tools=tools,
-                **(self.chat_template_kwargs or {}),
+                **(template_kwargs or {}),
             ),
         )
         prompt_ids = normalize_token_ids(prompt_ids)

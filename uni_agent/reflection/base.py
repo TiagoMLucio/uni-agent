@@ -73,6 +73,10 @@ class BaseReflectionConfig(BaseModel):
     name: str = "single"
     enabled: bool = False
     failed_only: bool = True
+    #: apply_chat_template kwargs for reflector calls only; None inherits the rollout's.
+    #: The reflector is a separate, untrained call whose prompt asks for staged reasoning,
+    #: so it can need reasoning on where the rollout deliberately has it off.
+    chat_template_kwargs: dict | None = None
     include_gold: bool = True
     # what the attempt actually produced; the other half of "what they did vs what was needed".
     # Captured by the reward spec (``reward.agent_patch_context`` sets its width).
@@ -145,7 +149,9 @@ class AbstractReflector(ABC):
             try:
                 with rollout_trace_span(label, metadata={"obs_cap": obs_cap, "resp_cap": resp_cap}):
                     # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
-                    cache = await self.model.prepare_rollout_cache(messages, include_tools=False)
+                    cache = await self.model.prepare_rollout_cache(
+                        messages, include_tools=False, chat_template_kwargs=cfg.chat_template_kwargs
+                    )
                     # the engine is sized for this call, not for a rollout: rollouts condense to the
                     # agent's budget while a reflector prompt is the whole trajectory at once, so its
                     # prefill is what sets the peak activation the rollout engine has to fit
