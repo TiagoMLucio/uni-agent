@@ -57,6 +57,14 @@ TURN_TEMPLATE = "### Turn {step}\nASSISTANT:\n{response}\n{tools}"
 # rendering the parsed action too duplicated whole written files in the prompt
 TOOL_TEMPLATE = "TOOL {name}:\n{observation}"
 
+
+def neutralised_atomic(token: str) -> str:
+    """``<|im_end|>`` -> ``[im_end]``, ``</tool_call>`` -> ``[/tool_call]``.
+
+    Same thing to a reader, but no longer the single atomic token the tokenizer emits.
+    """
+    return "[" + token.strip("<>").strip("|") + "]"
+
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -221,6 +229,35 @@ class AbstractReflector(ABC):
         cap = self.config.max_diagnosis_chars
         return text if len(text) <= cap else text[:cap] + " [... clipped ...]"
 
+    def _atomic_strings(self) -> list[str]:
+        """Every string the tokenizer turns into one atomic token, longest first so an
+        overlapping pair rewrites cleanly. Empty when the client exposes no tokenizer,
+        which only costs the sanitising, never the call."""
+        cached = getattr(self, "_atomic_cache", None)
+        if cached is None:
+            tokenizer = getattr(self.model, "tokenizer", None)
+            try:
+                vocab = tokenizer.get_added_vocab() if tokenizer is not None else {}
+            except Exception:
+                vocab = {}
+            cached = sorted(vocab, key=len, reverse=True)
+            self._atomic_cache = cached
+        return cached
+
+    def _strip_atomic(self, text: str) -> str:
+        """Neutralise atomic tokens carried in from a trajectory.
+
+        A turn's ``response`` is the model's raw output, so it still holds the real
+        ``<tool_call>`` and the ``<|im_end|>`` that closed it. Embedded verbatim these
+        tokenize as themselves, and a rendered trajectory then reaches the reflector as a
+        live conversation with one turn boundary per turn (measured: ~175 atomic tokens
+        per prompt over SWE-smith) rather than as the transcript it is meant to read.
+        """
+        for token in self._atomic_strings():
+            if token in text:
+                text = text.replace(token, neutralised_atomic(token))
+        return text
+
     def _render_turns(self, turns: list[dict], obs_cap: int, resp_cap: int | None) -> str:
         return "\n\n".join(
             TURN_TEMPLATE.format(
@@ -228,12 +265,15 @@ class AbstractReflector(ABC):
                 tokens=turn.get("tokens", "?"),
                 response=(
                     # mark breakdown turns so the reflector coaches recovery instead of inventing content (rule 3)
-                    f"(degenerate turn: the model emitted almost no output and no tool call) {turn['response']!r}"
+                    f"(degenerate turn: the model emitted almost no output and no tool call) "
+                    f"{self._strip_atomic(turn['response'])!r}"
                     if not turn["tools"] and len(turn["response"].strip()) < 20
-                    else self._clip_response(turn["response"], resp_cap)
+                    else self._clip_response(self._strip_atomic(turn["response"]), resp_cap)
                 ),
                 tools="\n".join(
-                    TOOL_TEMPLATE.format(name=r["name"], observation=self._clip(r["observation"] or "", obs_cap))
+                    TOOL_TEMPLATE.format(
+                        name=r["name"], observation=self._clip(self._strip_atomic(r["observation"] or ""), obs_cap)
+                    )
                     for r in turn["tools"]
                 )
                 or "(no tool calls)",

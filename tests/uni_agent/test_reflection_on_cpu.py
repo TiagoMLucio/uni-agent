@@ -16,7 +16,7 @@ class _Model:
     def __init__(self):
         self.messages: list[dict] = []
 
-    async def prepare_rollout_cache(self, messages, include_tools=True):
+    async def prepare_rollout_cache(self, messages, include_tools=True, chat_template_kwargs=None):
         return {}
 
     async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
@@ -159,7 +159,7 @@ class _ScriptedModel:
         self.replies = replies
         self.seen: list[dict] = []
 
-    async def prepare_rollout_cache(self, messages, include_tools=True):
+    async def prepare_rollout_cache(self, messages, include_tools=True, chat_template_kwargs=None):
         return {}
 
     async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
