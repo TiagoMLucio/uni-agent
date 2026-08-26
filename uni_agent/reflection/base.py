@@ -231,11 +231,12 @@ class AbstractReflector(ABC):
 
     def _atomic_strings(self) -> list[str]:
         """Every string the tokenizer turns into one atomic token, longest first so an
-        overlapping pair rewrites cleanly. Empty when the client exposes no tokenizer,
-        which only costs the sanitising, never the call."""
+        overlapping pair rewrites cleanly. Empty when there is no client or it exposes no
+        tokenizer -- the render helpers build a Reflector without one -- which costs the
+        sanitising, never the call."""
         cached = getattr(self, "_atomic_cache", None)
         if cached is None:
-            tokenizer = getattr(self.model, "tokenizer", None)
+            tokenizer = getattr(getattr(self, "model", None), "tokenizer", None)
             try:
                 vocab = tokenizer.get_added_vocab() if tokenizer is not None else {}
             except Exception:
