@@ -191,8 +191,16 @@ class UniAgentLoop(AgentLoopBase):
                                     await self.env.start()
 
                                     # tools schemas should be visible to the model
-                                    # to generate correct tool call format in response
-                                    self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
+                                    # to generate correct tool call format in response.
+                                    # declare_tools=false suppresses the template's tool
+                                    # block for scaffolds whose system prompt documents
+                                    # the tools inline; declaring them twice would also
+                                    # advertise a call format the model was not trained on.
+                                    self.chat_model.set_tools_schemas(
+                                        self.tools_manager.tools_schemas
+                                        if config_dict.get("declare_tools", True)
+                                        else None
+                                    )
                                     await self.env.install_tools(self.tools_manager.tools)
                                     if self.skills_manager is not None:
                                         await self.env.install_skills(self.skills_manager)

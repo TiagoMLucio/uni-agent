@@ -321,9 +321,31 @@ class HermesToolParser:
         return OpenAIFunctionToolCall(id=str(uuid.uuid4()), type="function", function=function_call)
 
 
+class SweStarXMLToolParser(XMLToolParser):
+    """SWE-Star's notation: a bare ``<function=...></function>`` with no ``<tool_call>``
+    wrapper. Only needed to replay models distilled from that scaffold; the wrapped form
+    is what our own rollouts emit."""
+
+    def _get_function_calls(self, model_output: str) -> list[str]:
+        matches = self.tool_call_function_regex.findall(model_output)
+        return [m[0] if m[0] else m[1] for m in matches]
+
+    def extract_tool_calls(
+        self, model_output: str, tools: list[OpenAIFunctionToolSchema]
+    ) -> tuple[str, list[OpenAIFunctionToolCall]]:
+        if self.tool_call_prefix not in model_output:
+            return model_output, []
+        function_calls = self._get_function_calls(model_output)
+        if not function_calls:
+            return model_output, []
+        tool_calls = [self._parse_xml_function_call(c, tools) for c in function_calls]
+        return model_output[: model_output.find(self.tool_call_prefix)], tool_calls
+
+
 _PARSER_REGISTRY: dict[str, type] = {
     "qwen3_coder": XMLToolParser,
     "hermes": HermesToolParser,
+    "swestar_xml": SweStarXMLToolParser,
 }
 
 

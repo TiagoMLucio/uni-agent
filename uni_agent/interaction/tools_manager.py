@@ -104,6 +104,9 @@ class ToolsManager:
         if func_name == "submit":
             return "echo '<<<Finished>>>'"
 
+        if func_name == "think":
+            return "echo 'Your thought has been logged.'"
+
         if func_name == "execute_bash":
             return func_params.get("command", "")
 

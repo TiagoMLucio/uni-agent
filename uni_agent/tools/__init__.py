@@ -13,6 +13,7 @@ from .search_arxiv import SearchArxivTool
 from .search import SearchWikiTool
 from .str_replace_editor import StrReplaceEditorTool
 from .submit import SubmitTool
+from .think import ThinkTool
 
 
 class ToolConfig(BaseModel):
@@ -32,4 +33,5 @@ __all__ = [
     "SearchWikiTool",
     "StrReplaceEditorTool",
     "SubmitTool",
+    "ThinkTool",
 ]

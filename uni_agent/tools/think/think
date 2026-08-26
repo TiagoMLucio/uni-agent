@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+
+import argparse
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Log a thought.")
+    parser.add_argument("--thought", required=True, type=str, help="A thought to think about")
+    parser.parse_args()
+
+    print("Your thought has been logged.")
+
+
+if __name__ == "__main__":
+    main()

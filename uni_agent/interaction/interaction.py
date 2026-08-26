@@ -138,6 +138,8 @@ class AgentInteraction:
         condense_chars_per_token: int = CONDENSE_CHARS_PER_TOKEN,
         condense_margin_tokens: int = CONDENSE_MARGIN_TOKENS,
         condense_min_chars: int = CONDENSE_MIN_CHARS,
+        observation_role: str = "tool",
+        observation_template: str = "EXECUTION RESULT of [{name}]:\n{observation}",
     ):
         """:param chat_mode: how to treat an assistant message with no
         tool calls. ``False`` (default, training / code-eval) raises
@@ -154,6 +156,10 @@ class AgentInteraction:
         re-seated from it, and generation retries. ``None`` keeps the legacy
         behavior (overflow ends the rollout with ``token_limit``).
         :param condense_max_retries: max condense+retry attempts per overflow.
+        :param observation_role: role carrying tool output. ``"tool"`` (default) is
+        what our own rollouts emit. ``"user"`` renders observations as user turns via
+        ``observation_template``, which is the OpenHands-style scaffold some distilled
+        checkpoints were trained on; replaying them any other way is off-distribution.
         """
         self.env = env
         self.model = model
@@ -172,7 +178,21 @@ class AgentInteraction:
         self.condense_chars_per_token = condense_chars_per_token
         self.condense_margin_tokens = condense_margin_tokens
         self.condense_min_chars = condense_min_chars
+        self.observation_role = observation_role
+        self.observation_template = observation_template
         self.logger = get_logger("interaction", run_id)
+
+    def _observation_message(self, name: str, tool_call_id: str | None, observation: str) -> dict:
+        """Shape one tool result the way this scaffold's training data did."""
+        if self.observation_role != "tool":
+            return {
+                "role": self.observation_role,
+                "content": self.observation_template.format(name=name or "", observation=observation),
+            }
+        msg: dict = {"role": "tool", "name": name, "content": observation}
+        if tool_call_id is not None:
+            msg["tool_call_id"] = tool_call_id
+        return msg
 
     def inject_skills_manifest(self) -> None:
         """Append the skills manifest to the first system message.
@@ -308,16 +328,11 @@ class AgentInteraction:
                 )
             if tool_calls:
                 error_msgs: list[dict[str, object]] = [
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "content": error_text,
-                    }
+                    self._observation_message(tc["function"]["name"], tc["id"], error_text)
                     for tc in tool_calls
                 ]
             else:
-                error_msgs = [{"role": "tool", "content": error_text}]
+                error_msgs = [self._observation_message("", None, error_text)]
             self.messages.extend(error_msgs)
             with simple_timer("tokenize_observations", self.rollout_cache["metrics"]):
                 self.rollout_cache = await self.model.append_messages_to_rollout_cache(
@@ -360,12 +375,7 @@ class AgentInteraction:
 
                 tool_results.append(result)
                 tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": result.tool_call_id,
-                        "name": result.name,
-                        "content": result.observation,
-                    }
+                    self._observation_message(result.name, result.tool_call_id, result.observation)
                 )
 
                 # On hard failure (dead session / budget out), synthesize
@@ -390,12 +400,9 @@ class AgentInteraction:
                             )
                         )
                         tool_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": remaining.id,
-                                "name": remaining.function.name,
-                                "content": skipped_reason,
-                            }
+                            self._observation_message(
+                                remaining.function.name, remaining.id, skipped_reason
+                            )
                         )
                     break
 
