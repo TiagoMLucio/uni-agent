@@ -86,7 +86,14 @@ class _SshMaster:
             + self._ssh_opts()
             + ["-L", f"127.0.0.1:{podman_local}:127.0.0.1:{self._config.podman_port}", self._config.ssh_host]
         )
-        subprocess.run(cmd, check=True, timeout=self._config.startup_timeout, capture_output=True)
+        proc = subprocess.run(cmd, timeout=self._config.startup_timeout, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # unreadable key, refused auth, unknown host: ssh says which only on stderr,
+            # and without it every one of them is an indistinguishable "exit status 255"
+            raise RuntimeError(
+                f"ssh ControlMaster to {self._config.ssh_host} failed (exit {proc.returncode}): "
+                f"{proc.stderr.strip() or '<no stderr>'}"
+            )
         self.docker = docker.DockerClient(
             base_url=f"tcp://127.0.0.1:{podman_local}", timeout=int(self._config.startup_timeout)
         )
@@ -111,11 +118,14 @@ class _SshMaster:
                     + ["-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}", self._config.ssh_host]
                 )
                 try:
-                    await asyncio.to_thread(subprocess.run, cmd, check=True, timeout=30, capture_output=True)
+                    await asyncio.to_thread(
+                        subprocess.run, cmd, check=True, timeout=30, capture_output=True, text=True
+                    )
                     return local
                 except subprocess.CalledProcessError as exc:
                     last = exc
-            raise RuntimeError(f"ssh -O forward failed for remote port {remote_port}") from last
+            detail = (getattr(last, "stderr", "") or "").strip() or "<no stderr>"
+            raise RuntimeError(f"ssh -O forward failed for remote port {remote_port}: {detail}") from last
 
     async def cancel(self, local_port: int, remote_port: int) -> None:
         cmd = (
