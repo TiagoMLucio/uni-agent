@@ -130,7 +130,13 @@ class AgentChatModel:
         turn_limit = None
         if self.max_completion_tokens:
             room = max(1, limit - len(prompt_ids))
-            turn_limit = min(int(self.max_completion_tokens), room)
+            # A caller that states its own budget keeps it: the reflector asks for far more
+            # than one agent turn because it writes a staged analysis before its hints, and
+            # this used to clamp it to max_completion_tokens regardless, so replies died at
+            # exactly 4096 tokens with the object unwritten. The window clamp still applies.
+            asked = sampling_params.get("max_tokens")
+            ceiling = int(asked) if asked else int(self.max_completion_tokens)
+            turn_limit = min(ceiling, room)
             sampling_params = {**sampling_params, "max_tokens": turn_limit}
 
         with simple_timer("generate_sequences", metrics):
