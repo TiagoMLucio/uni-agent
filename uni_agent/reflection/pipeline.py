@@ -121,23 +121,38 @@ class PipelineReflector(AbstractReflector):
                 selected = sorted(hints)
                 continue
 
+            # what this stage would keep: also the retry's acceptance test, so a reply is
+            # re-drawn exactly when it would have produced nothing
+            if call.parse == "turns":
+                usable = lambda t: bool([s for s in self._parse_turns(t)
+                                         if s in {x["step"] for x in turns}])
+            elif call.parse == "hints":
+                usable = lambda t: bool(self._keep_valid(self._parse(t), turns))
+            else:
+                usable = None
+
             text = await self._ask(
                 call.system.replace("{k}", k),
                 lambda obs, resp, c=call, p=prev: self._render(c.user, k, base, turns, obs, resp, prev=p),
                 call.max_output_tokens,
                 stage=call.id,
+                accept=usable,
             )
+            # a later stage that comes back empty leaves the hints an earlier one already
+            # earned, rather than discarding them: no stage may make the result worse
             if text is None:
-                return {}
+                break
             if call.parse == "turns":
-                selected = [step for step in self._parse_turns(text) if step in {t["step"] for t in turns}]
-                if not selected:
-                    return {}
+                fresh = [step for step in self._parse_turns(text) if step in {t["step"] for t in turns}]
+                if not fresh:
+                    break
+                selected = fresh
             elif call.parse == "hints":
-                hints = self._keep_valid(self._parse(text), turns)
+                fresh = self._keep_valid(self._parse(text), turns)
+                if not fresh:
+                    break
+                hints = fresh
                 selected = sorted(hints)
-                if not hints:
-                    return {}
             prev = text
         return hints
 

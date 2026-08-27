@@ -9,6 +9,7 @@ target. Guidance only: the prompt forbids revealing the fix itself.
 
 import gzip
 import json
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, ClassVar
@@ -66,6 +67,10 @@ def neutralised_atomic(token: str) -> str:
     return "[" + token.strip("<>").strip("|") + "]"
 
 _JSON_DECODER = json.JSONDecoder()
+#: raw control characters inside a string are routine when a hint quotes code
+_LENIENT_DECODER = json.JSONDecoder(strict=False)
+#: a hint key as the model writes it: "turn7", 'turn_7', turn 7
+_TURN_KEY_RE = re.compile(r"[\"']?turn[_\s]*(\d+)[\"']?\s*:\s*[\"']")
 
 
 class BaseReflectionConfig(BaseModel):
@@ -143,10 +148,22 @@ class AbstractReflector(ABC):
         """Hints keyed by step index; empty on any failure, since hints are optional supervision."""
 
     async def _ask(self, system: str, render_user, max_output_tokens: int | None = None,
-                   stage: str = "", step: int | None = None) -> str | None:
-        """One call, retried down the shrink ladder. ``render_user(obs_cap, resp_cap) -> str``."""
+                   stage: str = "", step: int | None = None, accept=None) -> str | None:
+        """One call, retried down the shrink ladder. ``render_user(obs_cap, resp_cap) -> str``.
+
+        ``accept(text) -> bool`` decides whether a reply is usable. A reply that parses to
+        nothing is a wasted rollout, and contract failures are drawn per sample rather than
+        being properties of the trace (measured: zero traces failed in all three repeats of
+        one arm, Cohen's kappa about 0), so re-drawing recovers most of them where rewording
+        the prompt does not. Without it, only an over-budget render was ever retried.
+        """
         cfg = self.config
-        for obs_cap, resp_cap in [(cfg.max_observation_chars, None), *cfg.shrink_ladder]:
+        rungs = [(cfg.max_observation_chars, None), *cfg.shrink_ladder]
+        # a rejected reply re-draws on the same rung once before shrinking, since the shrink
+        # is there for prompts that do not fit, not for replies that came out malformed
+        ladder = [rung for rung in rungs for _ in (range(2) if accept is not None else range(1))]
+        rejected = None
+        for attempt, (obs_cap, resp_cap) in enumerate(ladder):
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": render_user(obs_cap, resp_cap)},
@@ -175,7 +192,12 @@ class AbstractReflector(ABC):
                 self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
                                  f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
                 self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap)
-                return text
+                if accept is None or accept(text):
+                    return text
+                rejected = text if rejected is None else rejected
+                self.logger.info(f"Reflection reply unusable (attempt {attempt + 1}/{len(ladder)}, "
+                                 f"obs_cap={obs_cap}); re-drawing")
+                continue
             except MaxTokenExceededError as exc:
                 self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
                 self._record(stage, step, messages, None, None, obs_cap, resp_cap, error="over budget")
@@ -184,6 +206,11 @@ class AbstractReflector(ABC):
                 self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
                 self._record(stage, step, messages, None, None, obs_cap, resp_cap, error=repr(exc))
                 return None
+        if rejected is not None:
+            # hand back the last reply anyway: the caller's own parse is the arbiter, and a
+            # reply it cannot use is no worse than the None this used to return
+            self.logger.warning("Reflection: no usable reply in %d attempts", len(ladder))
+            return rejected
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
         return None
 
@@ -296,27 +323,59 @@ class AbstractReflector(ABC):
         return f"{text[:head]}\n[... {len(text) - cap} chars elided ...]\n{text[-(cap - head):]}"
 
     @staticmethod
-    def _extract_json_object(text: str) -> Any:
-        """First ``{...}`` that decodes as JSON, tolerating surrounding prose or ```json fences."""
+    def _extract_json_object(text: str, strict: bool = True) -> Any:
+        """First ``{...}`` that decodes as JSON, tolerating surrounding prose or ```json fences.
+
+        ``strict=False`` additionally allows raw control characters inside strings, which a
+        hint quoting a traceback or a diff routinely contains.
+        """
+        decoder = _JSON_DECODER if strict else _LENIENT_DECODER
         idx = text.find("{")
         while idx != -1:
             try:
-                return _JSON_DECODER.raw_decode(text, idx)[0]
+                return decoder.raw_decode(text, idx)[0]
             except json.JSONDecodeError:
                 idx = text.find("{", idx + 1)
         return None
+
+    @staticmethod
+    def _salvage_hints(text: str) -> dict[int, str]:
+        """Turn-keyed hints recovered from an object the decoder cannot accept.
+
+        The object is all-or-nothing to ``json``: one unescaped quote inside one hint costs
+        the rollout every hint in the reply, and hints quote code, so that happens. This reads
+        the keys directly and takes each value up to the next key, which recovers the text
+        verbatim without trusting the delimiters in between. It deliberately does NOT mine the
+        prose analysis -- measured, that invents hints where the model declined.
+        """
+        hints: dict[int, str] = {}
+        anchors = list(_TURN_KEY_RE.finditer(text))
+        for i, match in enumerate(anchors):
+            stop = anchors[i + 1].start() if i + 1 < len(anchors) else len(text)
+            value = text[match.end():stop].strip()
+            value = value.rstrip("\"},;. \n\t")
+            # a fragment shorter than this is a truncated key or a stray delimiter, not a hint
+            if len(value) >= 15:
+                hints[int(match.group(1))] = value
+        return hints
 
     @classmethod
     def _parse(cls, text: str) -> dict[int, str]:
         # After the last marker first, so an audit's own braces cannot shadow the answer; the
         # unanchored scan stays as the fallback for a reply that omitted the marker entirely.
+        text = text or ""
+        tail = text.rsplit(FINAL_MARKER, 1)[1] if FINAL_MARKER in text else ""
         raw = None
-        if FINAL_MARKER in (text or ""):
-            raw = cls._extract_json_object(text.rsplit(FINAL_MARKER, 1)[1])
+        for strict in (True, False):
+            if tail:
+                raw = cls._extract_json_object(tail, strict=strict)
+            if not isinstance(raw, dict):
+                raw = cls._extract_json_object(text, strict=strict)
+            if isinstance(raw, dict):
+                break
         if not isinstance(raw, dict):
-            raw = cls._extract_json_object(text)
-        if not isinstance(raw, dict):
-            return {}
+            # last resort: read the keys out of an object no decoder will take
+            return cls._salvage_hints(tail or text)
         hints: dict[int, str] = {}
         for key, value in raw.items():
             digits = "".join(c for c in str(key) if c.isdigit())
