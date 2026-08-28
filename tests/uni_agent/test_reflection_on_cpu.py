@@ -965,3 +965,124 @@ def test_obs_region_reads_the_conditional_resend_wording():
            "your old_str, copied character for character; if it is not, view the file "
            "and locate the right region before editing.")
     assert _obs_region(obs) == "    x = 1\n    return x"
+
+
+# --- _maybe_reflect filters: skip_exit_reasons and hint_cutoff_on_editor_error -------------
+
+import types  # noqa: E402
+
+from uni_agent.reflection import BaseReflectionConfig, first_editor_error_step  # noqa: E402
+
+
+def _traj_step(idx, tools=(), exit_reason="turn_done"):
+    return types.SimpleNamespace(
+        step_idx=idx,
+        response="r",
+        tool_results=[types.SimpleNamespace(name=n, action=a, observation=o) for n, a, o in tools],
+        exit_reason=exit_reason,
+        done=False,
+    )
+
+
+def _maybe_reflect(tmp_path, reflection, trajectory, reply=None):
+    """The real ``UniAgentLoop._maybe_reflect`` over a fake loop; errors fail the test."""
+    from uni_agent.agent_loop import UniAgentLoop
+
+    model = _Model()
+    if reply is not None:
+        model.reply = reply
+
+    def _raise(msg):
+        raise AssertionError(msg)
+
+    loop = types.SimpleNamespace(
+        env=types.SimpleNamespace(privileged_context="gold"),
+        chat_model=model,
+        run_id="run",
+        output_dir=tmp_path,
+        identity={},
+        logger=types.SimpleNamespace(critical=_raise),
+    )
+    result = {
+        "reward_score": 0.0,
+        "reward_extra_info": {"feedback": "f", "resolved": False, "agent_patch": ""},
+        "metrics": {},
+        "messages": [{"role": "user", "content": "t"}],
+        "trajectory": trajectory,
+        "rollout_cache": {"turn_spans": [[s.step_idx, i * 2, i * 2 + 2] for i, s in enumerate(trajectory)]},
+    }
+    hints = asyncio.run(UniAgentLoop._maybe_reflect(loop, result, {"reflection": reflection}, validate=False))
+    return hints, model
+
+
+def test_filter_fields_default_off_and_validate():
+    config = BaseReflectionConfig()
+    assert config.skip_exit_reasons == [] and config.hint_cutoff_on_editor_error is False
+    config = build_reflection_config(
+        {"name": "single", "skip_exit_reasons": ["stuck"], "hint_cutoff_on_editor_error": True}
+    )
+    assert config.skip_exit_reasons == ["stuck"] and config.hint_cutoff_on_editor_error is True
+
+
+def test_editor_error_marks_cover_the_failure_classes():
+    failures = [
+        "No replacement was performed, old_str `x` did not appear verbatim in /f.py.",
+        "No replacement was performed. Multiple occurrences of old_str `x` in lines [1, 2]. "
+        "Please ensure it is unique.",
+        "No replacement was performed: your old_str and new_str are byte-identical, "
+        "so this edit would leave the file unchanged.",
+        "No replacement was performed, old_str `x` is the same as new_str `x`.",
+        "The path `/f.py` does not exist. Please provide a valid path.",
+        "Parameter `old_str` is required for command: str_replace",
+    ]
+    for obs in failures:
+        turns = [{"step": 4, "tools": [{"name": "str_replace_editor", "observation": obs}]}]
+        assert first_editor_error_step(turns) == 4, obs
+    # a success and an error string echoed by another tool trigger nothing
+    turns = [{"step": 0, "tools": [
+        {"name": "str_replace_editor", "observation": "The file /f.py has been edited."},
+        {"name": "execute_bash", "observation": "grep: did not appear verbatim in"},
+    ]}]
+    assert first_editor_error_step(turns) is None
+
+
+def test_skip_exit_reasons_skips_the_reflector_call(tmp_path):
+    trajectory = [_traj_step(0, exit_reason="stuck")]
+    hints, model = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
+    assert hints == {} and model.messages == [], "the reflector must not even be queried"
+    # unset, the same trajectory is hinted as before
+    hints, model = _maybe_reflect(tmp_path, {"enabled": True}, trajectory)
+    assert hints == {0: "run the failing test"} and model.messages
+    # a termination outside the list is untouched
+    trajectory = [_traj_step(0, exit_reason="max_step_limit")]
+    hints, _ = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
+    assert hints == {0: "run the failing test"}
+
+
+def test_hint_cutoff_drops_hints_from_the_first_failed_edit(tmp_path):
+    trajectory = [
+        _traj_step(0),
+        _traj_step(1, tools=[("str_replace_editor", "str_replace_editor create /f.py",
+                              "File created successfully at: /f.py")]),
+        _traj_step(2, tools=[("str_replace_editor", "str_replace_editor str_replace /f.py",
+                              "No replacement was performed, old_str `x` did not appear verbatim in /f.py.")]),
+        _traj_step(3),
+    ]
+    reply = '{"turn1": "a", "turn2": "b", "turn3": "c"}'
+    hints, _ = _maybe_reflect(
+        tmp_path, {"enabled": True, "hint_cutoff_on_editor_error": True}, trajectory, reply=reply)
+    assert hints == {1: "a"}, "the failed step and everything after it go unhinted"
+    # off, the same reply lands in full
+    hints, _ = _maybe_reflect(tmp_path, {"enabled": True}, trajectory, reply=reply)
+    assert hints == {1: "a", 2: "b", 3: "c"}
+
+
+def test_hint_cutoff_without_editor_error_keeps_all_hints(tmp_path):
+    trajectory = [
+        _traj_step(0, tools=[("execute_bash", "bash -c ls", "No replacement was performed. echoed by a test log")]),
+        _traj_step(1, tools=[("str_replace_editor", "str_replace_editor view /f.py", "1\tx = 1")]),
+    ]
+    reply = '{"turn0": "a", "turn1": "b"}'
+    hints, _ = _maybe_reflect(
+        tmp_path, {"enabled": True, "hint_cutoff_on_editor_error": True}, trajectory, reply=reply)
+    assert hints == {0: "a", 1: "b"}

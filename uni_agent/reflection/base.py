@@ -72,6 +72,45 @@ _LENIENT_DECODER = json.JSONDecoder(strict=False)
 #: a hint key as the model writes it: "turn7", 'turn_7', turn 7
 _TURN_KEY_RE = re.compile(r"[\"']?turn[_\s]*(\d+)[\"']?\s*:\s*[\"']")
 
+#: The str_replace editor's own error messages, one stable fragment per message (interpolated
+#: values elided; both wording variants where the tool has two). Verbatim substrings only: a
+#: fuzzy pattern would also catch file content that merely resembles an error.
+EDITOR_ERROR_MARKS = (
+    # str_replace failures
+    "did not appear verbatim in",
+    "No replacement was performed. Multiple occurrences of",
+    "your old_str and new_str are byte-identical",
+    "is the same as new_str",
+    # argument validation
+    "Parameter `file_text` is required for command: create",
+    "Parameter `old_str` is required for command: str_replace",
+    "Parameter `insert_line` is required for command: insert",
+    "Parameter `new_str` is required for command: insert",
+    "Unrecognized command `",
+    # path validation
+    "does not exist. Please provide a valid path.",
+    "Cannot overwrite files using command",
+    "is a directory and only the `view` command can be used on directories",
+    # view / create / insert / undo_edit / file io
+    "The `view_range` parameter is not allowed when `path` points to a directory.",
+    "Invalid `view_range`",
+    "does not exist. Please create it first.",
+    "Invalid `insert_line` parameter:",
+    "No edit history found for",
+    "Ran into UnicodeDecodeError",
+    "while trying to write to",
+)
+
+
+def first_editor_error_step(turns: list[dict]) -> int | None:
+    """Step of the first str_replace_editor call whose observation is one of the editor's errors."""
+    for turn in turns:
+        for call in turn.get("tools") or []:
+            observation = call.get("observation") or ""
+            if call.get("name") == "str_replace_editor" and any(mark in observation for mark in EDITOR_ERROR_MARKS):
+                return turn["step"]
+    return None
+
 
 class BaseReflectionConfig(BaseModel):
     """Settings shared by every reflector (the agent config's ``reflection`` block).
@@ -86,6 +125,10 @@ class BaseReflectionConfig(BaseModel):
     name: str = "single"
     enabled: bool = False
     failed_only: bool = True
+    #: terminations (`stuck`, `max_step_limit`, ...) left unhinted; skips the reflector calls too
+    skip_exit_reasons: list[str] = []
+    #: drop every hint at or after the first failed str_replace_editor call (its own error strings)
+    hint_cutoff_on_editor_error: bool = False
     #: apply_chat_template kwargs for reflector calls only; None inherits the rollout's.
     #: The reflector is a separate, untrained call whose prompt asks for staged reasoning,
     #: so it can need reasoning on where the rollout deliberately has it off.

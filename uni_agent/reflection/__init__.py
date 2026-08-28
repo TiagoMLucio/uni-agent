@@ -13,11 +13,13 @@ several, including per-turn calls whose context is truncated to that turn's pref
 from uni_agent.reflection.base import (
     DEFAULT_SYSTEM_TEMPLATE,
     DEFAULT_USER_TEMPLATE,
+    EDITOR_ERROR_MARKS,
     FINAL_MARKER,
     TOOL_TEMPLATE,
     TURN_TEMPLATE,
     AbstractReflector,
     BaseReflectionConfig,
+    first_editor_error_step,
 )
 from uni_agent.reflection.loop_router import LoopRouterReflectionConfig, LoopRouterReflector
 from uni_agent.reflection.pipeline import CallSpec, PipelineReflectionConfig, PipelineReflector
@@ -37,6 +39,7 @@ ReflectionConfig = SingleCallReflectionConfig
 __all__ = [
     "DEFAULT_SYSTEM_TEMPLATE",
     "DEFAULT_USER_TEMPLATE",
+    "EDITOR_ERROR_MARKS",
     "FINAL_MARKER",
     "REFLECTOR_REGISTRY",
     "TOOL_TEMPLATE",
@@ -56,6 +59,7 @@ __all__ = [
     "ToolFixReflectionConfig",
     "ToolFixReflector",
     "build_reflection_config",
+    "first_editor_error_step",
     "load_reflector",
     "register_reflector",
 ]

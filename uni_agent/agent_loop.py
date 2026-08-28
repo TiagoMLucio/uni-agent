@@ -18,7 +18,7 @@ from uni_agent.interaction import (
     ToolsManager,
     ToolsManagerConfig,
 )
-from uni_agent.reflection import build_reflection_config, load_reflector
+from uni_agent.reflection import build_reflection_config, first_editor_error_step, load_reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
@@ -352,6 +352,8 @@ class UniAgentLoop(AgentLoopBase):
             trajectory = interaction_result.get("trajectory") or []
             steps = {step.step_idx: step for step in trajectory}
             termination = _termination(trajectory)
+            if termination in config.skip_exit_reasons:
+                return {}
             resolved = bool((interaction_result.get("reward_extra_info") or {}).get("resolved"))
             outcome = (
                 f"resolved: {resolved} | reward: {interaction_result.get('reward_score')} | "
@@ -385,7 +387,7 @@ class UniAgentLoop(AgentLoopBase):
             reflector = load_reflector(
                 self.chat_model, config, run_id=self.run_id,
                 record_path=self.output_dir / "reflection.jsonl.gz", identity=self.identity)
-            return await reflector.reflect_trajectory(
+            hints = await reflector.reflect_trajectory(
                 task=task,
                 turns=turns,
                 gold=gold,
@@ -393,6 +395,11 @@ class UniAgentLoop(AgentLoopBase):
                 outcome=outcome,
                 agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
             )
+            if config.hint_cutoff_on_editor_error:
+                cutoff = first_editor_error_step(turns)
+                if cutoff is not None:
+                    hints = {step: hint for step, hint in hints.items() if step < cutoff}
+            return hints
         except Exception as e:  # hints are optional supervision; never kill the rollout over them
             self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
             return {}
