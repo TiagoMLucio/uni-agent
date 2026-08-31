@@ -71,6 +71,13 @@ _JSON_DECODER = json.JSONDecoder()
 _LENIENT_DECODER = json.JSONDecoder(strict=False)
 #: a hint key as the model writes it: "turn7", 'turn_7', turn 7
 _TURN_KEY_RE = re.compile(r"[\"']?turn[_\s]*(\d+)[\"']?\s*:\s*[\"']")
+#: The reflectors that produce the best hints answer one note per line, "54: the condition needs
+#: both clauses to hold". Nothing here read that shape, so such a reply yielded no hints at all,
+#: which reads as a reflector with nothing to say rather than as a format mismatch. A colon is
+#: required rather than any separator, so a numbered list ("1. First, open the file") and a diff
+#: body cannot be mined as hints.
+_TURN_LINE_RE = re.compile(r"^[\s>*_`#-]*\[?\(?<?\s*(?:turn\s*)?(\d+)\s*>?\)?\]?[`*_]*\s*:\s+(.+?)\s*$",
+                           re.I | re.M)
 
 #: The str_replace editor's own error messages, one stable fragment per message (interpolated
 #: values elided; both wording variants where the tool has two). Verbatim substrings only: a
@@ -402,6 +409,16 @@ class AbstractReflector(ABC):
                 hints[int(match.group(1))] = value
         return hints
 
+    @staticmethod
+    def _parse_turn_lines(text: str) -> dict[int, str]:
+        """Hints from a reply that answers one note per line instead of a JSON object."""
+        hints: dict[int, str] = {}
+        for step, note in _TURN_LINE_RE.findall(text or ""):
+            note = note.strip().strip('"').strip()
+            if len(note) >= 15:
+                hints[int(step)] = note
+        return hints
+
     @classmethod
     def _parse(cls, text: str) -> dict[int, str]:
         # After the last marker first, so an audit's own braces cannot shadow the answer; the
@@ -418,7 +435,8 @@ class AbstractReflector(ABC):
                 break
         if not isinstance(raw, dict):
             # last resort: read the keys out of an object no decoder will take
-            return cls._salvage_hints(tail or text)
+            salvaged = cls._salvage_hints(tail or text)
+            return salvaged or cls._parse_turn_lines(tail or text)
         hints: dict[int, str] = {}
         for key, value in raw.items():
             digits = "".join(c for c in str(key) if c.isdigit())
