@@ -167,6 +167,7 @@ class AgentChatModel:
             # the interaction layer tells the model, or it misreads the parse error
             "capped": bool(turn_limit and len(token_output.token_ids) >= turn_limit),
         }
+        metrics["capped_turns"] = metrics.get("capped_turns", 0) + int(generation_info["capped"])
         response_ids = token_output.token_ids
         rollout_cache["prompt_ids"] += response_ids
         rollout_cache["response_mask"] += [1] * len(response_ids)

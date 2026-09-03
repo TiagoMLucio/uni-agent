@@ -303,6 +303,9 @@ class AgentInteraction:
         self.messages.append(assistant_msg)
 
         try:
+            if generation_info and generation_info.get("capped") and not self.chat_mode:
+                # whatever a cut response parses to, it is not the action the model meant
+                raise FunctionCallFormatError("Response cut at the per-turn output limit.")
             if tool_calls:
                 content, tool_calls = await self.tools_manager.parse_structured_action(
                     content=model_output,
