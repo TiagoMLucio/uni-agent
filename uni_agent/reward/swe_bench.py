@@ -245,6 +245,11 @@ def _category(test_status: dict, category: str, outcome: str) -> list[str]:
     return list(bucket.get(outcome, []) or [])
 
 
+def _any_passed(result: dict) -> bool:
+    ts = _test_status(result)
+    return any(_category(ts, cat, "success") for cat in ("FAIL_TO_PASS", "PASS_TO_PASS"))
+
+
 #: parametrized suffix; `test_f[0]` and `test_f[1]` are the same test exercising one code path
 _PARAM_SUFFIX_RE = re.compile(r"\[.*\]$")
 
@@ -365,7 +370,10 @@ class FeedbackConfig(BaseModel):
     ) -> str | None:
         """Render feedback from an eval result; ``None`` if no part produced content."""
         rendered: list[str] = []
-        abort = _collection_abort(output)
+        # a run that passed any test was not aborted at collection, whatever the output says:
+        # pytest's and pylint's own suites print "Interrupted: N errors during collection" as
+        # expected output of the tests under test
+        abort = None if _any_passed(result) else _collection_abort(output)
         # the budget is shared across parts, so the split is decided once, before rendering
         blocks = None if abort else _extract_tracebacks(output)
         failing = _failing_ids(result)
@@ -742,8 +750,12 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             attrs = "/tmp/.uniagent_gitattributes"
             # side session: the agent's own session may still be running whatever it
             # left attached, which would swallow this command until the timeout
+            # a text diff cannot carry a binary (git emits only "Binary files differ", which no
+            # apply command accepts), so binaries the agent left behind are unstaged first
             await self.env.communicate_isolated(
                 f"cd /testbed && printf '*.py diff=python\\n' > {attrs} && git add -A && "
+                "(git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
+                "| xargs -r -d '\\n' git reset -q --) ; "
                 f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
                 f"> {env_patch_file.as_posix()}",
             )
@@ -763,9 +775,11 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             return
         patch_path = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
         await env.write_file(patch_path, patch)
+        # the official harness's ladder (swebench.harness.run_evaluation.GIT_APPLY_CMDS); no
+        # --whitespace=fix, which would rewrite the agent's lines before grading them
         commands = [
-            f"cd /testbed && git apply --whitespace=fix {patch_path.as_posix()}",
-            f"cd /testbed && git apply --reject --whitespace=nowarn {patch_path.as_posix()}",
+            f"cd /testbed && git apply --verbose {patch_path.as_posix()}",
+            f"cd /testbed && git apply --verbose --reject {patch_path.as_posix()}",
             f"cd /testbed && patch --batch --fuzz=5 -p1 -i {patch_path.as_posix()}",
         ]
         last_error: Exception | None = None
