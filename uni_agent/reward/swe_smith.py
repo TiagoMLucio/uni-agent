@@ -298,8 +298,12 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             attrs = "/tmp/.uniagent_gitattributes"
             # side session: the agent's own session may still be running whatever it
             # left attached, which would swallow this command until the timeout
+            # binaries the agent left behind are unstaged: a text diff cannot carry them and
+            # the stub git writes instead makes the whole patch unapplicable
             await self.env.communicate_isolated(
                 f"cd /testbed && printf '*.py diff=python\\n' > {attrs} && git add -A && "
+                "(git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
+                "| xargs -r -d '\\n' git reset -q --) ; "
                 f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
                 f"> {env_patch_file.as_posix()}",
             )
