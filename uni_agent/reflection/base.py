@@ -204,7 +204,7 @@ class AbstractReflector(ABC):
         ``accept(text) -> bool`` decides whether a reply is usable. A reply that parses to
         nothing is a wasted rollout, and contract failures are drawn per sample rather than
         being properties of the trace (measured: zero traces failed in all three repeats of
-        one arm, Cohen's kappa about 0), so re-drawing recovers most of them where rewording
+        one experiment, Cohen's kappa about 0), so re-drawing recovers most of them where rewording
         the prompt does not. Without it, only an over-budget render was ever retried.
         """
         cfg = self.config
