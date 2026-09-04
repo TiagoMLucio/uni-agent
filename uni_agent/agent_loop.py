@@ -307,7 +307,7 @@ class UniAgentLoop(AgentLoopBase):
                     interaction_result["reward_score"] = -100
 
                 reflect_t0 = time.perf_counter()
-                interaction_result["turn_feedback"] = await self._maybe_reflect(
+                interaction_result["turn_hints"] = await self._maybe_reflect(
                     interaction_result, config_dict, validate=bool(kwargs.get("validate"))
                 )
                 interaction_result["metrics"]["reflect"] = time.perf_counter() - reflect_t0
@@ -325,7 +325,7 @@ class UniAgentLoop(AgentLoopBase):
             return output
 
     async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
-        """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: diagnosis}."""
+        """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: hint}."""
         try:
             config = build_reflection_config(config_dict.get("reflection"))
             if not config.enabled or validate:
@@ -428,7 +428,7 @@ class UniAgentLoop(AgentLoopBase):
         if getattr(self, "emit_feedback", False):
             extra_fields["reward_extra_info"] = {"feedback": None}
         extra_fields["turn_spans"] = []
-        extra_fields["turn_feedback"] = []
+        extra_fields["turn_hints"] = []
         extra_fields["global_steps"] = 0
         extra_fields["min_global_steps"] = 0
         extra_fields["max_global_steps"] = 0
@@ -491,7 +491,7 @@ class UniAgentLoop(AgentLoopBase):
             "termination": _termination(trajectory),
             "turns": len(trajectory),
             "condensations": max(len(segments) - 1, 0) if segments else 0,
-            "hinted_turns": len(interaction_result.get("turn_feedback") or {}),
+            "hinted_turns": len(interaction_result.get("turn_hints") or {}),
         }
         patch = interaction_result.get("graded_patch")
         # the diff goes in the output only: metadata stays scalar so it remains filterable
@@ -525,7 +525,7 @@ class UniAgentLoop(AgentLoopBase):
             "identity": getattr(self, "identity", {}),
             "reward_extra_info": interaction_result.get("reward_extra_info") or {},
             "gold_patch": getattr(self.env, "privileged_context", "") or "",
-            "turn_feedback": interaction_result.get("turn_feedback") or {},
+            "turn_hints": interaction_result.get("turn_hints") or {},
         }
         (self.output_dir / "interaction_result.json").write_text(
             json.dumps(save_content, ensure_ascii=False, indent=2, default=str),
@@ -686,7 +686,7 @@ class UniAgentLoop(AgentLoopBase):
 
         num_segments = len(segments)
         self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
-        turn_feedback = interaction_result.get("turn_feedback") or {}
+        turn_hints = interaction_result.get("turn_hints") or {}
         # segments are post-hoc views of work already traced live (segment_index rides on those spans)
         return [
             self._segment_to_output(
@@ -698,7 +698,7 @@ class UniAgentLoop(AgentLoopBase):
                 shared_extra=shared_extra,
                 seg_idx=seg_idx,
                 num_segments=num_segments,
-                turn_feedback=turn_feedback,
+                turn_hints=turn_hints,
             )
             for seg_idx, seg in enumerate(segments)
         ]
@@ -714,7 +714,7 @@ class UniAgentLoop(AgentLoopBase):
         shared_extra: dict,
         seg_idx: int,
         num_segments: int,
-        turn_feedback: dict[int, str] | None = None,
+        turn_hints: dict[int, str] | None = None,
     ) -> AgentLoopOutput:
         """Build one AgentLoopOutput from a single trajectory segment's token buffer."""
         rollout_cache = segment["rollout_cache"]
@@ -753,14 +753,14 @@ class UniAgentLoop(AgentLoopBase):
             for step, start, end in rollout_cache.get("turn_spans") or []
             if start < len(response_ids)
         ]
-        turn_feedback = turn_feedback or {}
+        turn_hints = turn_hints or {}
         # a reflector may return {"text": ..., "at": "call"} instead of plain text; the
         # placement rides as a third element so the trainer can splice mid-turn
-        extra_fields["turn_feedback"] = [
+        extra_fields["turn_hints"] = [
             [step, hint["text"], hint["at"]]
             if isinstance(hint, dict) else [step, hint]
             for step, _, _ in extra_fields["turn_spans"]
-            if (hint := turn_feedback.get(step)) is not None
+            if (hint := turn_hints.get(step)) is not None
         ]
         extra_fields.update(shared_extra)
         extra_fields["segment_index"] = seg_idx
