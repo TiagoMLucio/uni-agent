@@ -856,9 +856,14 @@ class EditTool:
                 )
                 for match in re.finditer(pattern, file_content)
             ]
-            if occurrences and _first_indent(original_old_str) != _first_indent(original_new_str):
-                # the stripped match keeps the file's indentation on the first line and the
-                # model's on the rest, so a reindent asked on a misread line cannot be applied
+            if (
+                occurrences
+                and "\n" in original_old_str.strip()
+                and _first_indent(original_old_str) != _first_indent(original_new_str)
+            ):
+                # on a multi-line edit the stripped match keeps the file's indentation on the first
+                # line and the model's on the rest, so a reindent asked on a misread line cannot be
+                # applied; a single line keeps the file's indentation, as before
                 line_no = occurrences[0][0]
                 safe_print(
                     f"No replacement was performed: old_str does not appear verbatim in {path} (its first "
