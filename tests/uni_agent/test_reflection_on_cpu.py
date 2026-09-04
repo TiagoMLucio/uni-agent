@@ -1004,7 +1004,7 @@ def _traj_step(idx, tools=(), exit_reason="turn_done"):
     )
 
 
-def _maybe_reflect(tmp_path, reflection, trajectory, reply=None):
+def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.0, resolved=False):
     """The real ``UniAgentLoop._maybe_reflect`` over a fake loop; errors fail the test."""
     from uni_agent.agent_loop import UniAgentLoop
 
@@ -1024,8 +1024,9 @@ def _maybe_reflect(tmp_path, reflection, trajectory, reply=None):
         logger=types.SimpleNamespace(critical=_raise),
     )
     result = {
-        "reward_score": 0.0,
-        "reward_extra_info": {"feedback": "f", "resolved": False, "agent_patch": ""},
+        "reward_score": reward_score,
+        "resolved": resolved,
+        "reward_extra_info": {"feedback": "f", "agent_patch": ""},
         "metrics": {},
         "messages": [{"role": "user", "content": "t"}],
         "trajectory": trajectory,
@@ -1033,6 +1034,26 @@ def _maybe_reflect(tmp_path, reflection, trajectory, reply=None):
     }
     hints = asyncio.run(UniAgentLoop._maybe_reflect(loop, result, {"reflection": reflection}, validate=False))
     return hints, model
+
+
+def test_outcome_reads_resolved_from_the_reward_result(tmp_path, monkeypatch):
+    """The reward sets ``resolved`` on its result, never inside reward_extra_info."""
+    from uni_agent import agent_loop as agent_loop_mod
+    from uni_agent.agent_loop import UniAgentLoop
+
+    trajectory = [_traj_step(0), _traj_step(1)]
+    _, model = _maybe_reflect(
+        tmp_path, {"enabled": True, "failed_only": False}, trajectory, reward_score=1.0, resolved=True
+    )
+    assert "resolved: True" in model.messages[1]["content"]
+
+    captured = {}
+    monkeypatch.setattr(agent_loop_mod, "rollout_trace_update_trace", lambda **kw: captured.update(kw))
+    base = {"reward_score": 1.0, "trajectory": trajectory, "segments": None}
+    UniAgentLoop._record_trace_outcome(None, dict(base, resolved=True))
+    assert captured["metadata"]["outcome"]["resolved"] is True
+    UniAgentLoop._record_trace_outcome(None, dict(base, reward_extra_info={"resolved": True}))
+    assert captured["metadata"]["outcome"]["resolved"] is False
 
 
 def test_filter_fields_default_off_and_validate():

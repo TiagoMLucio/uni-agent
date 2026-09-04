@@ -296,8 +296,9 @@ class UniAgentLoop(AgentLoopBase):
                     if isinstance(reward_result, dict):
                         interaction_result["reward_extra_info"] = reward_result.get("reward_extra_info", {})
                         if "resolved" in reward_result:
+                            interaction_result["resolved"] = bool(reward_result["resolved"])
                             rollout_trace_score(
-                                "resolved", int(bool(reward_result["resolved"])), data_type="BOOLEAN"
+                                "resolved", int(interaction_result["resolved"]), data_type="BOOLEAN"
                             )
                         # trace-only: the feedback text rides its own feedback_render span
                         interaction_result["graded_patch"] = reward_result.get("patch")
@@ -350,7 +351,7 @@ class UniAgentLoop(AgentLoopBase):
             termination = _termination(trajectory)
             if termination in config.skip_exit_reasons:
                 return {}
-            resolved = bool((interaction_result.get("reward_extra_info") or {}).get("resolved"))
+            resolved = bool(interaction_result.get("resolved"))
             outcome = (
                 f"resolved: {resolved} | reward: {interaction_result.get('reward_score')} | "
                 f"termination: {termination} | turns: {len(trajectory)}"
@@ -488,7 +489,7 @@ class UniAgentLoop(AgentLoopBase):
         segments = interaction_result.get("segments")
         outcome = {
             "reward_score": interaction_result.get("reward_score"),
-            "resolved": bool((interaction_result.get("reward_extra_info") or {}).get("resolved")),
+            "resolved": bool(interaction_result.get("resolved")),
             "termination": _termination(trajectory),
             "turns": len(trajectory),
             "condensations": max(len(segments) - 1, 0) if segments else 0,
