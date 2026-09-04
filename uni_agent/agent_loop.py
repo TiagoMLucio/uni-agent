@@ -505,6 +505,7 @@ class UniAgentLoop(AgentLoopBase):
         # turn's tokens live in exactly one grid. rollout_cache above is only the final buffer;
         # without the rest, offline scoring of a hint on an earlier turn has nothing to score against.
         segments = interaction_result.get("segments") or []
+        segments = [seg for seg in segments if len(seg["rollout_cache"].get("response_mask", [])) > 0]
         if len(segments) > 1:
             grids = [{f: seg["rollout_cache"].get(f) for f in SEGMENT_GRID_FIELDS} for seg in segments]
             with (self.output_dir / "segment_grids.pkl").open("wb") as f:

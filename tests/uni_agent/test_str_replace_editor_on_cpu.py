@@ -437,3 +437,25 @@ def test_did_you_mean_resend_is_conditional(tmp_path):
     out = run_edit_dym(f, "        a()\n        b()")
     assert "If this is the region you meant to change" in out
     assert "view the file and locate the right region" in out
+
+
+def _run_insert(path, line, text):
+    import pathlib
+    import subprocess
+    import sys
+
+    script = pathlib.Path(__file__).resolve().parents[2] / "uni_agent" / "tools" / "str_replace_editor" / "str_replace_editor"
+    return subprocess.run([sys.executable, str(script), "insert", "--path", str(path), "--insert_line", str(line),
+                           "--new_str", text], capture_output=True, text=True).stdout
+
+
+def test_insert_goes_after_the_named_line_and_keeps_tabs(tmp_path):
+    f = write(tmp_path, "all:\n\t@echo hi\n\t@echo bye\n")
+    _run_insert(f, 1, "\t@echo new")
+    assert f.read_text() == "all:\n\t@echo new\n\t@echo hi\n\t@echo bye\n"
+
+
+def test_insert_at_zero_is_the_top(tmp_path):
+    f = write(tmp_path, "a = 1\n")
+    _run_insert(f, 0, "# top")
+    assert f.read_text() == "# top\na = 1\n"

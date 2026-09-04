@@ -160,12 +160,17 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         try:
             f2p_files, p2p_files = rp.get_test_files(instance)
             test_files = sorted(set(f2p_files + p2p_files))
-        except Exception:
+        except Exception as e:
             test_files = []
+            result["eval_error"] = f"test files unavailable, the agent's test edits cannot be reverted: {type(e).__name__}: {e}"
 
         # The agent's diff IS the prediction we evaluate, so we always need it.
         with rollout_trace_span("patch_extract") as patch_span:
-            patch = await self._get_interaction_env_patch()
+            try:
+                patch = await self._get_interaction_env_patch()
+            except Exception as e:
+                patch = ""
+                result["eval_error"] = f"patch harvest failed: {type(e).__name__}: {e}"
             if patch_span is not None:
                 patch_span.update(
                     output=trace_clip(patch, TRACE_PATCH_CHARS),
@@ -180,6 +185,8 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         eval_env = self.env
         sibling = None
         try:
+            if result.get("eval_error"):
+                raise RuntimeError(result["eval_error"])
             with rollout_trace_span("eval_env_setup", metadata={"isolate": self.isolate}) as env_span:
                 if self.isolate:
                     env_config = kwargs.get("env_config") or self.env_config
@@ -199,7 +206,6 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     check="ignore",
                 )
                 result["eval_execution_time"] = time.perf_counter() - execution_t0
-                result["eval_completed"] = True
 
                 # Strip ANSI escapes / carriage returns before parsing.
                 output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
@@ -208,6 +214,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                 result["eval_report"] = eval_report
                 self.logger.info(f"Eval report: {eval_report}")
                 result["resolved"] = eval_report["resolved"]
+                result["eval_completed"] = True
                 if not eval_report["found_eval_status"] and APPLY_PATCH_FAIL in output:
                     result["patch_apply_failed"] = True
                 if tests_span is not None:
@@ -225,6 +232,8 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     )
         except Exception as e:
             self.logger.error(f"Failed to evaluate: {e}")
+            result["eval_completed"] = False
+            result["eval_error"] = f"{type(e).__name__}: {e}"
         finally:
             if sibling is not None:
                 try:
@@ -310,7 +319,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             return await self.env.read_file(env_patch_file)
         except Exception as e:
             self.logger.error(f"Failed to get interaction environment patch: {e}")
-            return ""
+            raise
 
     @auto_await
     async def _apply_patch(self, patch: str, reverse: bool = False) -> None:

@@ -26,7 +26,7 @@ class XMLToolParser:
         # Regex patterns
         self.tool_call_complete_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
         self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
-        self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>|<function=(.*)$", regex.DOTALL)
+        self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>", regex.DOTALL)
         self.tool_call_parameter_regex = regex.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", regex.DOTALL
         )
@@ -173,8 +173,10 @@ class XMLToolParser:
         raw_tool_calls = self.tool_call_regex.findall(model_output)
         raw_function_calls = []
         for tool_call in raw_tool_calls:
+            if tool_call.count("<function=") > tool_call.count("</function>"):
+                raise FunctionCallFormatError("Unclosed tool call: missing </function>, so the call was not executed.")
             raw_function_calls.extend(self.tool_call_function_regex.findall(tool_call))
-        return [match[0] if match[0] else match[1] for match in raw_function_calls]
+        return raw_function_calls
 
     def extract_tool_calls(
         self, model_output: str, tools: list[OpenAIFunctionToolSchema]
@@ -333,8 +335,7 @@ class SweStarXMLToolParser(XMLToolParser):
     is what our own rollouts emit."""
 
     def _get_function_calls(self, model_output: str) -> list[str]:
-        matches = self.tool_call_function_regex.findall(model_output)
-        return [m[0] if m[0] else m[1] for m in matches]
+        return self.tool_call_function_regex.findall(model_output)
 
     def extract_tool_calls(
         self, model_output: str, tools: list[OpenAIFunctionToolSchema]

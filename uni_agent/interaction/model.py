@@ -172,6 +172,12 @@ class AgentChatModel:
         rollout_cache["prompt_ids"] += response_ids
         rollout_cache["response_mask"] += [1] * len(response_ids)
         if token_output.log_probs is not None:
+            expected = len(rollout_cache["response_mask"]) - len(response_ids)
+            if len(rollout_cache["response_logprobs"]) != expected:
+                raise RuntimeError(
+                    f"response_logprobs ({len(rollout_cache['response_logprobs'])}) out of step with "
+                    f"response_mask ({expected}): an earlier turn returned no log-probs"
+                )
             rollout_cache["response_logprobs"] += token_output.log_probs
         if token_output.routed_experts is not None:
             rollout_cache["routed_experts"] = token_output.routed_experts

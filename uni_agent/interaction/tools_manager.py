@@ -124,7 +124,7 @@ class ToolsManager:
 
         # Append all other parameters
         for param_key, param_value in func_params.items():
-            if param_key == "command":
+            if param_key == "command" or param_value is None:
                 continue
 
             # Use JSON for structured types so the script can json.loads them

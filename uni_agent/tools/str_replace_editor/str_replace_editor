@@ -947,7 +947,7 @@ class EditTool:
         self.write_file(path, new_file_content)
 
         # Save the content to history
-        self._file_history[path].append(file_content)
+        self._file_history[str(path)].append(file_content)
 
         # Create a snippet of the edited section
         replacement_line = file_content.count("\n", 0, idx)
@@ -971,11 +971,10 @@ class EditTool:
 
     def insert(self, path: Path, insert_line: int, new_str: str):
         """Implement the insert command, which inserts new_str at the specified line in the file content."""
-        file_text = self.read_file(path).expandtabs()
-        new_str = new_str.expandtabs()
+        file_text = self.read_file(path)
         file_text_lines = file_text.split("\n")
         n_lines_file = len(file_text_lines)
-        insert_line -= 1  # Convert to 0-based index
+        # insert_line is 1-based and the text goes AFTER it; 0 means the top of the file
 
         if insert_line < 0 or insert_line > n_lines_file:
             safe_print(
@@ -996,7 +995,7 @@ class EditTool:
         snippet = "\n".join(snippet_lines)
 
         self.write_file(path, new_file_text)
-        self._file_history[path].append(file_text)
+        self._file_history[str(path)].append(file_text)
 
         # todo: Also expand these windows
 
@@ -1014,11 +1013,11 @@ class EditTool:
 
     def undo_edit(self, path: Path):
         """Implement the undo_edit command."""
-        if not self._file_history[path]:
+        if not self._file_history[str(path)]:
             safe_print(f"No edit history found for {path}.")
             sys.exit()
 
-        old_text = self._file_history[path].pop()
+        old_text = self._file_history[str(path)].pop()
         self.write_file(path, old_text)
 
         safe_print(f"Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}")

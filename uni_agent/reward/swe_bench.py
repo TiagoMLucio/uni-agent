@@ -621,7 +621,11 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         patch: str | None = None
         if self.isolate or self.feedback.enabled:
             with rollout_trace_span("patch_extract") as patch_span:
-                patch = await self._get_interaction_env_patch()
+                try:
+                    patch = await self._get_interaction_env_patch()
+                except Exception as e:
+                    patch = ""
+                    result["eval_error"] = f"patch harvest failed: {type(e).__name__}: {e}"
                 if patch_span is not None:
                     patch_span.update(
                         output=trace_clip(patch, TRACE_PATCH_CHARS),
@@ -632,6 +636,8 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         eval_env = self.env
         sibling = None
         try:
+            if result.get("eval_error"):
+                raise RuntimeError(result["eval_error"])
             with rollout_trace_span("eval_env_setup", metadata={"isolate": self.isolate}) as env_span:
                 if self.isolate:
                     env_config = kwargs.get("env_config") or self.env_config
@@ -657,7 +663,6 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                 output = await eval_env.communicate(cmd_str, timeout=self.eval_timeout, check="ignore")
 
                 execution_time = time.perf_counter() - execution_t0
-                result["eval_completed"] = True
                 result["eval_execution_time"] = execution_time
 
                 # Remove ANSI escape codes and \r
@@ -667,6 +672,7 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                 result["eval_report"] = eval_report
                 self.logger.info(f"Eval report: {eval_report}")
                 result["resolved"] = eval_report["resolved"]
+                result["eval_completed"] = True
                 if tests_span is not None:
                     tests_span.update(
                         output={
@@ -681,6 +687,8 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                     )
         except Exception as e:
             self.logger.error(f"Failed to evaluate: {e}")
+            result["eval_completed"] = False
+            result["eval_error"] = f"{type(e).__name__}: {e}"
         finally:
             if sibling is not None:
                 try:
@@ -762,8 +770,8 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             patch_content = await self.env.read_file(env_patch_file)
             return patch_content
         except Exception as e:
-            self.logger.error(f"Failed to get interaction environment patch: {e}")
-            return ""
+            self.logger.error(f"Failed to get patch: {e}")
+            raise
 
     @auto_await
     async def _apply_patch(self, patch: str, env=None) -> None:

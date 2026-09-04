@@ -125,6 +125,8 @@ class _SshMaster:
                 except subprocess.CalledProcessError as exc:
                     last = exc
             detail = (getattr(last, "stderr", "") or "").strip() or "<no stderr>"
+            # a master that cannot forward is dead; the next _ensure starts a fresh one
+            self._started = False
             raise RuntimeError(f"ssh -O forward failed for remote port {remote_port}: {detail}") from last
 
     async def cancel(self, local_port: int, remote_port: int) -> None:
@@ -214,7 +216,7 @@ class SshPodmanDeployment(AbstractDeployment):
         last: IsAliveResponse | None = None
         while loop.time() < end:
             last = await self.is_alive(timeout=5.0)
-            if last:
+            if last.is_alive:
                 return last
             await asyncio.sleep(0.5)
         # no stop() here: the caller's retry handler fetches container logs before tearing down

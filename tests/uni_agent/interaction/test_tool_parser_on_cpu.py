@@ -112,3 +112,14 @@ def test_hermes_unclosed_raises():
     cut = '<tool_call>\n{"name": "str_replace_editor", "arguments": {"command": "vi'
     with pytest.raises(FunctionCallFormatError, match="Unclosed tool call"):
         HermesToolParser().extract_tool_calls(cut, TOOLS)
+
+
+def test_closed_block_with_unclosed_function_raises():
+    from uni_agent.interaction.tool_parser import FunctionCallFormatError, XMLToolParser
+
+    text = (
+        "<tool_call>\n<function=str_replace_editor>\n<parameter=command>str_replace</parameter>\n"
+        "<parameter=path>/testbed/a.py</parameter>\n<parameter=old_str>def f():\n    return 1\n</tool_call>"
+    )
+    with pytest.raises(FunctionCallFormatError, match="missing </function>"):
+        XMLToolParser()._get_function_calls(text)
