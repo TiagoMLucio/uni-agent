@@ -395,9 +395,12 @@ class UniAgentLoop(AgentLoopBase):
                 cutoff = first_editor_error_step(turns)
                 if cutoff is not None:
                     hints = {step: hint for step, hint in hints.items() if step < cutoff}
+            if not hints:
+                interaction_result.setdefault("metrics", {})["reflect_empty"] = 1.0
             return hints
         except Exception as e:  # hints are optional supervision; never kill the rollout over them
             self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
+            interaction_result.setdefault("metrics", {})["reflect_failed"] = 1.0
             return {}
 
     async def _build_empty_agent_output(self, exit_reason: str) -> AgentLoopOutput:
