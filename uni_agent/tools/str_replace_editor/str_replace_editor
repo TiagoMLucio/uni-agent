@@ -88,6 +88,11 @@ def save_history(history: Dict[str, List[str]]):
         pass
 
 
+def _first_indent(text: str) -> int:
+    first = text.split("\n", 1)[0]
+    return len(first) - len(first.lstrip(" \t"))
+
+
 def _describe_old_str(old_str: str) -> str:
     """Compact identifier for a failed old_str, replacing the full echo."""
     lines = old_str.split("\n")
@@ -839,6 +844,7 @@ class EditTool:
             # We found no occurrences, possibly because of extra white spaces at either the front or back of the string.
             # Remove the white spaces and try again.
             original_old_str = old_str
+            original_new_str = new_str
             old_str = old_str.strip()
             new_str = new_str.strip()
             pattern = re.escape(old_str)
@@ -850,6 +856,17 @@ class EditTool:
                 )
                 for match in re.finditer(pattern, file_content)
             ]
+            if occurrences and _first_indent(original_old_str) != _first_indent(original_new_str):
+                # the stripped match keeps the file's indentation on the first line and the
+                # model's on the rest, so a reindent asked on a misread line cannot be applied
+                line_no = occurrences[0][0]
+                safe_print(
+                    f"No replacement was performed: old_str does not appear verbatim in {path} (its first "
+                    f"line is indented {_first_indent(original_old_str)} spaces; line {line_no} of the file is "
+                    f"not), and new_str changes that line's indentation. Copy the line exactly as the file "
+                    f"shows it, then state the new indentation in new_str."
+                )
+                sys.exit()
             if not occurrences:
                 if EXPLAIN_EDIT_FAILURES:
                     # No echo of old_str: the agent just wrote it, and repeated copies both

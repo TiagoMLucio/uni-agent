@@ -169,6 +169,13 @@ class AgentChatModel:
         }
         metrics["capped_turns"] = metrics.get("capped_turns", 0) + int(generation_info["capped"])
         response_ids = token_output.token_ids
+        # checked before the append: a generation that crosses the budget is regenerated in the
+        # condensed segment, so leaving it here would train the same step twice
+        if len(rollout_cache["prompt_ids"]) + len(response_ids) >= limit:
+            raise MaxTokenExceededError(
+                f"prompt_ids length {len(rollout_cache['prompt_ids']) + len(response_ids)} exceeds "
+                f"max_model_len {limit}\nGenerated response:\n{self.tokenizer.decode(response_ids)}"
+            )
         rollout_cache["prompt_ids"] += response_ids
         rollout_cache["response_mask"] += [1] * len(response_ids)
         if token_output.log_probs is not None:
@@ -200,12 +207,6 @@ class AgentChatModel:
             },
             num_preempted=token_output.num_preempted,
         )
-
-        if len(rollout_cache["prompt_ids"]) >= limit:
-            raise MaxTokenExceededError(
-                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {limit}\n"
-                f"Generated response:\n{response_str}"
-            )
 
         return response_str, [], rollout_cache, generation_info
 

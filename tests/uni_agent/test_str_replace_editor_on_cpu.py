@@ -459,3 +459,17 @@ def test_insert_at_zero_is_the_top(tmp_path):
     f = write(tmp_path, "a = 1\n")
     _run_insert(f, 0, "# top")
     assert f.read_text() == "# top\na = 1\n"
+
+
+def test_strip_fallback_refuses_a_reindent_of_a_misread_line(tmp_path):
+    f = write(tmp_path, "class A:\n       def g(self):\n            return 1\n")
+    out = run_edit(f, "        def g(self):\n            return 1", "    def g(self):\n        return 2")
+    assert "changes that line's indentation" in out
+    assert f.read_text() == "class A:\n       def g(self):\n            return 1\n", "file untouched"
+
+
+def test_strip_fallback_still_applies_a_pure_slip(tmp_path):
+    f = write(tmp_path, "class A:\n       def g(self):\n            return 1\n")
+    out = run_edit(f, "        def g(self):\n            return 1", "        def g(self):\n            return 2")
+    assert "has been edited" in out
+    assert f.read_text() == "class A:\n       def g(self):\n            return 2\n"
