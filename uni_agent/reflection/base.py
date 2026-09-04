@@ -244,7 +244,7 @@ class AbstractReflector(ABC):
                 self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap)
                 if accept is None or accept(text):
                     return text
-                rejected = text if rejected is None else rejected
+                rejected = text
                 self.logger.info(f"Reflection reply unusable (attempt {attempt + 1}/{len(ladder)}, "
                                  f"obs_cap={obs_cap}); re-drawing")
                 continue

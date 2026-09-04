@@ -205,11 +205,6 @@ class UniAgentLoop(AgentLoopBase):
                                     if self.skills_manager is not None:
                                         await self.env.install_skills(self.skills_manager)
                                         self.interaction.inject_skills_manifest()
-                                if env_span is not None:
-                                    env_span.update(
-                                        output={"status": "ready", "attempts": attempt + 1},
-                                        metadata={"retried": attempt > 0},
-                                    )
                                 break
                             except Exception as e:
                                 if attempt == setup_retries:
@@ -232,7 +227,8 @@ class UniAgentLoop(AgentLoopBase):
                         if env_span is not None:
                             env_span.update(
                                 output={"status": "ready", "attempts": attempt + 1,
-                                        "tools_installed": len(self.tools_manager.tools)}
+                                        "tools_installed": len(self.tools_manager.tools)},
+                                metadata={"retried": attempt > 0},
                             )
 
                     setup_done = True

@@ -127,7 +127,7 @@ class LocalDeployment(AbstractDeployment):
         last: IsAliveResponse | None = None
         while loop.time() < end:
             last = await self.is_alive(timeout=5.0)
-            if last:
+            if last.is_alive:
                 return last
             await asyncio.sleep(0.5)
         raise TimeoutError(

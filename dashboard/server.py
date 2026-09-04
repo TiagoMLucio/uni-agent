@@ -152,8 +152,8 @@ class DashboardMonitor:
                 try:
                     self._scan_run(Path(entry.path))
                 except OSError:
-                    # a live log dir races with whatever writes it; drop this round
-                    seen_run_ids.discard(entry.name)
+                    # a live log dir races with whatever writes it; keep the run, skip this round
+                    pass
 
             removed_run_ids = sorted(set(self.runs) - seen_run_ids)
             for run_id in removed_run_ids:
