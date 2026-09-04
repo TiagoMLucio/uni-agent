@@ -20,6 +20,7 @@ Notes for using the `str_replace` command:
 * The `old_str` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
 * If the `old_str` parameter is not unique in the file, the replacement will not be performed. Make sure to include enough context in `old_str` to make it unique
 * The `new_str` parameter should contain the edited lines that should replace the `old_str`
+* If `old_str` is not found, the error names the closest matching lines and exactly how your string differs from the file. Correct your next attempt with that description; do not resend the same string
 """.strip()
 
 

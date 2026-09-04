@@ -1,6 +1,7 @@
 import asyncio
 import json
 import pickle
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -17,16 +18,26 @@ from uni_agent.interaction import (
     ToolsManager,
     ToolsManagerConfig,
 )
+from uni_agent.reflection import build_reflection_config, first_editor_error_step, load_reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
+    TRACE_PATCH_CHARS,
     register_langfuse_op,
-    rollout_trace_event,
     rollout_trace_op,
     rollout_trace_score,
+    rollout_trace_span,
+    rollout_trace_update_span,
+    rollout_trace_update_trace,
+    trace_clip,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
+
+#: What a saved segment grid keeps: enough to locate a turn's tokens and rebuild the training
+#: row for it. `response_logprobs` is the sampler's own log-prob per token, which the SDPO loss
+#: uses as `old_log_probs` for its IS ratio, so it cannot be recomputed after the fact.
+SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn_spans")
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -48,8 +59,18 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
     return result
 
 
-# trace root, named "rollout"; token-id I/O omitted (huge payloads)
-register_langfuse_op("UniAgentLoop.run", no_io=True, as_type="agent", root=True, name="rollout")
+# trace root; token-id I/O omitted (huge payloads)
+register_langfuse_op("UniAgentLoop.run", no_io=True, as_type="agent", root=True, name="agent_loop")
+
+
+def _termination(trajectory) -> str:
+    """Terminal status of a trajectory: the last step's abnormal exit_reason, else finished/max_turns."""
+    last = trajectory[-1] if trajectory else None
+    return (
+        last.exit_reason
+        if last is not None and last.exit_reason not in ("", "turn_done")
+        else ("finished" if last is not None and last.done else "max_turns")
+    )
 
 
 class UniAgentLoop(AgentLoopBase):
@@ -113,6 +134,33 @@ class UniAgentLoop(AgentLoopBase):
         else:
             self.reward_spec = None
 
+        # trace identity up front: survives even if the final outcome update is lost on kill
+        task_text = next(
+            (m.get("content", "") for m in kwargs.get("raw_prompt") or [] if m.get("role") == "user"), ""
+        )
+        reward_meta = (config_dict.get("reward") or {}).get("metadata") or {}
+        image = ((config_dict.get("env") or {}).get("deployment") or {}).get("image")
+        identity = {
+            "run_id": self.run_id,
+            "uid": kwargs.get("uid"),
+            "data_source": kwargs.get("data_source"),
+            "instance_id": reward_meta.get("instance_id"),
+            "image": image,
+            "model": self.config.actor_rollout_ref.model.path,
+        }
+        self.identity = identity
+        rollout_trace_update_trace(
+            input=task_text or None, metadata={k: v for k, v in identity.items() if v is not None}
+        )
+        rollout_trace_update_span(
+            input={
+                "model": self.config.actor_rollout_ref.model.path,
+                "image": image,
+                "max_turns": (config_dict.get("interaction") or {}).get("max_turns"),
+                "tools": [t.get("name") for t in config_dict.get("tools") or [] if isinstance(t, dict)],
+            }
+        )
+
         async with self._semaphore:
             add_file_handler(self.output_dir / "run.log", self.run_id)
 
@@ -125,56 +173,236 @@ class UniAgentLoop(AgentLoopBase):
             self.logger.info(f"output_dir: {self.output_dir}")
             # cap the setup phase: one wedged env.start would stall the whole gathered step
             setup_timeout = config_dict.get("setup_timeout", 300)
+            setup_retries = config_dict.get("setup_retries", 2)
             setup_done = False
             try:
-                async with asyncio.timeout(setup_timeout):
-                    await self.env.start()
+                with rollout_trace_span("rollout", as_type="chain") as rollout_span:
+                    env_setup_t0 = time.perf_counter()
+                    with rollout_trace_span(
+                        "env_setup", metadata={"image": image, "timeout_s": setup_timeout}
+                    ) as env_span:
+                        # Setup is idempotent (each attempt builds a fresh sandbox), so a
+                        # transient infrastructure stall must not cost the rollout: one
+                        # node-wide ~2min freeze killed 7 in-flight rollouts at the same
+                        # instant, each scored 0 for something the agent never saw.
+                        for attempt in range(setup_retries + 1):
+                            try:
+                                async with asyncio.timeout(setup_timeout):
+                                    await self.env.start()
 
-                    # tools schemas should be visible to the model
-                    # to generate correct tool call format in response
-                    self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
-                    await self.env.install_tools(self.tools_manager.tools)
-                    if self.skills_manager is not None:
-                        await self.env.install_skills(self.skills_manager)
-                        self.interaction.inject_skills_manifest()
+                                    # tools schemas should be visible to the model
+                                    # to generate correct tool call format in response.
+                                    # declare_tools=false suppresses the template's tool
+                                    # block for scaffolds whose system prompt documents
+                                    # the tools inline; declaring them twice would also
+                                    # advertise a call format the model was not trained on.
+                                    self.chat_model.set_tools_schemas(
+                                        self.tools_manager.tools_schemas
+                                        if config_dict.get("declare_tools", True)
+                                        else None
+                                    )
+                                    await self.env.install_tools(self.tools_manager.tools)
+                                    if self.skills_manager is not None:
+                                        await self.env.install_skills(self.skills_manager)
+                                        self.interaction.inject_skills_manifest()
+                                break
+                            except Exception as e:
+                                if attempt == setup_retries:
+                                    raise
+                                self.logger.error(
+                                    f"env setup failed ({type(e).__name__}: {e}); rebuilding the "
+                                    f"sandbox, attempt {attempt + 2}/{setup_retries + 1}"
+                                )
+                                try:
+                                    # bounded: a stalled node can hang teardown too, and that
+                                    # time is outside the per-attempt budget
+                                    async with asyncio.timeout(30):
+                                        await self.env.close()
+                                except Exception as close_err:
+                                    self.logger.warning(f"could not close the broken sandbox: {close_err}")
+                                self.env = self._init_env(config_dict["env"])
+                                self.interaction.env = self.env
+                                if self.reward_spec is not None:
+                                    self.reward_spec.env = self.env
+                        if env_span is not None:
+                            env_span.update(
+                                output={"status": "ready", "attempts": attempt + 1,
+                                        "tools_installed": len(self.tools_manager.tools)},
+                                metadata={"retried": attempt > 0},
+                            )
 
-                setup_done = True
-                interaction_result = await self.interaction.run()
-                interaction_result["metrics"] = dict(interaction_result.get("rollout_cache", {}).get("metrics", {}))
+                    setup_done = True
+                    env_setup_s = time.perf_counter() - env_setup_t0
+                    interaction_result = await self.interaction.run()
+                    interaction_result["metrics"] = dict(
+                        interaction_result.get("rollout_cache", {}).get("metrics", {})
+                    )
+                    # env setup and reward run outside the turn loop, so they are invisible in
+                    # execution_time; without them a trajectory's wall clock cannot be accounted for
+                    interaction_result["metrics"]["env_setup"] = env_setup_s
+                    interaction_result["metrics"]["loop_wall"] = interaction_result.get("execution_time", 0.0)
+                    if rollout_span is not None:
+                        trajectory = interaction_result.get("trajectory") or []
+                        rollout_span.update(
+                            output={"turns": len(trajectory), "termination": _termination(trajectory)}
+                        )
+
+                # a command the agent left attached would swallow reward-side session
+                # commands until their timeout; free the session before reward runs
+                if setup_done:
+                    try:
+                        await self.env.clear_attached()
+                    except Exception as e:
+                        self.logger.warning(f"Failed to clear attached command at loop end: {e}")
 
                 # interaction environment should be visible to the reward spec
                 if self.reward_spec is not None:
                     if should_break("reward"):
                         breakpoint()
-                    reward_score, reward_result = await self.reward_spec.compute_reward(
-                        interaction_result=interaction_result,
-                        env_config=config_dict["env"],
-                    )
+                    reward_t0 = time.perf_counter()
+                    with rollout_trace_span("reward", as_type="evaluator") as reward_span:
+                        reward_score, reward_result = await self.reward_spec.compute_reward(
+                            interaction_result=interaction_result,
+                            env_config=config_dict["env"],
+                        )
+                        if reward_span is not None:
+                            reward_span.update(
+                                output={
+                                    "reward_score": reward_score,
+                                    "resolved": (reward_result or {}).get("resolved")
+                                    if isinstance(reward_result, dict)
+                                    else None,
+                                }
+                            )
+                    interaction_result["metrics"]["reward_eval"] = time.perf_counter() - reward_t0
+                    if isinstance(reward_result, dict):
+                        # reward_eval covers the sibling container end to end; this is the
+                        # test run alone, so the difference is what its setup cost
+                        if reward_result.get("eval_execution_time") is not None:
+                            interaction_result["metrics"]["eval_execution"] = float(
+                                reward_result["eval_execution_time"]
+                            )
+                        interaction_result["metrics"]["eval_completed"] = float(
+                            bool(reward_result.get("eval_completed", True))
+                        )
+                        interaction_result["metrics"]["patch_apply_failed"] = float(
+                            bool(reward_result.get("patch_apply_failed", False))
+                        )
+                        interaction_result["metrics"]["empty_patch"] = float(
+                            bool(reward_result.get("empty_patch", False))
+                        )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
                     if isinstance(reward_result, dict):
                         interaction_result["reward_extra_info"] = reward_result.get("reward_extra_info", {})
                         if "resolved" in reward_result:
+                            interaction_result["resolved"] = bool(reward_result["resolved"])
                             rollout_trace_score(
-                                "resolved", int(bool(reward_result["resolved"])), data_type="BOOLEAN"
+                                "resolved", int(interaction_result["resolved"]), data_type="BOOLEAN"
                             )
-                        # persist the textual eval report; only scalar scores are traced otherwise
-                        feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback")
-                        if feedback:
-                            rollout_trace_event("reward_feedback", output=feedback)
+                        # trace-only: the feedback text rides its own feedback_render span
+                        interaction_result["graded_patch"] = reward_result.get("patch")
                 else:
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
 
+                reflect_t0 = time.perf_counter()
+                interaction_result["turn_hints"] = await self._maybe_reflect(
+                    interaction_result, config_dict, validate=bool(kwargs.get("validate"))
+                )
+                interaction_result["metrics"]["reflect"] = time.perf_counter() - reflect_t0
+                self._record_trace_outcome(interaction_result)
                 self._save_interaction_result(interaction_result)
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
                 exit_reason = "setup_timeout" if not setup_done and isinstance(e, TimeoutError) else "agent_loop_failed"
                 self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {e!r}")
+                outcome = {"termination": exit_reason}
+                rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
                 output = [await self._build_empty_agent_output(exit_reason=exit_reason)]
             finally:
                 await self.env.close()
             return output
+
+    async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
+        """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: hint}."""
+        try:
+            config = build_reflection_config(config_dict.get("reflection"))
+            if not config.enabled or validate:
+                return {}
+            if config.failed_only and interaction_result.get("reward_score"):
+                return {}
+            # hinting a trajectory whose eval never ran would teach against an unknown label
+            if (interaction_result.get("metrics") or {}).get("eval_completed", 1.0) < 1.0:
+                return {}
+            # SWE-smith's dataset `patch` is the diff that *introduced* the bug, so the env
+            # captures the real fix at setup; benchmarks whose `patch` is already the solution
+            # (SWE-bench) leave privileged_setup_cmd unset and fall through to it.
+            gold = getattr(self.env, "privileged_context", "") or (
+                ((config_dict.get("reward") or {}).get("metadata") or {}).get("patch") or ""
+            )
+            feedback = (interaction_result.get("reward_extra_info") or {}).get("feedback") or ""
+            task = next(
+                (m.get("content", "") for m in interaction_result.get("messages") or [] if m.get("role") == "user"),
+                "",
+            )
+            trajectory = interaction_result.get("trajectory") or []
+            steps = {step.step_idx: step for step in trajectory}
+            termination = _termination(trajectory)
+            if termination in config.skip_exit_reasons:
+                return {}
+            resolved = bool(interaction_result.get("resolved"))
+            outcome = (
+                f"resolved: {resolved} | reward: {interaction_result.get('reward_score')} | "
+                f"termination: {termination} | turns: {len(trajectory)}"
+            )
+            segments = interaction_result.get("segments") or [{"rollout_cache": interaction_result["rollout_cache"]}]
+            # a turn lives in exactly one segment's spans: the union ordered by step is the full turn table
+            turns = sorted(
+                (
+                    {
+                        "step": step_idx,
+                        "tokens": end - start,
+                        "response": steps[step_idx].response,
+                        "tools": [
+                            {"name": r.name, "action": r.action, "observation": r.observation}
+                            for r in steps[step_idx].tool_results
+                        ],
+                    }
+                    for segment in segments
+                    for step_idx, start, end in segment["rollout_cache"].get("turn_spans") or []
+                    if step_idx in steps
+                ),
+                key=lambda turn: turn["step"],
+            )
+            if not turns:
+                return {}
+            from verl.utils.debug_breakpoints import should_break
+
+            if should_break("reflection"):
+                breakpoint()
+            reflector = load_reflector(
+                self.chat_model, config, run_id=self.run_id,
+                record_path=self.output_dir / "reflection.jsonl.gz", identity=self.identity)
+            hints = await reflector.reflect_trajectory(
+                task=task,
+                turns=turns,
+                gold=gold,
+                feedback=feedback,
+                outcome=outcome,
+                agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
+            )
+            if config.hint_cutoff_on_editor_error:
+                cutoff = first_editor_error_step(turns)
+                if cutoff is not None:
+                    hints = {step: hint for step, hint in hints.items() if step < cutoff}
+            if not hints:
+                interaction_result.setdefault("metrics", {})["reflect_empty"] = 1.0
+            return hints
+        except Exception as e:  # hints are optional supervision; never kill the rollout over them
+            self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
+            interaction_result.setdefault("metrics", {})["reflect_failed"] = 1.0
+            return {}
 
     async def _build_empty_agent_output(self, exit_reason: str) -> AgentLoopOutput:
         self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
@@ -196,11 +424,11 @@ class UniAgentLoop(AgentLoopBase):
         dummy_response_length = min(512, max_response_length)
 
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
-        # TODO: implement traj_mask in verl
-        extra_fields["traj_masked"] = 1
         extra_fields["traj_exit_reason"] = exit_reason
         if getattr(self, "emit_feedback", False):
             extra_fields["reward_extra_info"] = {"feedback": None}
+        extra_fields["turn_spans"] = []
+        extra_fields["turn_hints"] = []
         extra_fields["global_steps"] = 0
         extra_fields["min_global_steps"] = 0
         extra_fields["max_global_steps"] = 0
@@ -253,11 +481,37 @@ class UniAgentLoop(AgentLoopBase):
             self.logger.info(f"routed_experts replay shape resolved: {cls._routing_replay_shape}")
         return cls._routing_replay_shape
 
+    def _record_trace_outcome(self, interaction_result: dict) -> None:
+        """Publish the loop outcome as the trace output (+ filterable metadata)."""
+        trajectory = interaction_result.get("trajectory") or []
+        segments = interaction_result.get("segments")
+        outcome = {
+            "reward_score": interaction_result.get("reward_score"),
+            "resolved": bool(interaction_result.get("resolved")),
+            "termination": _termination(trajectory),
+            "turns": len(trajectory),
+            "condensations": max(len(segments) - 1, 0) if segments else 0,
+            "hinted_turns": len(interaction_result.get("turn_hints") or {}),
+        }
+        patch = interaction_result.get("graded_patch")
+        # the diff goes in the output only: metadata stays scalar so it remains filterable
+        output = dict(outcome, patch=trace_clip(patch, TRACE_PATCH_CHARS)) if patch else outcome
+        rollout_trace_update_trace(output=output, metadata={"outcome": outcome})
+
     def _save_interaction_result(self, interaction_result: dict):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # rollout_cache: binary pickle for fast I/O (no readability needed)
         with (self.output_dir / "rollout_cache.pkl").open("wb") as f:
             pickle.dump(interaction_result["rollout_cache"], f, protocol=pickle.HIGHEST_PROTOCOL)
+        # A condensation starts a new segment, and each segment becomes its own training row, so a
+        # turn's tokens live in exactly one grid. rollout_cache above is only the final buffer;
+        # without the rest, offline scoring of a hint on an earlier turn has nothing to score against.
+        segments = interaction_result.get("segments") or []
+        segments = [seg for seg in segments if len(seg["rollout_cache"].get("response_mask", [])) > 0]
+        if len(segments) > 1:
+            grids = [{f: seg["rollout_cache"].get(f) for f in SEGMENT_GRID_FIELDS} for seg in segments]
+            with (self.output_dir / "segment_grids.pkl").open("wb") as f:
+                pickle.dump(grids, f, protocol=pickle.HIGHEST_PROTOCOL)
         # rest: readable JSON
         save_content = {
             "trajectory": [s.model_dump() for s in interaction_result["trajectory"]],
@@ -265,6 +519,13 @@ class UniAgentLoop(AgentLoopBase):
             "messages": interaction_result["messages"],
             "metrics": interaction_result.get("metrics", {}),
             "reward_score": interaction_result.get("reward_score", None),
+            # Everything downstream analysis needs, so a rollout log is self-describing and
+            # offline tooling never has to reconstruct it from a trace backend that may have
+            # dropped events. Written on the training filesystem, never in the agent's sandbox.
+            "identity": getattr(self, "identity", {}),
+            "reward_extra_info": interaction_result.get("reward_extra_info") or {},
+            "gold_patch": getattr(self.env, "privileged_context", "") or "",
+            "turn_hints": interaction_result.get("turn_hints") or {},
         }
         (self.output_dir / "interaction_result.json").write_text(
             json.dumps(save_content, ensure_ascii=False, indent=2, default=str),
@@ -310,18 +571,30 @@ class UniAgentLoop(AgentLoopBase):
                 "per-sample. Remove `model` from your dataset's tools_kwargs."
             )
         config_dict = _deep_merge(base_config, tools_kwargs)
+        # Validation rollouts deep-merge `validation_overrides` (from the agent YAML)
+        # over the effective config: val limits live explicitly next to the train
+        # knobs instead of silently sharing them. Applied after the per-sample merge
+        # so a dataset row can never lose its env/reward identity to an override.
+        if kwargs.get("validate") and isinstance(config_dict.get("validation_overrides"), dict):
+            config_dict = _deep_merge(config_dict, config_dict["validation_overrides"])
 
         rollout_config = self.config.actor_rollout_ref.rollout
-        max_model_len = (
+        engine_len = (
             rollout_config.max_model_len
             if rollout_config.max_model_len is not None
             else rollout_config.prompt_length + rollout_config.response_length
         )
+        # The engine's ceiling and the agent's context budget stop being the same number once a
+        # caller needs more room than the agent does. `context_budget` is what the loop and the
+        # condenser live within; the engine is served wider so the reflector can use it.
+        max_model_len = min(int(config_dict.get("context_budget") or engine_len), engine_len)
         config_dict["model"] = {
             "client": self.server_manager,
             "tokenizer": self.tokenizer,
             "max_model_len": max_model_len,
             "sampling_params": sampling_params,
+            "max_completion_tokens": config_dict.get("max_completion_tokens"),
+            "chat_template_kwargs": config_dict.get("chat_template_kwargs"),
         }
 
         if not config_dict.get("reward"):
@@ -385,12 +658,18 @@ class UniAgentLoop(AgentLoopBase):
         trajectory = interaction_result.get("trajectory", [])
         num_turns = len(trajectory)
         traj_exit_reason = trajectory[-1].exit_reason if num_turns > 0 else "unknown"
-        should_mask_traj = self.mask_abnormal_exit_traj and traj_exit_reason != "finished"
         metrics = interaction_result.get("metrics", {})
+        # an eval that never ran scores resolved=False, which is indistinguishable from a real failure
+        eval_incomplete = metrics.get("eval_completed", 1.0) < 1.0
+        should_mask_traj = eval_incomplete or (
+            self.mask_abnormal_exit_traj and traj_exit_reason != "finished"
+        )
 
         shared_extra: dict[str, Any] = {
-            "traj_masked": int(should_mask_traj),
             "traj_exit_reason": traj_exit_reason,
+            # AgentLoopMetrics is a fixed schema the sync trainer never surfaces, so the
+            # per-trajectory timings ride along here instead
+            "timings": {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
         }
         if self.emit_feedback:
             reward_extra_info = interaction_result.get("reward_extra_info") or {}
@@ -407,6 +686,7 @@ class UniAgentLoop(AgentLoopBase):
 
         num_segments = len(segments)
         self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
+        turn_hints = interaction_result.get("turn_hints") or {}
         # segments are post-hoc views of work already traced live (segment_index rides on those spans)
         return [
             self._segment_to_output(
@@ -418,6 +698,7 @@ class UniAgentLoop(AgentLoopBase):
                 shared_extra=shared_extra,
                 seg_idx=seg_idx,
                 num_segments=num_segments,
+                turn_hints=turn_hints,
             )
             for seg_idx, seg in enumerate(segments)
         ]
@@ -433,6 +714,7 @@ class UniAgentLoop(AgentLoopBase):
         shared_extra: dict,
         seg_idx: int,
         num_segments: int,
+        turn_hints: dict[int, str] | None = None,
     ) -> AgentLoopOutput:
         """Build one AgentLoopOutput from a single trajectory segment's token buffer."""
         rollout_cache = segment["rollout_cache"]
@@ -465,6 +747,21 @@ class UniAgentLoop(AgentLoopBase):
 
         multi_modal_data = {}
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
+        # per-turn response spans [step_idx, start, end), clamped to the shipped response
+        extra_fields["turn_spans"] = [
+            [step, start, min(end, len(response_ids))]
+            for step, start, end in rollout_cache.get("turn_spans") or []
+            if start < len(response_ids)
+        ]
+        turn_hints = turn_hints or {}
+        # a reflector may return {"text": ..., "at": "call"} instead of plain text; the
+        # placement rides as a third element so the trainer can splice mid-turn
+        extra_fields["turn_hints"] = [
+            [step, hint["text"], hint["at"]]
+            if isinstance(hint, dict) else [step, hint]
+            for step, _, _ in extra_fields["turn_spans"]
+            if (hint := turn_hints.get(step)) is not None
+        ]
         extra_fields.update(shared_extra)
         extra_fields["segment_index"] = seg_idx
         extra_fields["num_segments"] = num_segments

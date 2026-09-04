@@ -4,6 +4,7 @@ from functools import cached_property
 from typing import Any
 
 from uni_agent.tracing import rollout_trace_generation
+from uni_agent.async_logging import get_logger
 from uni_agent.utils import get_event_loop, simple_timer
 
 
@@ -24,6 +25,13 @@ class AgentChatModel:
     sampling_params: dict[str, Any]
     """Sampling parameters for the model"""
 
+    max_completion_tokens: int | None = None
+    """Per-turn completion cap; None leaves the window as the only bound."""
+
+    chat_template_kwargs: dict[str, Any] | None = None
+    """Extra apply_chat_template kwargs (e.g. {"enable_thinking": False}); must match
+    what the trainer uses to derive template fragments."""
+
     tools_schemas: list[dict] = None
 
     def __init__(self, **data):
@@ -34,16 +42,27 @@ class AgentChatModel:
     def set_tools_schemas(self, tools_schemas: list[dict]) -> None:
         self.tools_schemas = tools_schemas
 
-    async def prepare_rollout_cache(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    async def prepare_rollout_cache(
+        self,
+        messages: list[dict[str, str]],
+        include_tools: bool = True,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``chat_template_kwargs`` overrides the model's own for this call only: the
+        reflector is a separate, untrained call and may need a different template mode
+        (reasoning on, say) from the rollout it is diagnosing."""
         from verl.utils.tokenizer import normalize_token_ids
 
+        tools = self.tools_schemas if include_tools else None
+        template_kwargs = self.chat_template_kwargs if chat_template_kwargs is None else chat_template_kwargs
         prompt_ids = await self.loop.run_in_executor(
             None,
             lambda: self.tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 tokenize=True,
-                tools=self.tools_schemas,
+                tools=tools,
+                **(template_kwargs or {}),
             ),
         )
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -93,13 +112,32 @@ class AgentChatModel:
         prompt_ids = rollout_cache["prompt_ids"]
         metrics = rollout_cache["metrics"]
 
-        if len(prompt_ids) >= self.max_model_len:
+        # `max_model_len` is the agent's own context budget, which is what the condenser reseats
+        # against; a caller that is not building the agent's context (the reflector reads a whole
+        # finished trajectory in one shot) may raise its own ceiling up to what the engine serves.
+        limit = kwargs.get("max_model_len") or self.max_model_len
+        if len(prompt_ids) >= limit:
             raise MaxTokenExceededError(
-                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {self.max_model_len}\n"
+                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {limit}\n"
                 f"Last tool response: {messages[-1]['content']}"
             )
 
         sampling_params = kwargs.get("sampling_params", self.sampling_params)
+        # Cap one turn's completion. Uncapped, a runaway turn fills the whole remaining
+        # window (measured: 0.15% of turns, ~14% of all generated tokens, ~4min of
+        # single-stream decode each, and the overflow usually kills the segment).
+        # min() with the window keeps a capped call from ever overflowing max_model_len.
+        turn_limit = None
+        if self.max_completion_tokens:
+            room = max(1, limit - len(prompt_ids))
+            # A caller that states its own budget keeps it: the reflector asks for far more
+            # than one agent turn because it writes a staged analysis before its hints, and
+            # this used to clamp it to max_completion_tokens regardless, so replies died at
+            # exactly 4096 tokens with the object unwritten. The window clamp still applies.
+            asked = sampling_params.get("max_tokens")
+            ceiling = int(asked) if asked else int(self.max_completion_tokens)
+            turn_limit = min(ceiling, room)
+            sampling_params = {**sampling_params, "max_tokens": turn_limit}
 
         with simple_timer("generate_sequences", metrics):
             token_output = await self.client.generate(
@@ -111,14 +149,42 @@ class AgentChatModel:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
         else:
             metrics["num_preempted"] += token_output.num_preempted if token_output.num_preempted is not None else 0
+        if turn_limit and len(token_output.token_ids) > turn_limit:
+            # Should be impossible (the server clamps to the requested max_tokens), yet
+            # observed once, immediately after a condensation retry (run 2985518,
+            # 5137 > 4096). Enforce the invariant here and log enough to find the path.
+            get_logger("model").warning(
+                f"generation returned {len(token_output.token_ids)} tokens despite max_tokens={turn_limit} "
+                f"(prompt={len(prompt_ids)}, request_id={request_id}); truncating to the cap"
+            )
+            token_output.token_ids = token_output.token_ids[:turn_limit]
+            if token_output.log_probs is not None:
+                token_output.log_probs = token_output.log_probs[:turn_limit]
         generation_info = {
             "prompt_tokens": len(prompt_ids),
             "completion_tokens": len(token_output.token_ids),
+            # the turn was cut mid-generation by the per-turn cap (not a natural stop);
+            # the interaction layer tells the model, or it misreads the parse error
+            "capped": bool(turn_limit and len(token_output.token_ids) >= turn_limit),
         }
+        metrics["capped_turns"] = metrics.get("capped_turns", 0) + int(generation_info["capped"])
         response_ids = token_output.token_ids
+        # checked before the append: a generation that crosses the budget is regenerated in the
+        # condensed segment, so leaving it here would train the same step twice
+        if len(rollout_cache["prompt_ids"]) + len(response_ids) >= limit:
+            raise MaxTokenExceededError(
+                f"prompt_ids length {len(rollout_cache['prompt_ids']) + len(response_ids)} exceeds "
+                f"max_model_len {limit}\nGenerated response:\n{self.tokenizer.decode(response_ids)}"
+            )
         rollout_cache["prompt_ids"] += response_ids
         rollout_cache["response_mask"] += [1] * len(response_ids)
         if token_output.log_probs is not None:
+            expected = len(rollout_cache["response_mask"]) - len(response_ids)
+            if len(rollout_cache["response_logprobs"]) != expected:
+                raise RuntimeError(
+                    f"response_logprobs ({len(rollout_cache['response_logprobs'])}) out of step with "
+                    f"response_mask ({expected}): an earlier turn returned no log-probs"
+                )
             rollout_cache["response_logprobs"] += token_output.log_probs
         if token_output.routed_experts is not None:
             rollout_cache["routed_experts"] = token_output.routed_experts
@@ -139,13 +205,8 @@ class AgentChatModel:
                 "input": generation_info["prompt_tokens"],
                 "output": generation_info["completion_tokens"],
             },
+            num_preempted=token_output.num_preempted,
         )
-
-        if len(rollout_cache["prompt_ids"]) >= self.max_model_len:
-            raise MaxTokenExceededError(
-                f"prompt_ids length {len(rollout_cache['prompt_ids'])} exceeds max_model_len {self.max_model_len}\n"
-                f"Generated response:\n{response_str}"
-            )
 
         return response_str, [], rollout_cache, generation_info
 
@@ -160,6 +221,7 @@ class AgentChatModel:
                 new_messages,
                 add_generation_prompt=True,
                 tokenize=True,
+                **(self.chat_template_kwargs or {}),
             ),
         )
         return self.message_boundary_tokens + normalize_token_ids(tokenized_prompt)
@@ -182,6 +244,7 @@ class AgentChatModel:
                     [dummy_next_message],
                     add_generation_prompt=True,
                     tokenize=True,
+                    **(self.chat_template_kwargs or {}),
                 )
             )
             with_boundary_ids = normalize_token_ids(
@@ -190,6 +253,7 @@ class AgentChatModel:
                     dummy_history + [dummy_next_message],
                     add_generation_prompt=True,
                     tokenize=True,
+                    **(self.chat_template_kwargs or {}),
                 )
             )
         except Exception:

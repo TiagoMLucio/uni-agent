@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Self
@@ -14,7 +15,6 @@ from swerex.deployment.abstract import AbstractDeployment
 from swerex.deployment.hooks.abstract import CombinedDeploymentHook, DeploymentHook
 from swerex.exceptions import DeploymentNotStartedError
 from swerex.runtime.abstract import Command, CreateBashSessionRequest, IsAliveResponse, UploadRequest
-from swerex.utils.wait import _wait_until_alive
 
 from uni_agent.async_logging import get_logger
 from uni_agent.deployment.config import LocalDeploymentConfig
@@ -100,6 +100,7 @@ class LocalDeployment(AbstractDeployment):
         self._server_log_path: Path | None = None
         self._server_log_handle: Any | None = None
         self._stopped = False
+        self.startup_timings: dict[str, float] = {}
 
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
@@ -119,12 +120,19 @@ class LocalDeployment(AbstractDeployment):
         return await self._runtime.is_alive(timeout=timeout)
 
     async def _wait_until_alive(self, timeout: float) -> IsAliveResponse:
-        try:
-            return await _wait_until_alive(self.is_alive, timeout=timeout, function_timeout=0.5)
-        except TimeoutError as e:
-            self.logger.error("Local runtime did not start within timeout.")
-            await self.stop()
-            raise e
+        # swerex's _wait_until_alive polls with a blocking time.sleep, freezing the shared
+        # event loop under concurrent startups; re-implemented with `await asyncio.sleep`
+        loop = asyncio.get_event_loop()
+        end = loop.time() + timeout
+        last: IsAliveResponse | None = None
+        while loop.time() < end:
+            last = await self.is_alive(timeout=5.0)
+            if last.is_alive:
+                return last
+            await asyncio.sleep(0.5)
+        raise TimeoutError(
+            f"Local runtime did not start within {timeout}s; last={getattr(last, 'message', last)}"
+        )
 
     def _get_token(self) -> str:
         return str(uuid.uuid4())
@@ -183,16 +191,18 @@ class LocalDeployment(AbstractDeployment):
         ip_address = result.stdout.strip()
         return ip_address or None
 
-    def _get_runtime_host(self, container_name: str) -> str:
+    def _resolve_runtime_endpoint(self, container_name: str, published_port: int) -> tuple[str, int]:
+        """Host and port the runtime is reachable at: the container IP serves the
+        runtime port directly, while localhost goes through the published mapping."""
         if self._config.host:
-            return self._config.host
+            return self._config.host, published_port
 
         if _is_running_in_container() or self._config.network:
             container_ip = self._get_container_ip(container_name)
             if container_ip:
-                return f"http://{container_ip}"
+                return f"http://{container_ip}", self._config.runtime_port
 
-        return "http://127.0.0.1"
+        return "http://127.0.0.1", published_port
 
     def _format_command(self, token: str, port: int) -> str:
         return self._config.command.format(token=token, port=port)
@@ -207,6 +217,9 @@ class LocalDeployment(AbstractDeployment):
             "-d",
             "--name",
             container_name,
+            # disposable sandbox: skip the SIGTERM grace period on stop/remove
+            "--stop-signal",
+            "SIGKILL",
             "--entrypoint",
             self._config.shell,
         ]
@@ -214,7 +227,7 @@ class LocalDeployment(AbstractDeployment):
             args.extend(["--network", network])
         args.extend(["-p", f"{published_port}:{self._config.runtime_port}"])
         args.extend(self._config.extra_run_args)
-        args.extend([self._config.image, "-lc", command])
+        args.extend([self._config.image, *self._config.shell_args, command])
         return args
 
     def _build_apptainer_command(self, command: str) -> list[str]:
@@ -225,7 +238,7 @@ class LocalDeployment(AbstractDeployment):
             "--compat",
         ]
         args.extend(self._config.extra_run_args)
-        args.extend([_normalize_apptainer_image(self._config.image), self._config.shell, "-lc", command])
+        args.extend([_normalize_apptainer_image(self._config.image), self._config.shell, *self._config.shell_args, command])
         return args
 
     def _get_container_logs(self, container_name: str) -> str:
@@ -281,22 +294,25 @@ class LocalDeployment(AbstractDeployment):
             self._runtime_exec, self._build_run_command(container_name, published_port, command)
         )
         self._container_id = result.stdout.strip()
-        host = await asyncio.to_thread(self._get_runtime_host, container_name)
+        host, port = await asyncio.to_thread(self._resolve_runtime_endpoint, container_name, published_port)
         runtime_config = LocalRuntimeConfig(
             auth_token=token,
             host=host,
-            port=self._config.runtime_port,
+            port=port,
             timeout=self._config.timeout,
         )
         self._runtime = LocalRuntime.from_config(runtime_config, run_id=self.run_id)
 
     async def start(self, max_retries: int = 5) -> None:
         token = self._get_token()
-        published_port = self._config.published_port or _pick_free_port()
         container_name = self._config.container_name or f"uni-agent-{_sanitize_name(self.run_id)}"
         self._stopped = False
         last_error: Exception | None = None
         for attempt in range(max_retries):
+            # re-picked per attempt: the free-port probe is bind-then-release, so
+            # concurrent starts can collide on the same port, and a collided port
+            # held by a long-lived container never frees however long we retry
+            published_port = self._config.published_port or _pick_free_port()
             self._stopped = False
             self.logger.info(
                 f"Starting local deployment with runtime={self._config.container_runtime}, image={self._config.image}."
@@ -305,6 +321,7 @@ class LocalDeployment(AbstractDeployment):
             self._container_name = container_name
 
             try:
+                t0 = time.perf_counter()
                 if _is_apptainer_runtime(self._config.container_runtime):
                     await self._start_apptainer(token=token, published_port=published_port)
                 else:
@@ -314,9 +331,22 @@ class LocalDeployment(AbstractDeployment):
                         published_port=published_port,
                     )
 
+                t_container = time.perf_counter()
                 await self._wait_until_alive(timeout=self._config.startup_timeout)
+                t_alive = time.perf_counter()
                 await self.runtime.create_session(
                     CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=60)
+                )
+                # container = image pull + unpack + start; serve = the swerex bootstrap inside it
+                self.startup_timings = {
+                    "container": t_container - t0,
+                    "serve": t_alive - t_container,
+                    "session": time.perf_counter() - t_alive,
+                }
+                self.logger.info(
+                    "sandbox startup: "
+                    + " ".join(f"{k}={v:.1f}s" for k, v in self.startup_timings.items())
+                    + f" image={self._config.image}"
                 )
                 self._stopped = False
                 return

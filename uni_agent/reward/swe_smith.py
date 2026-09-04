@@ -40,7 +40,14 @@ from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
 from uni_agent.reward.base import AbstractRewardSpec
 from uni_agent.reward.registry import register_reward_spec
-from uni_agent.reward.swe_bench import FeedbackConfig
+from uni_agent.reward.swe_bench import FeedbackConfig, _feedback_seed, clip_eval_report
+from uni_agent.tracing import (
+    TRACE_FEEDBACK_CHARS,
+    TRACE_PATCH_CHARS,
+    TRACE_TEST_OUTPUT_CHARS,
+    rollout_trace_span,
+    trace_clip,
+)
 from uni_agent.utils import auto_await
 
 #: HEREDOC delimiter unlikely to appear in a diff (matches swe_bench's convention).
@@ -52,17 +59,25 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
 
     Replicates ``swesmith.harness.utils.run_patch_in_container`` as a single bash
     script so it can run through ``env.communicate`` (like swe_bench's eval), rather
-    than via the host docker SDK. ``set -uxo pipefail`` (no ``-e``) so a failed apply
+    than via the host docker SDK. ``set -uo pipefail`` (no ``-e``) so a failed apply
     does not abort the script — we surface it via the ``APPLY_PATCH_FAIL`` sentinel,
-    exactly as the library does.
+    exactly as the library does. No ``-x``: its trace would eat the feedback budget,
+    so the output markers the grader looks for must be echoed explicitly (the
+    library's ``: 'marker'`` no-ops only ever surfaced through the ``-x`` trace).
     """
     repo_directory = "/testbed"
     # Apply the agent patch with swesmith's fallback ladder; echo the sentinel on total
     # failure so _get_logs_eval can flag patch_apply_failed (mirrors the library).
-    apply_lines = ["_applied=0"]
-    for cmd in GIT_APPLY_CMDS:
-        apply_lines.append(f'if [ "$_applied" -eq 0 ] && {cmd} /tmp/swesmith_pred.diff; then _applied=1; fi')
-    apply_lines.append(f"if [ \"$_applied\" -eq 0 ]; then echo '{APPLY_PATCH_FAIL}'; fi")
+    # An empty prediction reaches the heredoc as a lone newline, which every rung of the ladder
+    # rejects as garbage -- so an agent that never landed an edit was reported as
+    # patch_apply_failed. There is nothing to apply, so do not claim the apply failed.
+    if not (patch or "").strip():
+        apply_lines = ["echo 'empty prediction: nothing to apply'"]
+    else:
+        apply_lines = ["_applied=0"]
+        for cmd in GIT_APPLY_CMDS:
+            apply_lines.append(f'if [ "$_applied" -eq 0 ] && {cmd} /tmp/swesmith_pred.diff; then _applied=1; fi')
+        apply_lines.append(f"if [ \"$_applied\" -eq 0 ]; then echo '{APPLY_PATCH_FAIL}'; fi")
 
     revert_tests = f"git checkout -- {' '.join(test_files)}" if test_files else "echo 'no test files to reset'"
 
@@ -78,9 +93,9 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
         *apply_lines,
         # Tests are graded from the repo's own copy — discard any agent edits to them.
         revert_tests,
-        f": '{TEST_OUTPUT_START}'",
+        f"echo '{TEST_OUTPUT_START}'",
         test_command,
-        f": '{TEST_OUTPUT_END}'",
+        f"echo '{TEST_OUTPUT_END}'",
     ]
 
 
@@ -96,6 +111,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         feedback: dict | FeedbackConfig | None = None,
         env_config: dict | None = None,
         isolate: bool = False,
+        agent_patch_diff_args: str = "",
     ):
         self.run_id = run_id
         self.metadata = metadata
@@ -105,6 +121,9 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         self.feedback = feedback if isinstance(feedback, FeedbackConfig) else FeedbackConfig(**(feedback or {}))
         self.env_config = env_config
         self.isolate = isolate
+        # extra git-diff flags for the reflector's copy of the patch ('-U10', '-W');
+        # empty means do not capture one
+        self.agent_patch_diff_args = agent_patch_diff_args
 
     @auto_await
     async def apply_gold_patch(self) -> None:
@@ -130,49 +149,91 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         rp = registry.get_from_inst(instance)
         # Whole-suite command (f2p_only would drop P2P tests in other files -> false regressions).
         test_command, _ = rp.get_test_cmd(instance, f2p_only=False)
+        # Long tracebacks are the single most useful thing in the feedback, and the
+        # per-test pairing needs the FAILURES blocks they produce. Profiles ship
+        # assorted --tb flavors or none at all (click had none: its evals fell back
+        # to the raw dump), so rewrite whatever is there rather than string-replace.
+        if "pytest" in test_command:
+            test_command, n = re.subn(r"--tb[= ]\S+", "--tb=long", test_command)
+            if n == 0:
+                test_command += " --tb=long"
         try:
             f2p_files, p2p_files = rp.get_test_files(instance)
             test_files = sorted(set(f2p_files + p2p_files))
-        except Exception:
+        except Exception as e:
             test_files = []
+            result["eval_error"] = f"test files unavailable, the agent's test edits cannot be reverted: {type(e).__name__}: {e}"
 
         # The agent's diff IS the prediction we evaluate, so we always need it.
-        patch = await self._get_interaction_env_patch()
+        with rollout_trace_span("patch_extract") as patch_span:
+            try:
+                patch = await self._get_interaction_env_patch()
+            except Exception as e:
+                patch = ""
+                result["eval_error"] = f"patch harvest failed: {type(e).__name__}: {e}"
+            if patch_span is not None:
+                patch_span.update(
+                    output=trace_clip(patch, TRACE_PATCH_CHARS),
+                    metadata={"chars": len(patch or "")},
+                )
         eval_script_list = _make_eval_script_list(instance_id, patch, test_command, test_files)
-        eval_script = "\n".join(["#!/bin/bash", "set -uxo pipefail"] + eval_script_list) + "\n"
+        # -x would echo every conda-activation line into the captured output and eat the
+        # feedback budget before pytest has said anything
+        eval_script = "\n".join(["#!/bin/bash", "set -uo pipefail"] + eval_script_list) + "\n"
 
         output = ""
         eval_env = self.env
         sibling = None
         try:
-            if self.isolate:
-                env_config = kwargs.get("env_config") or self.env_config
-                sibling = await self._start_sibling_env(env_config)
-                eval_env = sibling
+            if result.get("eval_error"):
+                raise RuntimeError(result["eval_error"])
+            with rollout_trace_span("eval_env_setup", metadata={"isolate": self.isolate}) as env_span:
+                if self.isolate:
+                    env_config = kwargs.get("env_config") or self.env_config
+                    sibling = await self._start_sibling_env(env_config)
+                    eval_env = sibling
 
-            eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
-            await eval_env.write_file(eval_script_container, eval_script)
+                eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
+                await eval_env.write_file(eval_script_container, eval_script)
+                if env_span is not None:
+                    env_span.update(output={"status": "ready", "sibling": sibling is not None})
 
-            execution_t0 = time.perf_counter()
-            output = await eval_env.communicate(
-                f"bash {eval_script_container}",
-                timeout=self.eval_timeout,
-                check="ignore",
-            )
-            result["eval_execution_time"] = time.perf_counter() - execution_t0
-            result["eval_completed"] = True
+            with rollout_trace_span("tests", input={"test_command": test_command}) as tests_span:
+                execution_t0 = time.perf_counter()
+                output = await eval_env.communicate(
+                    f"bash {eval_script_container}",
+                    timeout=self.eval_timeout,
+                    check="ignore",
+                )
+                result["eval_execution_time"] = time.perf_counter() - execution_t0
 
-            # Strip ANSI escapes / carriage returns before parsing.
-            output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
+                # Strip ANSI escapes / carriage returns before parsing.
+                output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
 
-            eval_report = self._get_eval_report(output)
-            result["eval_report"] = eval_report
-            self.logger.info(f"Eval report: {eval_report}")
-            result["resolved"] = eval_report["resolved"]
-            if not eval_report["found_eval_status"] and APPLY_PATCH_FAIL in output:
-                result["patch_apply_failed"] = True
+                eval_report = self._get_eval_report(output)
+                result["eval_report"] = eval_report
+                self.logger.info(f"Eval report: {eval_report}")
+                result["resolved"] = eval_report["resolved"]
+                result["eval_completed"] = True
+                if not eval_report["found_eval_status"] and APPLY_PATCH_FAIL in output:
+                    result["patch_apply_failed"] = True
+                if tests_span is not None:
+                    tests_span.update(
+                        output={
+                            "eval_report": clip_eval_report(eval_report),
+                            "stdout": trace_clip(output, TRACE_TEST_OUTPUT_CHARS),
+                        },
+                        metadata={
+                            "resolved": result["resolved"],
+                            "eval_execution_time": result["eval_execution_time"],
+                            "patch_apply_failed": result.get("patch_apply_failed", False),
+                            "stdout_chars": len(output),
+                        },
+                    )
         except Exception as e:
             self.logger.error(f"Failed to evaluate: {e}")
+            result["eval_completed"] = False
+            result["eval_error"] = f"{type(e).__name__}: {e}"
         finally:
             if sibling is not None:
                 try:
@@ -180,14 +241,34 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                 except Exception as e:
                     self.logger.error(f"Failed to close sibling eval env: {e}")
 
+        # distinct from patch_apply_failed: the agent produced no diff at all
+        result["empty_patch"] = not (patch or "").strip()
+
+        extra_info: dict = {}
         if self.feedback.enabled:
-            feedback = self.feedback.render(
-                result=result,
-                output=output,
-                patch=patch,
-                instance_id=instance.get("instance_id", ""),
-            )
-            result["reward_extra_info"] = {"feedback": feedback}
+            with rollout_trace_span("feedback_render") as feedback_span:
+                extra_info["feedback"] = self.feedback.render(
+                    result=result,
+                    output=output,
+                    patch=patch,
+                    instance_id=instance_id,
+                    seed=_feedback_seed(instance_id, kwargs.get("interaction_result")),
+                )
+                if feedback_span is not None:
+                    feedback_span.update(output=trace_clip(extra_info["feedback"], TRACE_FEEDBACK_CHARS))
+        if self.agent_patch_diff_args:
+            # a wider re-render of the same prediction, for the reflector only
+            with rollout_trace_span(
+                "patch_extract", metadata={"diff_args": self.agent_patch_diff_args}
+            ) as wide_span:
+                extra_info["agent_patch"] = await self._get_interaction_env_patch(self.agent_patch_diff_args)
+                if wide_span is not None:
+                    wide_span.update(output=trace_clip(extra_info["agent_patch"], TRACE_PATCH_CHARS))
+        if extra_info:
+            result["reward_extra_info"] = extra_info
+        # graded prediction, for the trace outcome only: kept out of reward_extra_info
+        # so it never lands in the persisted dumps
+        result["patch"] = patch
 
         return result["resolved"], result
 
@@ -206,25 +287,39 @@ class SWESmithRewardSpec(AbstractRewardSpec):
 
         sibling = AgentEnv(
             run_id=f"{self.run_id}-eval",
-            env_config=AgentEnvConfig(**{**env_config, "post_setup_cmd": None}),
+            env_config=AgentEnvConfig(**{**env_config, "post_setup_cmd": None, "privileged_setup_cmd": None}),
         )
         await sibling.start()
         self.logger.info("Started isolated sibling eval environment")
         return sibling
 
     @auto_await
-    async def _get_interaction_env_patch(self) -> str:
-        """Get the current staged diff in /testbed (interaction env state) as a patch string."""
+    async def _get_interaction_env_patch(self, diff_args: str = "") -> str:
+        """Get the current staged diff in /testbed (interaction env state) as a patch string.
+
+        ``diff_args`` are extra git-diff flags (``-U10``, ``-W``, ...) for the reflector's copy;
+        the prediction that is graded is always taken with none, so the eval never depends on
+        them. The attributes file is what makes ``-W`` find Python function boundaries: without
+        it git falls back to a generic heuristic that expands every hunk to the whole file.
+        """
         try:
             env_patch_file = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
-            await self.env.communicate(
-                f"cd /testbed && git add -A && git diff --no-color --cached > {env_patch_file.as_posix()}",
-                check="ignore",
+            attrs = "/tmp/.uniagent_gitattributes"
+            # side session: the agent's own session may still be running whatever it
+            # left attached, which would swallow this command until the timeout
+            # binaries the agent left behind are unstaged: a text diff cannot carry them and
+            # the stub git writes instead makes the whole patch unapplicable
+            await self.env.communicate_isolated(
+                f"cd /testbed && printf '*.py diff=python\\n' > {attrs} && git add -A && "
+                "(git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
+                "| xargs -r -d '\\n' git reset -q --) ; "
+                f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
+                f"> {env_patch_file.as_posix()}",
             )
             return await self.env.read_file(env_patch_file)
         except Exception as e:
             self.logger.error(f"Failed to get interaction environment patch: {e}")
-            return ""
+            raise
 
     @auto_await
     async def _apply_patch(self, patch: str, reverse: bool = False) -> None:

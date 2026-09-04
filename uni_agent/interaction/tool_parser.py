@@ -20,12 +20,13 @@ class FunctionCallFormatError(Exception):
 class XMLToolParser:
     def __init__(self):
         self.tool_call_start_token: str = "<tool_call>"
+        self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_prefix: str = "<function="
 
         # Regex patterns
         self.tool_call_complete_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
-        self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", regex.DOTALL)
-        self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>|<function=(.*)$", regex.DOTALL)
+        self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
+        self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>", regex.DOTALL)
         self.tool_call_parameter_regex = regex.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", regex.DOTALL
         )
@@ -166,15 +167,16 @@ class XMLToolParser:
         return content, chars_removed
 
     def _get_function_calls(self, model_output: str) -> list[str]:
-        """Return ``<function=...>`` bodies found inside ``<tool_call>`` blocks.
+        """Return ``<function=...>`` bodies found inside closed ``<tool_call>`` blocks.
         Empty list = nothing recoverable (caller treats as "no tool calls").
         """
-        matched_ranges = self.tool_call_regex.findall(model_output)
-        raw_tool_calls = [match[0] if match[0] else match[1] for match in matched_ranges]
+        raw_tool_calls = self.tool_call_regex.findall(model_output)
         raw_function_calls = []
         for tool_call in raw_tool_calls:
+            if tool_call.count("<function=") > tool_call.count("</function>"):
+                raise FunctionCallFormatError("Unclosed tool call: missing </function>, so the call was not executed.")
             raw_function_calls.extend(self.tool_call_function_regex.findall(tool_call))
-        return [match[0] if match[0] else match[1] for match in raw_function_calls]
+        return raw_function_calls
 
     def extract_tool_calls(
         self, model_output: str, tools: list[OpenAIFunctionToolSchema]
@@ -186,10 +188,16 @@ class XMLToolParser:
         was absent or present-but-unrecoverable. Callers decide what to
         do (single-shot raises, chat treats as turn-end). When a function
         name IS recovered but invalid (unknown name, bad arg type, ...)
-        we still raise :class:`FunctionCallFormatError`.
+        we still raise :class:`FunctionCallFormatError`. An unclosed
+        ``<tool_call>`` (a response cut mid-call) raises too: the truncated
+        argument must never reach a tool.
         """
         if self.tool_call_start_token not in model_output:
             return model_output, []
+        if model_output.count(self.tool_call_start_token) > model_output.count(self.tool_call_end_token):
+            raise FunctionCallFormatError(
+                f"Unclosed tool call: missing {self.tool_call_end_token}, so the call was not executed."
+            )
 
         function_calls = self._get_function_calls(model_output)
         if not function_calls:
@@ -321,9 +329,32 @@ class HermesToolParser:
         return OpenAIFunctionToolCall(id=str(uuid.uuid4()), type="function", function=function_call)
 
 
+class SweStarXMLToolParser(XMLToolParser):
+    """SWE-Star's notation: a bare ``<function=...></function>`` with no ``<tool_call>``
+    wrapper. Only needed to replay models distilled from that scaffold; the wrapped form
+    is what our own rollouts emit."""
+
+    def _get_function_calls(self, model_output: str) -> list[str]:
+        return self.tool_call_function_regex.findall(model_output)
+
+    def extract_tool_calls(
+        self, model_output: str, tools: list[OpenAIFunctionToolSchema]
+    ) -> tuple[str, list[OpenAIFunctionToolCall]]:
+        if self.tool_call_prefix not in model_output:
+            return model_output, []
+        if model_output.count(self.tool_call_prefix) > model_output.count("</function>"):
+            raise FunctionCallFormatError("Unclosed tool call: missing </function>, so the call was not executed.")
+        function_calls = self._get_function_calls(model_output)
+        if not function_calls:
+            return model_output, []
+        tool_calls = [self._parse_xml_function_call(c, tools) for c in function_calls]
+        return model_output[: model_output.find(self.tool_call_prefix)], tool_calls
+
+
 _PARSER_REGISTRY: dict[str, type] = {
     "qwen3_coder": XMLToolParser,
     "hermes": HermesToolParser,
+    "swestar_xml": SweStarXMLToolParser,
 }
 
 

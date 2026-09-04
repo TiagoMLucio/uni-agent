@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Literal
 
@@ -15,19 +16,31 @@ from uni_agent.tracing import (
 from uni_agent.utils import auto_await, simple_timer
 
 from .condenser import AbstractCondenser, CondensationFailed
-from .env import ActionIncorrectSyntaxError, ActionTimeoutError, AgentEnv, TerminalNotAliveError
+from .env import (
+    ActionIncorrectSyntaxError,
+    ActionTimeoutError,
+    AgentEnv,
+    TerminalNotAliveError,
+)
 from .model import AgentChatModel, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
 from .tool_schemas import OpenAIFunctionToolCall
 from .tools_manager import ToolsManager
 
-ToolStatus = Literal["ok", "timeout", "syntax_error", "skipped"]
+# "yielded": the command hit its timeout but is still running and still reachable, so it
+# is normal operation, not a failure. Only "timeout" (the kill) spends the budget.
+ToolStatus = Literal["ok", "yielded", "timeout", "syntax_error", "skipped"]
 
 # Heuristic budget for reactive condensation: how many characters to free when the
 # context overflows, escalated per retry (~chars_per_token x tokens_over + margin).
 CONDENSE_CHARS_PER_TOKEN = 4
 CONDENSE_MARGIN_TOKENS = 1024
 CONDENSE_MIN_CHARS = 2000
+
+
+def _clip(text: str, limit: int = 80) -> str:
+    """Command echo for protocol messages: repeated full echoes bloat the context."""
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 class ToolResult(BaseModel):
@@ -71,10 +84,13 @@ def _step_span_update(result):
     if not hasattr(result, "model_dump"):
         return {"output": result}
     dumped = result.model_dump()
+    tool_results = dumped.get("tool_results") or []
     output = {
         "exit_reason": dumped.get("exit_reason"),
         "done": dumped.get("done"),
-        "n_tools": len(dumped.get("tool_results") or []),
+        "n_tools": len(tool_results),
+        "tools": [t.get("name") for t in tool_results],
+        "response_chars": len(dumped.get("response") or ""),
     }
     return {"output": output}
 
@@ -110,6 +126,8 @@ class AgentInteraction:
         tools_manager: ToolsManager,
         messages: list[dict[str, str]],
         action_timeout: int = 60,
+        yield_timeout: int = 5,
+        attached_kill_timeout: float = 45.0,
         timeout_budget: int = 3,
         max_turns: int = 50,
         skills_manager: SkillsManager | None = None,
@@ -120,6 +138,8 @@ class AgentInteraction:
         condense_chars_per_token: int = CONDENSE_CHARS_PER_TOKEN,
         condense_margin_tokens: int = CONDENSE_MARGIN_TOKENS,
         condense_min_chars: int = CONDENSE_MIN_CHARS,
+        observation_role: str = "tool",
+        observation_template: str = "EXECUTION RESULT of [{name}]:\n{observation}",
     ):
         """:param chat_mode: how to treat an assistant message with no
         tool calls. ``False`` (default, training / code-eval) raises
@@ -136,6 +156,10 @@ class AgentInteraction:
         re-seated from it, and generation retries. ``None`` keeps the legacy
         behavior (overflow ends the rollout with ``token_limit``).
         :param condense_max_retries: max condense+retry attempts per overflow.
+        :param observation_role: role carrying tool output. ``"tool"`` (default) is
+        what our own rollouts emit. ``"user"`` renders observations as user turns via
+        ``observation_template``, which is the OpenHands-style scaffold some distilled
+        checkpoints were trained on; replaying them any other way is off-distribution.
         """
         self.env = env
         self.model = model
@@ -143,6 +167,8 @@ class AgentInteraction:
         self.skills_manager = skills_manager
         self.messages = messages
         self.action_timeout = action_timeout
+        self.yield_timeout = yield_timeout
+        self.attached_kill_timeout = attached_kill_timeout
         self.timeout_budget = timeout_budget
         self.max_turns = max_turns
         self.chat_mode = chat_mode
@@ -152,7 +178,21 @@ class AgentInteraction:
         self.condense_chars_per_token = condense_chars_per_token
         self.condense_margin_tokens = condense_margin_tokens
         self.condense_min_chars = condense_min_chars
+        self.observation_role = observation_role
+        self.observation_template = observation_template
         self.logger = get_logger("interaction", run_id)
+
+    def _observation_message(self, name: str, tool_call_id: str | None, observation: str) -> dict:
+        """Shape one tool result the way this scaffold's training data did."""
+        if self.observation_role != "tool":
+            return {
+                "role": self.observation_role,
+                "content": self.observation_template.format(name=name or "", observation=observation),
+            }
+        msg: dict = {"role": "tool", "name": name, "content": observation}
+        if tool_call_id is not None:
+            msg["tool_call_id"] = tool_call_id
+        return msg
 
     def inject_skills_manifest(self) -> None:
         """Append the skills manifest to the first system message.
@@ -231,7 +271,8 @@ class AgentInteraction:
                     return step_output
                 self.logger.warning("{}", _msg)
                 try:
-                    await self._condense_and_reseat(attempt)
+                    with simple_timer("condense", self.rollout_cache["metrics"]):
+                        await self._condense_and_reseat(attempt)
                     self.logger.info(f"Condensed context (attempt {attempt + 1}); retrying generation.")
                 except CondensationFailed as ce:
                     self.logger.error(f"Condensation failed: {ce}")
@@ -240,6 +281,11 @@ class AgentInteraction:
                     return step_output
 
         step_output.response = model_output
+        # turn table: this step's response span within the active segment buffer
+        span_end = len(rollout_cache["response_mask"])
+        rollout_cache.setdefault("turn_spans", []).append(
+            [step_idx, span_end - generation_info["completion_tokens"], span_end]
+        )
         self.logger.info(
             f"Prompt Tokens: {generation_info['prompt_tokens']}, "
             f"Completion Tokens: {generation_info['completion_tokens']}"
@@ -257,30 +303,44 @@ class AgentInteraction:
         self.messages.append(assistant_msg)
 
         try:
+            if generation_info and generation_info.get("capped") and not self.chat_mode:
+                # whatever a cut response parses to, it is not the action the model meant
+                raise FunctionCallFormatError("Response cut at the per-turn output limit.")
             if tool_calls:
                 content, tool_calls = await self.tools_manager.parse_structured_action(
                     content=model_output,
                     tool_calls_data=tool_calls,
                 )
             else:
-                content, tool_calls = await self.tools_manager.parse_action(model_output=model_output)
+                with simple_timer("parse_action", self.rollout_cache["metrics"]):
+                    content, tool_calls = await self.tools_manager.parse_action(model_output=model_output)
             if not tool_calls and not self.chat_mode:
                 raise FunctionCallFormatError("No function call found in the response.")
         except FunctionCallFormatError as e:
+            error_text = str(e)
+            if generation_info and generation_info.get("capped"):
+                # without this the model misattributes the cut ("the file content was
+                # truncated") and walks into the same runaway generation again
+                cap = getattr(self.model, "max_completion_tokens", None)
+                error_text = (
+                    f"Your response was cut off at the per-turn output limit"
+                    f"{f' of {cap} tokens' if cap else ''} before the tool call was closed, "
+                    "so it was not executed. Produce a shorter response this turn: make "
+                    "smaller edits (str_replace on a narrow block, or write the file in "
+                    "parts) and do not repeat content."
+                )
             if tool_calls:
                 error_msgs: list[dict[str, object]] = [
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "content": str(e),
-                    }
+                    self._observation_message(tc["function"]["name"], tc["id"], error_text)
                     for tc in tool_calls
                 ]
             else:
-                error_msgs = [{"role": "tool", "content": str(e)}]
+                error_msgs = [self._observation_message("", None, error_text)]
             self.messages.extend(error_msgs)
-            self.rollout_cache = await self.model.append_messages_to_rollout_cache(error_msgs, self.rollout_cache)
+            with simple_timer("tokenize_observations", self.rollout_cache["metrics"]):
+                self.rollout_cache = await self.model.append_messages_to_rollout_cache(
+                    error_msgs, self.rollout_cache
+                )
             step_output.exit_reason = "format_error"
             model_output_preview = "\n".join(model_output.splitlines()[:20])
             _msg = (
@@ -318,12 +378,7 @@ class AgentInteraction:
 
                 tool_results.append(result)
                 tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": result.tool_call_id,
-                        "name": result.name,
-                        "content": result.observation,
-                    }
+                    self._observation_message(result.name, result.tool_call_id, result.observation)
                 )
 
                 # On hard failure (dead session / budget out), synthesize
@@ -348,18 +403,16 @@ class AgentInteraction:
                             )
                         )
                         tool_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": remaining.id,
-                                "name": remaining.function.name,
-                                "content": skipped_reason,
-                            }
+                            self._observation_message(
+                                remaining.function.name, remaining.id, skipped_reason
+                            )
                         )
                     break
 
         # step 6: commit collected tool messages
         self.messages.extend(tool_messages)
-        self.rollout_cache = await self.model.append_messages_to_rollout_cache(tool_messages, self.rollout_cache)
+        with simple_timer("tokenize_observations", self.rollout_cache["metrics"]):
+            self.rollout_cache = await self.model.append_messages_to_rollout_cache(tool_messages, self.rollout_cache)
         step_output.tool_results = tool_results
 
         # step 7: step-level exit_reason (precedence: terminal_dead >
@@ -428,7 +481,49 @@ class AgentInteraction:
         """Run one tool call in the env; errors become the observation (status marks the kind)."""
         action = self.tools_manager.get_tool_action(tool_call)
         self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
-        action_timeout = action.timeout or self.action_timeout
+        # unasked, a command gets the short yield timeout: it is not killed when that
+        # expires, so the cost of guessing low is one polling turn. A model that knows
+        # its command is slow may ask for more, up to the ceiling, but never past it.
+        requested = action.timeout if action.timeout and action.timeout > 0 else self.yield_timeout
+        action_timeout = max(1, min(requested, self.action_timeout))
+        # the kill wall bounds total run time, so no single action may outlive what is
+        # left of it: checking only afterwards let a 30s request served on 1s of budget
+        # run the full 30s before anything cancelled it. One second is the floor, so the
+        # wall may be overrun by that much rather than leaving an unusable sliver.
+        left = self.attached_kill_timeout - getattr(self.env, "attached_seconds", 0.0)
+        action_timeout = max(1, min(action_timeout, math.ceil(left)))
+
+        attached = getattr(self.env, "attached_command", None)
+        if attached and not action.is_input:
+            cancel_example = self.tools_manager.format_args_example({"command": "C-c", "is_input": True})
+            observation = (
+                f'Your command "{_clip(action.command)}" is NOT executed. The previous command '
+                f'"{_clip(attached)}" is still running, so you cannot start a new one. To cancel it, '
+                f"call this tool again with exactly these arguments: {cancel_example} -- is_input "
+                'must be a tool argument, not part of the command text. Send input the same way, '
+                'or "C-d" for EOF.'
+            )
+            self.logger.error(observation)
+            # a protocol correction, not a dead session: "skipped" would trip the
+            # terminal_dead abort and end the trajectory on a recoverable mistake
+            return ToolResult(
+                tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
+                observation=observation, status="syntax_error", execution_time=0.0,
+            )
+        if action.is_input and not attached:
+            rerun_example = self.tools_manager.format_args_example(
+                {"command": action.command, "is_input": False}
+            )
+            observation = (
+                "A command was expected but is_input was set. Nothing is currently running in the "
+                "session, so there is nothing to send input to. To run it as a command, resend "
+                f"exactly these arguments: {rerun_example}"
+            )
+            self.logger.error(observation)
+            return ToolResult(
+                tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
+                observation=observation, status="syntax_error", execution_time=0.0,
+            )
 
         tool_t0 = time.perf_counter()
         status: ToolStatus
@@ -442,9 +537,8 @@ class AgentInteraction:
             status = "ok"
         except ActionTimeoutError as e:
             observation = str(e)
-            status = "timeout"
-            self.timeout_budget -= 1
-            self.logger.error(f"{observation} (timeout_budget left: {self.timeout_budget})")
+            status = "yielded"
+            self.logger.info(observation)
         except ActionIncorrectSyntaxError as e:
             observation = str(e)
             status = "syntax_error"
@@ -453,26 +547,76 @@ class AgentInteraction:
             observation = str(e)
             status = "skipped"
             self.logger.error(observation)
+        elapsed = time.perf_counter() - tool_t0
+        if getattr(self.env, "attached_command", None):
+            self.env.attached_seconds += elapsed
+            if self.env.attached_seconds >= self.attached_kill_timeout:
+                observation, status = await self._kill_attached(observation)
+            elif status == "yielded":
+                # one note, built here because this is where the balance is known: the
+                # model cannot judge whether to keep waiting on a wall it is not told about
+                cancel_example = self.tools_manager.format_args_example({"command": "C-c", "is_input": True})
+                observation += (
+                    f"\n<NOTE>Still running: {self.env.attached_seconds:.2f}s of "
+                    f"{self.attached_kill_timeout:g}s used before it is cancelled, and no new command "
+                    "can run until then. Send it input with is_input=true -- to cancel, resend exactly "
+                    f'these arguments: {cancel_example} -- "C-d" for EOF, or "" to wait.</NOTE>'
+                )
         return ToolResult(
             tool_call_id=tool_call.id,
             name=tool_call.function.name,
             action=action.command,
             observation=observation,
             status=status,
-            execution_time=time.perf_counter() - tool_t0,
+            execution_time=elapsed,
+        )
+
+    async def _kill_attached(self, observation: str) -> tuple[str, ToolStatus]:
+        """Cancel a command that has held the session past its limit."""
+        killed, spent = self.env.attached_command, self.env.attached_seconds
+        last_words = await self.env.kill_attached()
+        self.timeout_budget -= 1
+        self.logger.error(
+            f"Killed attached command {killed!r} after {spent:.1f}s of run time "
+            f"(timeout_budget left: {self.timeout_budget})"
+        )
+        if last_words:
+            observation += f"\n{last_words}"
+        # the step ends once the budget goes below zero, so this many cancellations remain
+        left = self.timeout_budget + 1
+        if left <= 0:
+            consequence = "That was the last one allowed, so the episode ends here."
+        elif left == 1:
+            consequence = "One more cancellation ends the episode."
+        else:
+            consequence = f"{left} more cancellations end the episode."
+        return (
+            observation
+            + f"\n<NOTE>'{killed}' was cancelled: it held the session for {spent:.2f}s of run time, "
+            f"past the {self.attached_kill_timeout:g}s limit. The session is free again. "
+            f"{consequence}</NOTE>",
+            "timeout",
         )
 
     async def _condense_and_reseat(self, attempt: int) -> None:
         """Materialize the overflowing buffer as a segment (when it produced tokens),
         condense the history, and re-seat a fresh buffer from the condensed messages so
         the next generation continues into a new segment."""
+        if _should_break("condense"):
+            breakpoint()
         if len(self.rollout_cache.get("response_mask", [])) > 0:
             self._materialize_segment()
         budget = self._condense_budget(attempt)
+        n_messages_before = len(self.messages)
+        n_tokens_before = len(self.rollout_cache.get("prompt_ids", []))
         self.messages = self.condenser.condense(
             self.messages, budget, arg_masker=self.tools_manager.mask_tool_args
         )
+        carried_metrics = self.rollout_cache.get("metrics", {})
         self.rollout_cache = await self.model.prepare_rollout_cache(self.messages)
+        # the fresh buffer starts with empty metrics: carry the dict so timings stay
+        # per-trajectory (and so timers holding the old reference keep writing somewhere live)
+        self.rollout_cache["metrics"] = carried_metrics
         self.segment_start_messages = list(self.messages)
         # mark the condensation boundary; later op spans carry the new segment index
         seg_idx = len(self.segments)
@@ -481,7 +625,8 @@ class AgentInteraction:
         rollout_trace_event(
             "condensation",
             metadata={"segment_index": seg_idx, "attempt": attempt, "budget": budget},
-            input=f"context overflow on attempt {attempt}; freeing ~{budget} chars",
+            input=f"context overflow on attempt {attempt} at {n_messages_before} messages / "
+            f"{n_tokens_before} prompt tokens; freeing ~{budget} chars",
             output=f"re-seated to {len(self.messages)} messages / {n_after} prompt tokens (segment {seg_idx})",
         )
 
@@ -514,6 +659,12 @@ class AgentInteraction:
                     break
                 if self.check_stuck():
                     self.logger.error(f"Exit due to stuck loop: {self.stuck_threshold} identical responses")
+                    rollout_trace_event(
+                        "stuck_abort",
+                        metadata={"threshold": self.stuck_threshold, "step_idx": step_idx},
+                        input=f"{self.stuck_threshold} consecutive identical responses",
+                        output=(step_output.response or "")[:500],
+                    )
                     step_output = StepOutput(step_idx=step_idx, exit_reason="stuck")
                     self.trajectory.append(step_output)
                     break

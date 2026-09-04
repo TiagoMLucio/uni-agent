@@ -86,7 +86,14 @@ class _SshMaster:
             + self._ssh_opts()
             + ["-L", f"127.0.0.1:{podman_local}:127.0.0.1:{self._config.podman_port}", self._config.ssh_host]
         )
-        subprocess.run(cmd, check=True, timeout=self._config.startup_timeout, capture_output=True)
+        proc = subprocess.run(cmd, timeout=self._config.startup_timeout, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # unreadable key, refused auth, unknown host: ssh says which only on stderr,
+            # and without it every one of them is an indistinguishable "exit status 255"
+            raise RuntimeError(
+                f"ssh ControlMaster to {self._config.ssh_host} failed (exit {proc.returncode}): "
+                f"{proc.stderr.strip() or '<no stderr>'}"
+            )
         self.docker = docker.DockerClient(
             base_url=f"tcp://127.0.0.1:{podman_local}", timeout=int(self._config.startup_timeout)
         )
@@ -111,11 +118,16 @@ class _SshMaster:
                     + ["-L", f"127.0.0.1:{local}:127.0.0.1:{remote_port}", self._config.ssh_host]
                 )
                 try:
-                    await asyncio.to_thread(subprocess.run, cmd, check=True, timeout=30, capture_output=True)
+                    await asyncio.to_thread(
+                        subprocess.run, cmd, check=True, timeout=30, capture_output=True, text=True
+                    )
                     return local
                 except subprocess.CalledProcessError as exc:
                     last = exc
-            raise RuntimeError(f"ssh -O forward failed for remote port {remote_port}") from last
+            detail = (getattr(last, "stderr", "") or "").strip() or "<no stderr>"
+            # a master that cannot forward is dead; the next _ensure starts a fresh one
+            self._started = False
+            raise RuntimeError(f"ssh -O forward failed for remote port {remote_port}: {detail}") from last
 
     async def cancel(self, local_port: int, remote_port: int) -> None:
         cmd = (
@@ -178,6 +190,8 @@ class SshPodmanDeployment(AbstractDeployment):
             name=name,
             detach=True,
             auto_remove=True,
+            # disposable sandbox: skip the SIGTERM grace period on stop/remove
+            stop_signal="SIGKILL",
             ports={f"{self._config.runtime_port}/tcp": ("127.0.0.1", None)},
         )
         container.reload()
@@ -202,7 +216,7 @@ class SshPodmanDeployment(AbstractDeployment):
         last: IsAliveResponse | None = None
         while loop.time() < end:
             last = await self.is_alive(timeout=5.0)
-            if last:
+            if last.is_alive:
                 return last
             await asyncio.sleep(0.5)
         # no stop() here: the caller's retry handler fetches container logs before tearing down
@@ -263,10 +277,16 @@ class SshPodmanDeployment(AbstractDeployment):
         self._local_port = None
         self._remote_port = None
         if self._container_name is not None and self._master is not None and self._master.docker is not None:
-            try:
-                await asyncio.to_thread(self._master.docker.containers.get(self._container_name).remove, force=True)
-            except Exception as exc:
-                self.logger.error(f"Failed to remove remote sandbox {self._container_name}: {exc}")
+            # rootless podman netns teardown fails transiently under concurrent ops; container TTL is the backstop
+            for attempt, delay in enumerate((0, 3, 9), start=1):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    await asyncio.to_thread(self._master.docker.containers.get(self._container_name).remove, force=True)
+                    break
+                except Exception as exc:
+                    log = self.logger.error if attempt == 3 else self.logger.warning
+                    log(f"Failed to remove remote sandbox {self._container_name} (attempt {attempt}/3): {exc}")
             self._container_name = None
         self._stopped = True
 

@@ -31,6 +31,19 @@ class ToolsManager:
         self.tools_schemas = [t.get_tool_schema() for t in self.tools]
         self._tool_parser = get_tool_parser(tools_manager_config.parser)
 
+    def format_args_example(self, args: dict) -> str:
+        """A literal tool-call arguments example in the configured call notation.
+
+        Env messages quote corrected calls with this so the model can resend them
+        verbatim; a JSON example shown to an XML-notation model (or vice versa)
+        would teach the wrong syntax.
+        """
+        if self.tools_manager_config.parser == "hermes":
+            return json.dumps(args)
+        return " ".join(
+            f"<parameter={k}>{str(v).lower() if isinstance(v, bool) else v}</parameter>" for k, v in args.items()
+        )
+
     async def parse_action(
         self,
         model_output: str,
@@ -91,6 +104,9 @@ class ToolsManager:
         if func_name == "submit":
             return "echo '<<<Finished>>>'"
 
+        if func_name == "think":
+            return "echo 'Your thought has been logged.'"
+
         if func_name == "execute_bash":
             return func_params.get("command", "")
 
@@ -108,7 +124,7 @@ class ToolsManager:
 
         # Append all other parameters
         for param_key, param_value in func_params.items():
-            if param_key == "command":
+            if param_key == "command" or param_value is None:
                 continue
 
             # Use JSON for structured types so the script can json.loads them
