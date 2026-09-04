@@ -675,18 +675,13 @@ def test_corrected_call_reports_class():
     assert (step, cls) == (4, "trailing") and json.dumps("a\nb")[1:-1] in call
 
 
-def test_tool_fix_ships_the_target_when_configured():
+def test_tool_fix_hint_is_text_placed_at_the_call():
     old, new = "    a()", "    b()"
     turns = [_fix_turn(1, old, new, "Closest match: lines 1-1 match exactly except every line "
                                     "of your old_str has 4 extra leading space(s).")]
-    reflector = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix", target_mask=True))
-    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))
-    h = hints[1]
-    assert h["at"] == "call" and "target" in h
-    assert json.dumps("a()")[1:-1] in h["target"], "target is the corrected call"
-    without = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix"))
-    h2 = asyncio.run(without.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))[1]
-    assert "target" not in h2, "default ships no target (p1toolfix3 reproducible)"
+    h = _fix(turns)[1]
+    assert set(h) == {"text", "at"} and h["at"] == "call"
+    assert json.dumps("a()")[1:-1] in h["text"], "hint carries the corrected call"
 
 
 def test_tool_fix_prefers_the_editor_printed_region_and_keeps_the_models_new_str():
@@ -696,10 +691,9 @@ def test_tool_fix_prefers_the_editor_printed_region_and_keeps_the_models_new_str
                 "4 extra leading space(s).\nThe matching region of the file reads exactly:\n"
                 "    a()\n    b()\nResend the call with this, copied character for character, as your old_str.")
     turns = [_fix_turn(0, old, new, obs_tail)]
-    reflector = ToolFixReflector(None, ToolFixReflectionConfig(enabled=True, name="tool_fix", target_mask=True))
-    h = asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="g", feedback="f"))[0]
-    assert json.dumps("    a()\n    b()")[1:-1] in h["target"], "old_str from the printed region"
-    assert json.dumps(new)[1:-1] in h["target"], "new_str stays the model's own"
+    _step, _cls, call = corrected_call(turns, 0.8)
+    assert json.dumps("    a()\n    b()")[1:-1] in call, "old_str from the printed region"
+    assert json.dumps(new)[1:-1] in call, "new_str stays the model's own"
 
 
 def test_non_canonical_wire_ships_no_target():
@@ -737,13 +731,12 @@ def test_tool_fix_old_wire_hint_template():
     turns = [_fix_turn(3, old, new, "Closest match: lines 1-2 match exactly except every line "
                                     "of your old_str has 4 extra leading space(s).")]
     cfg = ToolFixReflectionConfig(
-        enabled=True, name="tool_fix", target_mask=True,
+        enabled=True, name="tool_fix",
         hint_template='Your next edit must use exactly this value:\n"old_str": {corrected_old_wire}')
     h = asyncio.run(ToolFixReflector(None, cfg).reflect_trajectory(
         task="t", turns=turns, gold="g", feedback="f"))[3]
     assert h["text"].endswith(json.dumps("a()\nb()")), h["text"]
     assert "new_str" not in h["text"], "old-wire hint carries no new_str"
-    assert "target" in h and json.dumps("a()\nb()")[1:-1] in h["target"], "mask target still the full call"
 
 
 def test_tool_fix_template_validation_accepts_either_placeholder():
@@ -820,33 +813,12 @@ def test_hint_at_retry_reaches_past_a_view_turn():
     assert list(_fix(turns, hint_at="retry")) == [2]
 
 
-def test_hint_at_retry_ships_the_same_corrected_call_and_target():
+def test_hint_at_retry_ships_the_same_corrected_call():
     turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
              _fix_retry_turn(1, "    a()", "    b()", INDENT_DIAG)]
-    hints = _fix(turns, hint_at="both", target_mask=True)
+    hints = _fix(turns, hint_at="both")
     assert hints[0]["text"] == hints[1]["text"] and hints[0]["at"] == hints[1]["at"] == "call"
-    assert hints[0]["target"] == hints[1]["target"]
     assert hints[0] is not hints[1], "each step carries its own hint dict"
-
-
-def test_hint_at_retry_target_is_reanchored_on_the_retry_call():
-    """A retry usually rewrites both fields; the retry-step target must keep the RETRY's
-    own new_str and swap only its old_str for the verified value."""
-    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
-             _fix_retry_turn(1, "  a()", "  c()", INDENT_DIAG)]
-    hints = _fix(turns, hint_at="both", target_mask=True)
-    assert '"old_str": ' + json.dumps("a()") in hints[1]["target"], "old_str swapped"
-    assert '"new_str": ' + json.dumps("  c()") in hints[1]["target"], "retry's new_str kept"
-    assert json.dumps("    b()") not in hints[1]["target"], "failed call's new_str gone"
-    assert hints[0]["text"] == hints[1]["text"], "hint text unchanged"
-
-
-def test_hint_at_retry_ships_no_target_when_the_retry_already_adopted():
-    """A retry that already wrote the verified old_str but still failed has nothing sound
-    to teach at that placement; ship no retry hint rather than a wrong target."""
-    turns = [_fix_turn(0, "    a()", "    b()", INDENT_DIAG),
-             _fix_retry_turn(1, "a()", "b()", "old_str `a()` did not appear verbatim in /f.py.")]
-    assert _fix(turns, hint_at="retry", target_mask=True) == {}
 
 
 def test_hint_at_validation():

@@ -424,8 +424,6 @@ class UniAgentLoop(AgentLoopBase):
         dummy_response_length = min(512, max_response_length)
 
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
-        # TODO: implement traj_mask in verl
-        extra_fields["traj_masked"] = 1
         extra_fields["traj_exit_reason"] = exit_reason
         if getattr(self, "emit_feedback", False):
             extra_fields["reward_extra_info"] = {"feedback": None}
@@ -668,7 +666,6 @@ class UniAgentLoop(AgentLoopBase):
         )
 
         shared_extra: dict[str, Any] = {
-            "traj_masked": int(should_mask_traj),
             "traj_exit_reason": traj_exit_reason,
             # AgentLoopMetrics is a fixed schema the sync trainer never surfaces, so the
             # per-trajectory timings ride along here instead
@@ -760,7 +757,7 @@ class UniAgentLoop(AgentLoopBase):
         # a reflector may return {"text": ..., "at": "call"} instead of plain text; the
         # placement rides as a third element so the trainer can splice mid-turn
         extra_fields["turn_feedback"] = [
-            [step, hint["text"], hint["at"], *([hint["target"]] if hint.get("target") else [])]
+            [step, hint["text"], hint["at"]]
             if isinstance(hint, dict) else [step, hint]
             for step, _, _ in extra_fields["turn_spans"]
             if (hint := turn_feedback.get(step)) is not None
