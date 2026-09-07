@@ -28,9 +28,9 @@ def _build(hinted, hints):
 
 def test_one_subrow_per_hint():
     hinted = [
-        HintedTurn(3, 12, 16, "a", "turn"),
-        HintedTurn(5, 24, 28, "b", "turn"),
-        HintedTurn(7, 33, 36, "c", "turn"),
+        HintedTurn(3, 12, 16, "a"),
+        HintedTurn(5, 24, 28, "b"),
+        HintedTurn(7, 33, 36, "c"),
     ]
     seq, meta, _, _ = _build(hinted, [_hint(900), _hint(901), _hint(902)])
     assert meta[0] == 3
@@ -41,7 +41,7 @@ def test_one_subrow_per_hint():
 def test_a_subrow_carries_only_its_own_hint():
     """The whole point: sub-row 2 must not contain hint 1, or the teacher scores turn 2
     from a state where it gave advice that was then ignored."""
-    hinted = [HintedTurn(3, 12, 16, "a", "turn"), HintedTurn(5, 24, 28, "b", "turn")]
+    hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
     seq, meta, _, _ = _build(hinted, [_hint(900), _hint(901)])
 
     offset = 0
@@ -59,7 +59,7 @@ def test_a_subrow_carries_only_its_own_hint():
 def test_span_lands_at_body_start():
     """body_start must index the scored tokens inside the body, or the teacher's outputs
     scatter onto the wrong response positions."""
-    hinted = [HintedTurn(3, 12, 16, "a", "turn"), HintedTurn(5, 24, 28, "b", "turn")]
+    hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
     seq, meta, _, _ = _build(hinted, [_hint(900), _hint(901)])
 
     offset = 0
@@ -71,7 +71,7 @@ def test_span_lands_at_body_start():
 
 
 def test_history_before_the_hint_is_untouched():
-    hinted = [HintedTurn(5, 24, 28, "b", "turn")]
+    hinted = [HintedTurn(5, 24, 28, "b")]
     seq, meta, _, _ = _build(hinted, [_hint(901)])
     total_len, body_len, body_start, start, end = meta[1:6]
     body = seq[-body_len:]
@@ -81,9 +81,9 @@ def test_history_before_the_hint_is_untouched():
 
 def test_exploder_returns_one_row_per_hint():
     hinted = [
-        HintedTurn(3, 12, 16, "a", "turn"),
-        HintedTurn(5, 24, 28, "b", "turn"),
-        HintedTurn(7, 33, 36, "c", "turn"),
+        HintedTurn(3, 12, 16, "a"),
+        HintedTurn(5, 24, 28, "b"),
+        HintedTurn(7, 33, 36, "c"),
     ]
     seq, meta, _, _ = _build(hinted, [_hint(900), _hint(901), _hint(902)])
     seqs = torch.nested.nested_tensor([seq], layout=torch.jagged)
@@ -100,7 +100,7 @@ def test_exploder_returns_one_row_per_hint():
 def test_student_keeps_the_union_of_spans():
     """The student scores every hinted span in one pass, so its keep positions are the union
     even though the teacher now splits them."""
-    hinted = [HintedTurn(3, 12, 16, "a", "turn"), HintedTurn(5, 24, 28, "b", "turn")]
+    hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
     _, meta, _, _ = _build(hinted, [_hint(900), _hint(901)])
     prompt_len = PROMPT.shape[0]
     input_ids = torch.nested.nested_tensor(
@@ -129,7 +129,7 @@ def test_degenerate_row_encoding_round_trips():
 def test_first_turn_hint_joins_the_prefix():
     """A turn starting at position 0 has its header in the prompt, so the hint goes there."""
     prompt = torch.cat([torch.arange(100, 108), HEADER])
-    hinted = [HintedTurn(1, 0, 4, "a", "turn")]
+    hinted = [HintedTurn(1, 0, 4, "a")]
     seq, meta, fallbacks, _ = build_spliced_teacher_row(
         prompt, RESPONSE, hinted, [_hint(900)], max_prefix_len=64, header_ids=HEADER
     )
@@ -141,7 +141,7 @@ def test_first_turn_hint_joins_the_prefix():
 
 
 def test_fallback_counted_when_no_header_precedes_the_span():
-    hinted = [HintedTurn(3, 13, 17, "a", "turn")]  # 13-2=11,12 are not the header tokens
+    hinted = [HintedTurn(3, 13, 17, "a")]  # 13-2=11,12 are not the header tokens
     _, meta, fallbacks, _ = _build(hinted, [_hint(900)])
     assert fallbacks == 1
     assert meta[0] == 1

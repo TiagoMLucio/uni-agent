@@ -2,12 +2,9 @@
 
 from typing import NamedTuple, Optional
 
-import torch
-
 __all__ = [
     "HintedTurn",
     "assistant_header_ids",
-    "hint_token_ids",
     "hint_user_turn_ids",
     "select_hinted_turns",
 ]
@@ -15,38 +12,28 @@ __all__ = [
 
 class HintedTurn(NamedTuple):
     """One reflection hint paired with the turn it lands on: ``[start, end)`` on the response
-    grid, spliced before the whole turn (``placement == "turn"``, the default) or between the
-    turn's reasoning and its tool call (``"call"``)."""
+    grid, spliced as a user turn before the turn's assistant header."""
 
     step: int
     start: int
     end: int
     text: str
-    placement: str = "turn"
-
-    @property
-    def is_call(self) -> bool:
-        return self.placement == "call"
 
 
 def select_hinted_turns(
     extra_fields: dict, response_len: int, max_hinted_turns: Optional[int] = None
 ) -> list[HintedTurn]:
-    """Pair a sample's turn spans with its hints. The rollout ships the
-    placement as an optional third element of the ``turn_hints`` entry; a fourth element
-    (the ``target`` field older rollout dumps still carry) is ignored.
+    """Pair a sample's turn spans with its hints. A ``turn_hints`` entry is ``[step, text]``.
 
     Spans are clamped to the (possibly truncated) response; with a cap, the first
     ``max_hinted_turns`` turns are kept (earliest, before the trajectory loses coherence).
     """
-    hint_by_step = {int(entry[0]): (entry[1], entry[2] if len(entry) > 2 else "turn")
-                    for entry in (extra_fields.get("turn_hints") or [])}
+    hint_by_step = {int(entry[0]): entry[1] for entry in (extra_fields.get("turn_hints") or [])}
     hinted = []
     for step, start, end in extra_fields.get("turn_spans") or []:
         step, start, end = int(step), int(start), min(int(end), response_len)
         if step in hint_by_step and start < end:
-            text, placement = hint_by_step[step]
-            hinted.append(HintedTurn(step, start, end, text, placement))
+            hinted.append(HintedTurn(step, start, end, hint_by_step[step]))
     if max_hinted_turns is not None and len(hinted) > max_hinted_turns:
         hinted = hinted[:max_hinted_turns]
     return hinted
@@ -86,22 +73,12 @@ def assistant_header_ids(tokenizer, template_kwargs=None) -> list[int]:
 
 def hint_user_turn_ids(tokenizer, hint_text: str, template_kwargs=None) -> list[int]:
     """Token ids of ``hint_text`` rendered as a full user turn of the tokenizer's chat template."""
-    suffix = _template_suffix(
-        tokenizer,
-        messages=[{"role": "user", "content": hint_text}],
-        probe=_TEMPLATE_PROBE_USER,
-        template_kwargs=template_kwargs,
-    )
-    return tokenizer.encode(suffix, add_special_tokens=False)
-
-
-def hint_token_ids(
-    tokenizer, hint: HintedTurn, turn_hint_template: str, call_hint_template: str, template_kwargs=None
-) -> torch.Tensor:
-    """Token ids of ``hint`` wrapped in the template its placement calls for, rendered as a
-    user turn."""
-    template = call_hint_template if hint.is_call else turn_hint_template
-    return torch.tensor(
-        hint_user_turn_ids(tokenizer, template.format(hint=hint.text), template_kwargs=template_kwargs),
-        dtype=torch.int64,
+    return tokenizer.encode(
+        _template_suffix(
+            tokenizer,
+            messages=[{"role": "user", "content": hint_text}],
+            probe=_TEMPLATE_PROBE_USER,
+            template_kwargs=template_kwargs,
+        ),
+        add_special_tokens=False,
     )

@@ -71,52 +71,6 @@ _JSON_DECODER = json.JSONDecoder()
 _LENIENT_DECODER = json.JSONDecoder(strict=False)
 #: a hint key as the model writes it: "turn7", 'turn_7', turn 7
 _TURN_KEY_RE = re.compile(r"[\"']?turn[_\s]*(\d+)[\"']?\s*:\s*[\"']")
-#: The reflectors that produce the best hints answer one note per line, "54: the condition needs
-#: both clauses to hold". Nothing here read that shape, so such a reply yielded no hints at all,
-#: which reads as a reflector with nothing to say rather than as a format mismatch. A colon is
-#: required rather than any separator, so a numbered list ("1. First, open the file") and a diff
-#: body cannot be mined as hints.
-_TURN_LINE_RE = re.compile(r"^[\s>*_`#-]*\[?\(?<?\s*(?:turn\s*)?(\d+)\s*>?\)?\]?[`*_]*\s*:\s+(.+?)\s*$",
-                           re.I | re.M)
-
-#: The str_replace editor's own error messages, one stable fragment per message (interpolated
-#: values elided; both wording variants where the tool has two). Verbatim substrings only: a
-#: fuzzy pattern would also catch file content that merely resembles an error.
-EDITOR_ERROR_MARKS = (
-    # str_replace failures
-    "did not appear verbatim in",
-    "No replacement was performed. Multiple occurrences of",
-    "your old_str and new_str are byte-identical",
-    "is the same as new_str",
-    # argument validation
-    "Parameter `file_text` is required for command: create",
-    "Parameter `old_str` is required for command: str_replace",
-    "Parameter `insert_line` is required for command: insert",
-    "Parameter `new_str` is required for command: insert",
-    "Unrecognized command `",
-    # path validation
-    "does not exist. Please provide a valid path.",
-    "Cannot overwrite files using command",
-    "is a directory and only the `view` command can be used on directories",
-    # view / create / insert / undo_edit / file io
-    "The `view_range` parameter is not allowed when `path` points to a directory.",
-    "Invalid `view_range`",
-    "does not exist. Please create it first.",
-    "Invalid `insert_line` parameter:",
-    "No edit history found for",
-    "Ran into UnicodeDecodeError",
-    "while trying to write to",
-)
-
-
-def first_editor_error_step(turns: list[dict]) -> int | None:
-    """Step of the first str_replace_editor call whose observation is one of the editor's errors."""
-    for turn in turns:
-        for call in turn.get("tools") or []:
-            observation = call.get("observation") or ""
-            if call.get("name") == "str_replace_editor" and any(mark in observation for mark in EDITOR_ERROR_MARKS):
-                return turn["step"]
-    return None
 
 
 class BaseReflectionConfig(BaseModel):
@@ -134,8 +88,6 @@ class BaseReflectionConfig(BaseModel):
     failed_only: bool = True
     #: terminations (`stuck`, `max_step_limit`, ...) left unhinted; skips the reflector calls too
     skip_exit_reasons: list[str] = []
-    #: drop every hint at or after the first failed str_replace_editor call (its own error strings)
-    hint_cutoff_on_editor_error: bool = False
     #: apply_chat_template kwargs for reflector calls only; None inherits the rollout's.
     #: The reflector is a separate, untrained call whose prompt asks for staged reasoning,
     #: so it can need reasoning on where the rollout deliberately has it off.
@@ -409,16 +361,6 @@ class AbstractReflector(ABC):
                 hints[int(match.group(1))] = value
         return hints
 
-    @staticmethod
-    def _parse_turn_lines(text: str) -> dict[int, str]:
-        """Hints from a reply that answers one note per line instead of a JSON object."""
-        hints: dict[int, str] = {}
-        for step, note in _TURN_LINE_RE.findall(text or ""):
-            note = note.strip().strip('"').strip()
-            if len(note) >= 15:
-                hints[int(step)] = note
-        return hints
-
     @classmethod
     def _parse(cls, text: str) -> dict[int, str]:
         # After the last marker first, so an audit's own braces cannot shadow the answer; the
@@ -435,8 +377,7 @@ class AbstractReflector(ABC):
                 break
         if not isinstance(raw, dict):
             # last resort: read the keys out of an object no decoder will take
-            salvaged = cls._salvage_hints(tail or text)
-            return salvaged or cls._parse_turn_lines(tail or text)
+            return cls._salvage_hints(tail or text)
         hints: dict[int, str] = {}
         for key, value in raw.items():
             digits = "".join(c for c in str(key) if c.isdigit())

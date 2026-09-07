@@ -1,24 +1,12 @@
 """The spliced teacher row: one sub-row per hint, its meta packed by
 :mod:`verl.trainer.ppo.sdpo.teacher_meta`, plus the per-token mask."""
 
-from typing import Optional
-
 import torch
 
 from uni_agent.sdpo.hints import HintedTurn
 from verl.trainer.ppo.sdpo.teacher_meta import SubRow, pack
 
 __all__ = ["build_spliced_teacher_row", "turn_token_mask"]
-
-
-def _find_subseq(haystack: torch.Tensor, needle: torch.Tensor, start: int, end: int) -> Optional[int]:
-    """Index of the first occurrence of ``needle`` inside ``haystack[start:end]``, or None."""
-    n = needle.shape[0]
-    if n == 0 or end - start < n:
-        return None
-    window = haystack[start:end]
-    hits = (window.unfold(0, n, 1) == needle).all(dim=1).nonzero()
-    return start + hits[0].item() if len(hits) else None
 
 
 def _sub_row(
@@ -38,18 +26,13 @@ def build_spliced_teacher_row(
     hint_ids_list: list[torch.Tensor],
     max_prefix_len: int,
     header_ids: torch.Tensor,
-    close_ids: Optional[torch.Tensor] = None,
-    call_open_ids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
-    and truncated after the scored span. Turn-placed hints go immediately before the
-    turn's assistant header and score the whole turn. Call-placed hints go between
-    the turn's reasoning and its tool call: the assistant turn is closed (``close_ids``),
-    the hint's user turn inserted, the assistant header reopened, and only the call span
-    (from ``call_open_ids``, e.g. the ``<tool_call>`` token, to the turn's end) is scored.
-    A call hint whose turn has no call opening falls back to the turn splice.
+    and truncated after the scored span. The hint goes immediately before the turn's
+    assistant header and the whole turn is scored; when the header is not where the span
+    says, the hint is spliced at the span start instead and counted as a fallback.
 
     Carrying every hint in one sequence would make the teacher score a later turn from a
     state it could not reach: it would see its own earlier advice followed by the student
@@ -69,44 +52,27 @@ def build_spliced_teacher_row(
         start, end = hint.start, hint.end
         hint_ids = hint_ids.to(response_ids.dtype)
         prefix = base_prefix
-        call_at = None
-        if hint.is_call and close_ids is not None and call_open_ids is not None:
-            call_at = _find_subseq(response_ids, call_open_ids.to(response_ids.dtype), start, end)
-
-        if call_at is not None:
-            body = [
-                response_ids[:call_at],  # history plus this turn's header and reasoning
-                close_ids.to(response_ids.dtype),
-                hint_ids,
-                header_ids.to(response_ids.dtype),
-                response_ids[call_at:end],  # the call, the only span the teacher scores
-            ]
-            row, sub_row = _sub_row(prefix, body, scored=4, span=(call_at, end))
+        if start >= header and torch.equal(response_ids[start - header : start], header_ids):
+            insert_at = start - header
+        elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
+            # first turn: its assistant header is the prompt tail, so the hint joins the prefix
+            prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
+            insert_at = None
         else:
-            # one count per hint, whether the call opening was missing, the header was, or both
-            degraded = hint.is_call
-            if start >= header and torch.equal(response_ids[start - header : start], header_ids):
-                insert_at = start - header
-            elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
-                # first turn: its assistant header is the prompt tail, so the hint joins the prefix
-                prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
-                insert_at = None
-            else:
-                insert_at = start
-                degraded = True
-            fallbacks += int(degraded)
+            insert_at = start
+            fallbacks += 1
 
-            if insert_at is None:
-                body = [response_ids[:start], response_ids[start:end]]
-                row, sub_row = _sub_row(prefix, body, scored=1, span=(start, end))
-            else:
-                body = [
-                    response_ids[:insert_at],  # untouched history, no other hints
-                    hint_ids,
-                    response_ids[insert_at:start],  # the turn's assistant header
-                    response_ids[start:end],  # the span the teacher scores
-                ]
-                row, sub_row = _sub_row(prefix, body, scored=3, span=(start, end))
+        if insert_at is None:
+            body = [response_ids[:start], response_ids[start:end]]
+            row, sub_row = _sub_row(prefix, body, scored=1, span=(start, end))
+        else:
+            body = [
+                response_ids[:insert_at],  # untouched history, no other hints
+                hint_ids,
+                response_ids[insert_at:start],  # the turn's assistant header
+                response_ids[start:end],  # the span the teacher scores
+            ]
+            row, sub_row = _sub_row(prefix, body, scored=3, span=(start, end))
 
         pieces.append(row)
         sub_rows.append(sub_row)
@@ -120,4 +86,3 @@ def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Te
     for start, end in spans:
         mask[start:end] = 1.0
     return mask
-

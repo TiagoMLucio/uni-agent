@@ -18,7 +18,7 @@ from uni_agent.interaction import (
     ToolsManager,
     ToolsManagerConfig,
 )
-from uni_agent.reflection import build_reflection_config, first_editor_error_step, load_reflector
+from uni_agent.reflection import build_reflection_config, load_reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
@@ -392,10 +392,6 @@ class UniAgentLoop(AgentLoopBase):
                 outcome=outcome,
                 agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
             )
-            if config.hint_cutoff_on_editor_error:
-                cutoff = first_editor_error_step(turns)
-                if cutoff is not None:
-                    hints = {step: hint for step, hint in hints.items() if step < cutoff}
             if not hints:
                 interaction_result.setdefault("metrics", {})["reflect_empty"] = 1.0
             return hints
@@ -754,11 +750,8 @@ class UniAgentLoop(AgentLoopBase):
             if start < len(response_ids)
         ]
         turn_hints = turn_hints or {}
-        # a reflector may return {"text": ..., "at": "call"} instead of plain text; the
-        # placement rides as a third element so the trainer can splice mid-turn
         extra_fields["turn_hints"] = [
-            [step, hint["text"], hint["at"]]
-            if isinstance(hint, dict) else [step, hint]
+            [step, hint]
             for step, _, _ in extra_fields["turn_spans"]
             if (hint := turn_hints.get(step)) is not None
         ]

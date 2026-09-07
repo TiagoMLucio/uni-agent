@@ -1,6 +1,6 @@
 """User-turn hint insertion in build_spliced_teacher_row: the hint lands before the turn's
-assistant header (not after it, prefill-style), with a bare-splice fallback when the header
-isn't where expected. Meta must keep mapping each span's verbatim tokens on the body grid."""
+assistant header, with a bare-splice fallback when the header isn't where expected. Meta must
+keep mapping each span's verbatim tokens on the body grid."""
 
 import pytest
 import torch
@@ -31,7 +31,7 @@ def test_hint_inserted_before_assistant_header():
     prompt = torch.arange(10, dtype=torch.int64)
     # response: turn0 [0:4), obs+header [4:12) with header at [9:12), turn1 [12:16)
     response = torch.tensor([0, 1, 2, 3, 50, 51, 52, 53, 54, 90, 91, 92, 10, 11, 12, 13], dtype=torch.int64)
-    hinted = [HintedTurn(1, 12, 16, "hint", "turn")]
+    hinted = [HintedTurn(1, 12, 16, "hint")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
     seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
@@ -45,7 +45,7 @@ def test_hint_inserted_before_assistant_header():
 def test_first_turn_hint_joins_prompt_tail():
     prompt = torch.cat([torch.arange(5, dtype=torch.int64), HEADER])
     response = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-    hinted = [HintedTurn(0, 0, 4, "hint", "turn")]
+    hinted = [HintedTurn(0, 0, 4, "hint")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
     seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
@@ -60,7 +60,7 @@ def test_first_turn_hint_joins_prompt_tail():
 def test_missing_header_falls_back_to_bare_splice():
     prompt = torch.arange(10, dtype=torch.int64)
     response = torch.tensor([0, 1, 2, 3, 50, 51, 52, 10, 11, 12], dtype=torch.int64)  # no header anywhere
-    hinted = [HintedTurn(1, 7, 10, "hint", "turn")]
+    hinted = [HintedTurn(1, 7, 10, "hint")]
     hint = torch.tensor([70, 71], dtype=torch.int64)
 
     seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
@@ -84,7 +84,7 @@ def test_cumulative_hints_and_truncation_after_last_span():
             torch.tensor([98, 99], dtype=torch.int64),  # trailing tokens beyond last span
         ]
     )
-    hinted = [HintedTurn(0, 5, 8, "a", "turn"), HintedTurn(1, 13, 15, "b", "turn")]
+    hinted = [HintedTurn(0, 5, 8, "a"), HintedTurn(1, 13, 15, "b")]
     hints = [torch.tensor([70], dtype=torch.int64), torch.tensor([71], dtype=torch.int64)]
 
     seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, hints, 100, HEADER)
@@ -97,73 +97,7 @@ def test_cumulative_hints_and_truncation_after_last_span():
     _spans_map_back(seq, meta, response, hinted)
 
 
-# --- mid-turn (call-placed) splice -------------------------------------------------------
-
-CLOSE = torch.tensor([80, 81], dtype=torch.int64)
-CALL_OPEN = torch.tensor([95], dtype=torch.int64)
-
-
-def test_call_hint_splices_between_reasoning_and_call():
-    prompt = torch.arange(10, dtype=torch.int64)
-    # one turn [0:10): reasoning [0:4), call opening at 4, call body [5:10)
-    response = torch.tensor([1, 2, 3, 4, 95, 30, 31, 32, 33, 34], dtype=torch.int64)
-    hinted = [HintedTurn(0, 0, 10, "h", "call")]
-    hint = torch.tensor([70, 71], dtype=torch.int64)
-
-    seq, meta, fallbacks, spans = build_spliced_teacher_row(
-        prompt, response, hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
-
-    assert fallbacks == 0
-    expected = torch.cat([prompt, response[:4], CLOSE, hint, HEADER, response[4:10]])
-    assert torch.equal(seq, expected), "close + hint + header must sit between reasoning and call"
-    assert spans == [(4, 10)], "only the call tokens are scored"
-    assert meta == [1, seq.shape[0], seq.shape[0] - 10, 4 + 2 + 2 + 3, 4, 10]
-    from uni_agent.sdpo.splice import turn_token_mask
-    mask = turn_token_mask(10, spans)
-    assert mask.tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
-
-
-def test_call_hint_without_call_opening_falls_back_to_turn_splice():
-    prompt = torch.arange(10, dtype=torch.int64)
-    # header at [2:5), turn [5:9), no CALL_OPEN token anywhere
-    response = torch.tensor([1, 2, 90, 91, 92, 10, 11, 12, 13], dtype=torch.int64)
-    hinted = [HintedTurn(1, 5, 9, "h", "call")]
-    hint = torch.tensor([70, 71], dtype=torch.int64)
-
-    seq, meta, fallbacks, spans = build_spliced_teacher_row(
-        prompt, response, hinted, [hint], 100, HEADER, close_ids=CLOSE, call_open_ids=CALL_OPEN)
-
-    assert fallbacks == 1, "a call hint with no call opening is a fallback"
-    expected = torch.cat([prompt, response[:2], hint, response[2:9]])
-    assert torch.equal(seq, expected), "fallback is the turn splice before the header"
-    assert spans == [(5, 9)], "fallback scores the whole turn"
-
-
-def test_call_hint_without_splice_ids_falls_back():
-    prompt = torch.arange(10, dtype=torch.int64)
-    response = torch.tensor([1, 2, 90, 91, 92, 10, 11, 95, 13], dtype=torch.int64)
-    hinted = [HintedTurn(1, 5, 9, "h", "call")]
-    hint = torch.tensor([70, 71], dtype=torch.int64)
-
-    seq, meta, fallbacks, spans = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER)
-
-    assert fallbacks == 1
-    assert spans == [(5, 9)]
-    assert torch.equal(seq, torch.cat([prompt, response[:2], hint, response[2:9]]))
-
-
-def test_select_hinted_turns_reads_call_placement():
-    from uni_agent.sdpo.hints import select_hinted_turns
-
-    extra = {"turn_spans": [[0, 0, 4], [1, 4, 9]],
-             "turn_hints": [[0, "a"], [1, "b", "call"], ]}
-    assert select_hinted_turns(extra, 9) == [HintedTurn(0, 0, 4, "a", "turn"), HintedTurn(1, 4, 9, "b", "call")]
-    assert [hint.is_call for hint in select_hinted_turns(extra, 9)] == [False, True]
-    extra["turn_hints"] = [[1, "b", "call", "removed target field"]]
-    assert select_hinted_turns(extra, 9) == [HintedTurn(1, 4, 9, "b", "call")]
-
-
-# --- channel balance (call_loss_weight as the call rows' weight_scale) ---------------------
+# --- trace weights -----------------------------------------------------------------------
 
 
 def test_trace_weights_default_matches_one_per_supervised_row():
@@ -178,26 +112,3 @@ def test_trace_weights_split_a_condensed_trajectory_by_supervision():
     w = trace_weights([30.0, 10.0], [("a", "0"), ("a", "0")])
     assert w[0] / w[1] == pytest.approx(3.0)
     assert sum(w) == pytest.approx(2.0)
-
-
-def test_call_loss_weight_reallocates_between_channels_without_changing_scale():
-    rows = [("a", "0"), ("b", "0"), ("c", "0"), ("d", "0")]
-    sup = [4.0, 4.0, 4.0, 4.0]
-    base = trace_weights(sup, rows, [1.0, 1.0, 1.0, 1.0])
-    down = trace_weights(sup, rows, [0.1, 1.0, 1.0, 1.0])
-    assert sum(base) == pytest.approx(4.0) and sum(down) == pytest.approx(4.0), "scale preserved"
-    assert down[0] < base[0], "the call row loses influence"
-    assert down[1] > base[1], "turn rows gain it"
-    assert down[0] / down[1] == pytest.approx(0.1), "ratio between channels IS lambda"
-
-
-def test_call_loss_weight_zero_silences_call_rows_only():
-    w = trace_weights([4.0, 4.0], [("a", "0"), ("b", "0")], [0.0, 1.0])
-    assert w[0] == 0.0 and w[1] == pytest.approx(2.0)
-
-
-def test_call_loss_weight_is_inert_when_every_row_is_one_channel():
-    rows, sup = [("a", "0"), ("b", "0")], [4.0, 4.0]
-    for lam in (0.1, 1.0, 5.0):
-        assert trace_weights(sup, rows, [lam, lam]) == pytest.approx([1.0, 1.0])
-        assert trace_weights(sup, rows, [1.0, 1.0]) == pytest.approx([1.0, 1.0])

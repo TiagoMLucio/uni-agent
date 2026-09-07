@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from uni_agent.sdpo.hints import HintedTurn, assistant_header_ids, hint_token_ids, select_hinted_turns
+from uni_agent.sdpo.hints import HintedTurn, assistant_header_ids, hint_user_turn_ids, select_hinted_turns
 from uni_agent.sdpo.metrics import hint_metrics
 from uni_agent.sdpo.splice import build_spliced_teacher_row, turn_token_mask
 from verl.trainer.ppo.sdpo.batch import TeacherBatch, TeacherInputs
@@ -40,13 +40,11 @@ class TurnHintTeacher(SDPOTeacher):
 
     ``max_prefix_len`` caps the spliced prefix, which is the student's real prompt (segment
     rows reach ~24k): the student's own prompt budget, not the reprompt one. The keyword
-    options are verl's ``trainer/config/sdpo_teacher/turn_hints.yaml``: the two hint templates
+    options are ``uni_agent/conf/sdpo_teacher/turn_hints.yaml``: ``turn_hint_template``
     (``{hint}`` is the only placeholder), ``chat_template_kwargs`` (the rollout's
     ``apply_chat_template`` kwargs, so the header and hint fragments match the rollout tokens;
-    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here),
-    ``max_hinted_turns`` (keeps the first ones; None hints every turn the reflector wrote for)
-    and ``call_loss_weight`` (lambda in ``L = L_turn + lambda * L_call``, a row weight because a
-    within-row scale would cancel in the token-mean).
+    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here) and
+    ``max_hinted_turns`` (keeps the first ones; None hints every turn the reflector wrote for).
     """
 
     needs_prompts = True
@@ -59,10 +57,8 @@ class TurnHintTeacher(SDPOTeacher):
         apply_chat_template_kwargs=None,
         success_reward_threshold: Optional[float] = None,
         turn_hint_template: str,
-        call_hint_template: str,
         chat_template_kwargs: Optional[dict] = None,
-        max_hinted_turns: Optional[int] = None,
-        call_loss_weight: float = 1.0,
+        max_hinted_turns: Optional[int] = 3,
     ):
         super().__init__(
             tokenizer,
@@ -71,27 +67,17 @@ class TurnHintTeacher(SDPOTeacher):
             success_reward_threshold=success_reward_threshold,
         )
         _validate_hint_template("turn_hint_template", turn_hint_template)
-        _validate_hint_template("call_hint_template", call_hint_template)
-        if call_loss_weight < 0:
-            raise ValueError(f"call_loss_weight must be >= 0, got {call_loss_weight}")
         self.turn_hint_template = turn_hint_template
-        self.call_hint_template = call_hint_template
         self.template_kwargs = dict(chat_template_kwargs or {})
         self.max_hinted_turns = max_hinted_turns
-        self.call_loss_weight = float(call_loss_weight)
         self.header_ids = torch.tensor(
             assistant_header_ids(tokenizer, template_kwargs=self.template_kwargs), dtype=torch.int64
         )
-        # call-placed splices close the assistant turn and reopen it after the hint; the
-        # call span starts at the template's tool-call opening token
-        self.close_ids = torch.tensor(
-            tokenizer.encode(tokenizer.eos_token + "\n", add_special_tokens=False), dtype=torch.int64
-        )
-        self.call_open_ids = torch.tensor(tokenizer.encode("<tool_call>", add_special_tokens=False), dtype=torch.int64)
 
-    def hint_ids(self, hint) -> torch.Tensor:
-        return hint_token_ids(
-            self.tokenizer, hint, self.turn_hint_template, self.call_hint_template, self.template_kwargs
+    def hint_ids(self, hint: HintedTurn) -> torch.Tensor:
+        return torch.tensor(
+            hint_user_turn_ids(self.tokenizer, self.turn_hint_template.format(hint=hint.text), self.template_kwargs),
+            dtype=torch.int64,
         )
 
     def build(self, inputs: TeacherInputs) -> TurnHintBatch:
@@ -115,8 +101,6 @@ class TurnHintTeacher(SDPOTeacher):
                     [self.hint_ids(hint) for hint in hinted],
                     self.max_prefix_len,
                     self.header_ids,
-                    close_ids=self.close_ids,
-                    call_open_ids=self.call_open_ids,
                 )
                 hint_fallbacks += fallbacks
                 mask_row = turn_token_mask(response_ids.shape[0], spans)
@@ -142,12 +126,10 @@ class TurnHintTeacher(SDPOTeacher):
                 sum(len(hinted) for hinted in hinted_per_row) / num_hinted if num_hinted else 0.0
             ),
             "self_distillation/hint_injection_fallbacks": hint_fallbacks,
-            "self_distillation/call_loss_weight": self.call_loss_weight,
         }
-        weight_scale = [self.call_loss_weight if any(h.is_call for h in hinted) else 1.0 for hinted in hinted_per_row]
-        return TurnHintBatch(fields=fields, metrics=metrics, weight_scale=weight_scale, hinted_per_row=hinted_per_row)
+        return TurnHintBatch(fields=fields, metrics=metrics, hinted_per_row=hinted_per_row)
 
     def trajectory_metrics(
         self, batch: TurnHintBatch, inputs: TeacherInputs, supervised_per_row: list[float], weights: list[float]
     ) -> dict:
-        return hint_metrics(batch.hinted_per_row, inputs.extra_fields, inputs.traj_of_row, supervised_per_row, weights)
+        return hint_metrics(batch.hinted_per_row, inputs.extra_fields, inputs.traj_of_row)

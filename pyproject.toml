@@ -96,6 +96,9 @@ version = {file = "verl/version/version"}
 "" = "."
 
 [tool.setuptools.package-data]
+uni_agent = [
+  "conf/**/*.yaml",
+]
 verl = [
   "version/*",
   "trainer/config/*.yaml",

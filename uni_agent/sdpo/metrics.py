@@ -10,28 +10,13 @@ from uni_agent.sdpo.hints import HintedTurn
 __all__ = ["hint_metrics", "hint_position_metrics"]
 
 
-def hint_metrics(
-    hinted_per_row: list[list[HintedTurn]],
-    extra_fields: list[dict],
-    traj_of_row: list,
-    supervised_per_row: list[float],
-    weights: list[float],
-) -> dict:
-    """Hint reach per trajectory and the two supervision channels as the loss actually weighs
-    them: call-hinted rows carry ~10x the per-token divergence of turn-hinted ones."""
-    call_row = [any(hint.is_call for hint in hinted) for hinted in hinted_per_row]
+def hint_metrics(hinted_per_row: list[list[HintedTurn]], extra_fields: list[dict], traj_of_row: list) -> dict:
+    """Hint reach per trajectory, then where the hints land."""
     hinted_traces = {traj for traj, hinted in zip(traj_of_row, hinted_per_row, strict=True) if hinted}
-    n_supervised = sum(1 for n in supervised_per_row if n > 0)
     out = {
         "self_distillation/hinted_trace_fraction": len(hinted_traces) / len(set(traj_of_row)),
         "self_distillation/hinted_turns_per_trace": (
             sum(len(hinted) for hinted in hinted_per_row) / len(hinted_traces) if hinted_traces else 0.0
-        ),
-        "self_distillation/call_row_fraction": (
-            sum(1 for c, n in zip(call_row, supervised_per_row, strict=True) if c and n > 0) / max(n_supervised, 1)
-        ),
-        "self_distillation/call_row_weight_share": (
-            sum(w for w, c in zip(weights, call_row, strict=True) if c) / max(sum(weights), 1e-8)
         ),
     }
     out.update(hint_position_metrics(hinted_per_row, extra_fields, traj_of_row))
