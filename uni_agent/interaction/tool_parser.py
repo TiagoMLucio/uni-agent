@@ -23,10 +23,13 @@ class XMLToolParser:
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_prefix: str = "<function="
 
-        # Regex patterns
-        self.tool_call_complete_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
-        self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
-        self.tool_call_function_regex = regex.compile(r"<function=(.*?)</function>", regex.DOTALL)
+        # closed blocks only: a call cut at the turn cap must never match
+        self.tool_call_regex = regex.compile(
+            regex.escape(self.tool_call_start_token) + r"(.*?)" + regex.escape(self.tool_call_end_token), regex.DOTALL
+        )
+        self.tool_call_function_regex = regex.compile(
+            regex.escape(self.tool_call_prefix) + r"(.*?)</function>", regex.DOTALL
+        )
         self.tool_call_parameter_regex = regex.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", regex.DOTALL
         )

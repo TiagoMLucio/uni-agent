@@ -151,8 +151,8 @@ class AgentChatModel:
             metrics["num_preempted"] += token_output.num_preempted if token_output.num_preempted is not None else 0
         if turn_limit and len(token_output.token_ids) > turn_limit:
             # Should be impossible (the server clamps to the requested max_tokens), yet
-            # observed once, immediately after a condensation retry (run 2985518,
-            # 5137 > 4096). Enforce the invariant here and log enough to find the path.
+            # observed once, immediately after a condensation retry (5137 > 4096).
+            # Enforce the invariant here and log enough to find the path.
             get_logger("model").warning(
                 f"generation returned {len(token_output.token_ids)} tokens despite max_tokens={turn_limit} "
                 f"(prompt={len(prompt_ids)}, request_id={request_id}); truncating to the cap"

@@ -97,22 +97,18 @@ class BaseReflectionConfig(BaseModel):
     # Captured by the reward spec (``reward.agent_patch_context`` sets its width).
     include_agent_patch: bool = True
     include_exec_feedback: bool = True
-    max_selected_turns: int = 5
-    # The reflector reads a finished trajectory in one shot, so it needs far more room than the
-    # agent's own context budget, which the condenser reseats against. Left unset it inherits
-    # that budget, and long trajectories then get hints written from a shrink-laddered render:
-    # measured over SWE-smith, a render with observations already capped at 1000 chars reaches
-    # ~47k tokens, well past a 32k agent budget. Cannot exceed what the engine serves.
+    max_selected_turns: int = 3
+    # Serving ceiling for the reflector's one-shot read of a whole trajectory; None inherits the
+    # agent's context budget. Cannot exceed what the engine serves.
     max_model_len: int | None = None
     max_observation_chars: int = 1000
     max_diagnosis_chars: int = 4000
     # the shrink ladder only trims turns, so an outsized patch overflows at every level and
     # drops the rollout's hints entirely. Over SWE-smith 16k spares 99.2% of tasks.
     max_patch_chars: int = 16000
-    # Room for the reflector's own reply. A reasoned prompt writes an audit before its JSON, and
-    # 2048 truncates the tail on long trajectories: the object never closes and the rollout loses
-    # every hint without an error, since a cut reply simply parses to nothing.
-    max_output_tokens: int = 2048
+    # Room for the reflector's own reply, reasoning included: a reply cut before its JSON closes
+    # parses to nothing and the rollout loses every hint without an error.
+    max_output_tokens: int = 16384
     # Retries when the render overflows the serving context, as (observation cap, response cap);
     # None means uncapped. The first attempt always uses max_observation_chars, so these are what
     # it falls back to. Deriving them from that field instead made the first rungs no-ops

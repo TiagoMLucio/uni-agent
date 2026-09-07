@@ -36,7 +36,7 @@ EXPLAIN_EDIT_FAILURES = os.getenv("EXPLAIN_EDIT_FAILURES", "true").lower() == "t
 # imperative resend line: measured to raise retry self-fixes to 98% (indent) / 83%
 # (trailing) / 31% (window) against 19% with the diagnosis alone.
 STR_REPLACE_DID_YOU_MEAN = os.getenv("STR_REPLACE_DID_YOU_MEAN", "false").lower() == "true"
-DID_YOU_MEAN_MAX_CHARS = 4000
+DID_YOU_MEAN_MAX_CHARS = 20000
 DID_YOU_MEAN_MIN_RATIO = 0.8
 EXPLAIN_MAX_FILE_BYTES = 2000000
 EXPLAIN_MAX_OLD_LINES = 200
@@ -268,25 +268,27 @@ def _closest_window(old_str: str, file_content: str) -> Optional[Tuple[int, floa
     return start + 1, ratio, diffs
 
 
-def _did_you_mean(file_content: str, start: int, end: int) -> str:
-    """The matching region as the JSON value to resend; empty when disabled or the region is
-    too large for an observation.
+def _did_you_mean(file_content: str, start: int, end: int, old_str: str) -> str:
+    """The matching region, verbatim between marker lines, to resend as old_str; empty when
+    disabled or the region is too large for an observation.
 
-    The region is printed escaped rather than raw because the differences that cause these
-    failures are the ones raw text cannot show: a trailing space, a tab, a literal ``\\n``.
-    Printed raw, a whitespace-only near-miss renders identically to what the model already
-    sent, which reads as "resend the same thing" -- and the model does.
+    Printed raw, never escaped: the tool-call notation passes string parameters through
+    untouched, so an escaped form would be resent literally and fail again.
     """
     if not STR_REPLACE_DID_YOU_MEAN:
         return ""
     region = "\n".join(file_content.split("\n")[start - 1 : end])
     if not region or len(region) > DID_YOU_MEAN_MAX_CHARS:
         return ""
-    return ("\nThe matching region of the file is exactly this JSON value:\n"
-            + '"old_str": ' + json.dumps(region)
-            + "\nIf this is the region you meant to change, resend the call with this as "
-              "your old_str, copied character for character; if it is not, view the file "
-              "and locate the right region before editing.")
+    whitespace_only = "".join(region.split()) == "".join(old_str.split())
+    note = (" It differs from your old_str only in whitespace, so it may look identical to what "
+            "you sent: copy it from here, not from your previous call." if whitespace_only else "")
+    return ("\nThe matching region of the file is exactly the text between the two marker lines "
+            f"below.{note}\n"
+            f"----- BEGIN old_str -----\n{region}\n----- END old_str -----\n"
+            "If this is the region you meant to change, resend the call with that text as your "
+            "old_str, copied exactly, including indentation and blank lines; if it is not, view "
+            "the file and locate the right region before editing.")
 
 
 def _anchor_positions(file_lines: List[str], line: str) -> List[int]:
@@ -409,7 +411,7 @@ def explain_edit_failure(old_str: str, file_content: str) -> str:
         if found is not None:
             start, end, description = found
             return (f"Closest match: lines {start}-{end} match exactly except {description}."
-                    + _did_you_mean(file_content, start, end))
+                    + _did_you_mean(file_content, start, end, old_str))
     window = _closest_window(old_str, file_content)
     file_lines = file_content.split("\n")
     guard = None
@@ -424,7 +426,7 @@ def explain_edit_failure(old_str: str, file_content: str) -> str:
         # a both-edge-anchored window is trustworthy below the raw-ratio gate: skipped
         # inner lines lengthen the window and depress the ratio without adding doubt
         confident = a_ratio >= DID_YOU_MEAN_MIN_RATIO or (paired and a_ratio >= 0.6)
-        suggestion = _did_you_mean(file_content, a_start, a_end) if confident else ""
+        suggestion = _did_you_mean(file_content, a_start, a_end, old_str) if confident else ""
         return (f"Closest match: lines {a_start}-{a_end} ({a_ratio:.0%} similar). "
                 f"Differing lines:\n{lines}{suggestion}")
     if window is None:
@@ -441,7 +443,7 @@ def explain_edit_failure(old_str: str, file_content: str) -> str:
     if len(diffs) > EXPLAIN_MAX_DIFF_LINES:
         shown.append(f"  ... and {len(diffs) - EXPLAIN_MAX_DIFF_LINES} more differing line(s)")
     lines = "\n".join(shown) if shown else "  (differences are within lines' whitespace)"
-    suggestion = _did_you_mean(file_content, start, end) if ratio >= DID_YOU_MEAN_MIN_RATIO else ""
+    suggestion = _did_you_mean(file_content, start, end, old_str) if ratio >= DID_YOU_MEAN_MIN_RATIO else ""
     return f"Closest match: lines {start}-{end} ({ratio:.0%} similar). Differing lines:\n{lines}{suggestion}"
 
 

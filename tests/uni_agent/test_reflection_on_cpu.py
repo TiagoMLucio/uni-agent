@@ -122,7 +122,7 @@ def test_output_budget_is_configurable():
     reflector = Reflector(model, ReflectionConfig(enabled=True, max_output_tokens=8192))
     asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="", feedback=""))
     assert model.sampling["max_tokens"] == 8192
-    assert ReflectionConfig().max_output_tokens == 2048
+    assert ReflectionConfig().max_output_tokens == 16384
 
 
 def test_shrink_ladder_is_configurable_and_starts_uncapped():

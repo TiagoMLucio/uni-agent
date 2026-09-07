@@ -304,22 +304,28 @@ def run_edit_dym(path: Path, old: str, dym: bool = True):
     ).stdout
 
 
+def region_of(out: str) -> str:
+    return out.split("----- BEGIN old_str -----\n", 1)[1].split("\n----- END old_str -----", 1)[0]
+
+
 def test_did_you_mean_prints_the_region_for_an_indent_miss(tmp_path):
     f = write(tmp_path, "def g():\n    a()\n    b()\n")
     out = run_edit_dym(f, "        a()\n        b()")
-    assert "The matching region of the file is exactly this JSON value:" in out
-    # escaped, not raw: the whitespace that caused the miss has to be visible
-    assert '"old_str": "    a()\\n    b()"' in out
-    assert "copied character for character" in out
+    assert "exactly the text between the two marker lines" in out
+    # raw, not escaped: the live tool-call notation takes string parameters verbatim
+    assert region_of(out) == "    a()\n    b()"
+    assert "copied exactly, including indentation and blank lines" in out
+    assert "differs from your old_str only in whitespace" in out
 
 
-def test_did_you_mean_makes_trailing_whitespace_visible(tmp_path):
-    """The case the raw form could not show: printed raw, the region rendered
-    identically to what the model sent, and it re-sent the same bytes."""
+def test_did_you_mean_names_a_whitespace_only_difference(tmp_path):
+    """Printed raw, a trailing-space miss renders identically to what the model sent; the
+    message has to say the difference is whitespace or the model re-sends the same bytes."""
     f = write(tmp_path, "def g():\n    x = (0,)\n    return x\n")
     out = run_edit_dym(f, "    x = (0,) \n    return x")
-    assert '"old_str": "    x = (0,)\\n    return x"' in out
-    assert "(0,) \\n" not in out, "the trailing space must be gone from the suggestion"
+    assert region_of(out) == "    x = (0,)\n    return x"
+    assert "(0,) \n" not in out, "the trailing space must be gone from the suggestion"
+    assert "differs from your old_str only in whitespace" in out
 
 
 def test_did_you_mean_stays_off_without_the_flag(tmp_path):
@@ -332,8 +338,9 @@ def test_did_you_mean_prints_for_a_close_window(tmp_path):
     body = "def g():\n    x = 1\n    y = 2\n    z = 3\n    return x + y + z\n"
     f = write(tmp_path, body)
     out = run_edit_dym(f, "def g():\n    x = 1\n    y = 9\n    z = 3\n    return x + y + z")
-    assert "The matching region of the file is exactly this JSON value:" in out
-    assert "    y = 2" in out
+    assert "exactly the text between the two marker lines" in out
+    assert "    y = 2" in region_of(out)
+    assert "only in whitespace" not in out, "a content difference must not be called whitespace"
 
 
 def test_did_you_mean_skips_a_weak_window(tmp_path):
@@ -387,7 +394,7 @@ def test_did_you_mean_region_spans_the_restored_lines_not_the_collapsed_count(tm
     f = write(tmp_path, body)
     out = run_edit_dym(f, "def f():\\n    a()\\n    b()\\n    c()\\n    d()")
     assert "collapsed your newlines" in out
-    assert '"old_str": "def f():\\n    a()\\n    b()\\n    c()\\n    d()"' in out
+    assert region_of(out) == "def f():\n    a()\n    b()\n    c()\n    d()"
 
 
 DC_FILE = ("    def _end_dc_subject(self):\n        self._end_category()\n\n"

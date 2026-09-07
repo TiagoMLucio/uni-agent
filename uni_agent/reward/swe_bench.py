@@ -83,10 +83,8 @@ def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commi
 
 
 # --- Feedback templates (str.format) ------------------------------------------------
-# All feedback wording lives here as config-overridable defaults, so it can be tweaked
-# via config (reward.feedback_templates / feedback_item_templates / feedback_*_separator
-# / feedback_join_template) without code changes. User-supplied templates are merged
-# over these key-by-key in SWEBenchRewardSpec.__init__.
+# All feedback wording lives here as defaults; ``FeedbackConfig`` (the ``reward.feedback``
+# block) overrides them key-by-key at render time through ``_template`` / ``_item_template``.
 
 #: Parts rendered (in order) when ``FeedbackConfig.parts`` is not configured.
 DEFAULT_FEEDBACK_PARTS = ["summary", "failing_tests", "regressions", "failure_mode"]
@@ -163,7 +161,7 @@ def _collection_abort(output: str) -> str | None:
     hits = _COLLECTION_ERROR_RE.findall(output)
     if not hits:
         return "a module failed to import during collection"
-    return "; ".join(f"{f} ({r.strip()})" for f, r in hits[:3])
+    return "; ".join(f"{f} ({r.strip()})" for f, r in hits[:COLLECTION_ABORT_MAX_FILES])
 
 
 #: A ``--tb=long`` run writes one block per failure under ``=== FAILURES ===`` (and per setup
@@ -256,6 +254,8 @@ _PARAM_SUFFIX_RE = re.compile(r"\[.*\]$")
 
 # names kept per failing bucket; passing names are counted, never listed
 TRACE_REPORT_FAILURES = 40
+# import failures named when pytest aborts at collection
+COLLECTION_ABORT_MAX_FILES = 3
 
 
 def clip_eval_report(report, cap=TRACE_REPORT_FAILURES):

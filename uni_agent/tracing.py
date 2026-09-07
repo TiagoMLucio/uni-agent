@@ -54,8 +54,8 @@ except ImportError:
 
 # Trace payload caps (middle-clipped by trace_clip): a failing pytest log carries its
 # setup errors at the top and its failure summary at the bottom, so both ends survive.
-TRACE_TEST_OUTPUT_CHARS = 16000
-TRACE_PATCH_CHARS = 8000
+TRACE_TEST_OUTPUT_CHARS = 32000
+TRACE_PATCH_CHARS = 32000
 TRACE_FEEDBACK_CHARS = 16000
 
 __all__ = [

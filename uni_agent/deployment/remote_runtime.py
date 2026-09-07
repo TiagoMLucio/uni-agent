@@ -215,7 +215,7 @@ class RemoteRuntime(AbstractRuntime):
         # commands (evals, slow tool calls) are aborted at the transport layer. But it
         # must not dwarf it either: against a dead container the in-env timeout never
         # fires and THIS is the binding one - the old max(default, +30) floor plus
-        # retries turned 5s yields into 60-108s stalls (run 2985518 val).
+        # retries turned 5s yields into 60-108s stalls on validation.
         command_timeout = getattr(payload, "timeout", None)
         if command_timeout:
             timeout = command_timeout + 15
