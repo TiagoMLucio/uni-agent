@@ -19,8 +19,10 @@ import verl
 from uni_agent.sdpo import TurnHintTeacher, select_hinted_turns
 from uni_agent.sdpo.hints import assistant_header_ids, hint_token_ids
 from uni_agent.sdpo.splice import build_spliced_teacher_row, turn_token_mask
+from uni_agent.sdpo.turn_hint_teacher import TurnHintBatch
 from verl.trainer import main_ppo_sync
 from verl.trainer.ppo.sdpo import TeacherInputs, make_teacher
+from verl.trainer.ppo.sdpo.batch import trace_weights
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
 from verl.workers.config.actor import SelfDistillationConfig
 
@@ -74,7 +76,7 @@ def turn_hints_options(**overrides) -> dict:
     return options
 
 
-def _inputs(extra_fields, uids, seq_scores, feedback, responses=None):
+def _inputs(extra_fields, uids, seq_scores, feedback, responses=None, traj_of_row=None):
     n = len(extra_fields)
     responses = responses or [RESPONSE.clone() for _ in range(n)]
     mask = [torch.ones(r.shape[0], dtype=torch.int64) for r in responses]
@@ -91,6 +93,7 @@ def _inputs(extra_fields, uids, seq_scores, feedback, responses=None):
         seq_scores=list(seq_scores),
         feedback=list(feedback),
         extra_fields=extra_fields,
+        traj_of_row=traj_of_row or [f"{uid}_{i}" for i, uid in enumerate(uids)],
     )
 
 
@@ -159,6 +162,59 @@ def test_turn_hint_teacher_counts_one_fallback_per_hint():
     assert out.metrics["self_distillation/hint_injection_fallbacks"] == 2
     assert [len(h) for h in out.hinted_per_row] == [2, 1, 2]
     assert torch.equal(out.fields["self_distillation_mask"][1][1 : len(TURN0)], torch.ones(len(TURN0) - 1))
+
+
+def test_turn_hint_teacher_weight_scale_and_trajectory_metrics():
+    """``build`` scales a row by ``call_loss_weight`` when one of its hints is call-placed and by
+    1.0 otherwise, and ``trajectory_metrics`` reads hint reach, the call channel's share of the
+    final weights and hint placement off the batch, pooled per trajectory."""
+    tok = ToyTokenizer()
+    teacher = make_teacher(
+        SelfDistillationConfig(teacher=turn_hints_options(call_loss_weight=2.0)), tok, max_prefix_len=4096
+    )
+    # a three-turn response for the call-hinted row, so its hint positions are not only 0 and 1
+    response3 = ids(TURN0 + OBS + TURN1 + OBS + TURN1)
+    start1, start2 = len(TURN0 + OBS), len(TURN0 + OBS + TURN1 + OBS)
+    spans3 = [SPANS[0], [1, start1, start1 + len(TURN1)], [2, start2, start2 + len(TURN1)]]
+    extra = [
+        {"turn_spans": spans3, "turn_hints": [[0, "h0"], [1, "h1", "call"]]},
+        {"turn_spans": SPANS, "turn_hints": [], "segment_index": 0},
+        {"turn_spans": SPANS, "turn_hints": [[1, "h2"]], "segment_index": 1, "segment_prompt": SEGMENT_PROMPT},
+        {"turn_spans": SPANS, "turn_hints": [[0, "h3"]]},
+        {"turn_spans": SPANS, "turn_hints": []},
+    ]
+    responses = [response3] + [RESPONSE.clone() for _ in range(4)]
+    traj_of_row = ["t0", "t1", "t1", "t2", "t3"]
+    inputs = _inputs(extra, ["a", "b", "b", "c", "d"], [0.0] * 5, [None] * 5, responses, traj_of_row)
+
+    out = teacher.build(inputs)
+
+    assert isinstance(out, TurnHintBatch)
+    assert [any(h.is_call for h in hinted) for hinted in out.hinted_per_row] == [True, False, False, False, False]
+    assert out.weight_scale == [2.0, 1.0, 1.0, 1.0, 1.0]
+
+    supervised_per_row = [float(m.sum()) for m in out.fields["loss_mask"].unbind()]
+    call_span = len(TURN1) - TURN1.index("<tool_call>")
+    assert supervised_per_row == [len(TURN0) - 1 + call_span, 0.0, len(TURN1), len(TURN0) - 1, 0.0]
+    weights = trace_weights(supervised_per_row, traj_of_row, out.weight_scale)
+    # raw shares (2.0 for the call row, 1, 1) renormalised to the three supervised rows
+    assert weights == pytest.approx([1.5, 0.0, 0.75, 0.75, 0.0])
+
+    metrics = teacher.trajectory_metrics(out, inputs, supervised_per_row, weights)
+    # t0 spans steps 0..2 with hints at 0 and 1 (relative 0 and 0.5), t1 pools its two
+    # segments' steps 0..1 and is hinted at 1, t2 at 0 of 0..1, t3 is unhinted
+    assert metrics == pytest.approx({
+        "self_distillation/hinted_trace_fraction": 3 / 4,
+        "self_distillation/hinted_turns_per_trace": 4 / 3,
+        "self_distillation/call_row_fraction": 1 / 3,
+        "self_distillation/call_row_weight_share": 1.5 / 3.0,
+        "self_distillation/hint_position_mean": (0.0 + 0.5 + 1.0 + 0.0) / 4,
+        "self_distillation/hint_position_median": 0.5,
+        "self_distillation/hint_position_first_half": 3 / 4,
+        "self_distillation/hint_in_last_two_turns": 3 / 4,
+        "self_distillation/hint_gap_mean": 1.0,
+        "self_distillation/hint_adjacent_fraction": 1.0,
+    })
 
 
 def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():

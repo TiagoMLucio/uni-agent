@@ -1,10 +1,8 @@
 """Reflector hints paired with the turns they land on, and their chat-template rendering."""
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
-
-from verl.trainer.ppo.sdpo.batch import HintedTurn
 
 __all__ = [
     "HintedTurn",
@@ -13,6 +11,22 @@ __all__ = [
     "hint_user_turn_ids",
     "select_hinted_turns",
 ]
+
+
+class HintedTurn(NamedTuple):
+    """One reflection hint paired with the turn it lands on: ``[start, end)`` on the response
+    grid, spliced before the whole turn (``placement == "turn"``, the default) or between the
+    turn's reasoning and its tool call (``"call"``)."""
+
+    step: int
+    start: int
+    end: int
+    text: str
+    placement: str = "turn"
+
+    @property
+    def is_call(self) -> bool:
+        return self.placement == "call"
 
 
 def select_hinted_turns(

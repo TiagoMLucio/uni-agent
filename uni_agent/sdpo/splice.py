@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from verl.trainer.ppo.sdpo.batch import HintedTurn
+from uni_agent.sdpo.hints import HintedTurn
 from verl.trainer.ppo.sdpo.teacher_meta import SubRow, pack
 
 __all__ = ["build_spliced_teacher_row", "turn_token_mask"]

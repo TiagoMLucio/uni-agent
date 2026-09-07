@@ -1,14 +1,23 @@
 """The turn-hint teacher: hints only, no sibling solution, no response decode."""
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-from uni_agent.sdpo.hints import assistant_header_ids, hint_token_ids, select_hinted_turns
+from uni_agent.sdpo.hints import HintedTurn, assistant_header_ids, hint_token_ids, select_hinted_turns
+from uni_agent.sdpo.metrics import hint_metrics
 from uni_agent.sdpo.splice import build_spliced_teacher_row, turn_token_mask
 from verl.trainer.ppo.sdpo.batch import TeacherBatch, TeacherInputs
 from verl.trainer.ppo.sdpo.teacher import SDPOTeacher
 from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+
+
+@dataclass(kw_only=True)
+class TurnHintBatch(TeacherBatch):
+    """A :class:`TeacherBatch` that also carries the hints spliced per row."""
+
+    hinted_per_row: list[list[HintedTurn]]
 
 
 def _validate_hint_template(name: str, template: str) -> None:
@@ -85,7 +94,7 @@ class TurnHintTeacher(SDPOTeacher):
             self.tokenizer, hint, self.turn_hint_template, self.call_hint_template, self.template_kwargs
         )
 
-    def build(self, inputs: TeacherInputs) -> TeacherBatch:
+    def build(self, inputs: TeacherInputs) -> TurnHintBatch:
         from verl.utils.debug_breakpoints import should_break
 
         hinted_per_row = [
@@ -135,4 +144,10 @@ class TurnHintTeacher(SDPOTeacher):
             "self_distillation/hint_injection_fallbacks": hint_fallbacks,
             "self_distillation/call_loss_weight": self.call_loss_weight,
         }
-        return TeacherBatch(fields=fields, metrics=metrics, hinted_per_row=hinted_per_row)
+        weight_scale = [self.call_loss_weight if any(h.is_call for h in hinted) else 1.0 for hinted in hinted_per_row]
+        return TurnHintBatch(fields=fields, metrics=metrics, weight_scale=weight_scale, hinted_per_row=hinted_per_row)
+
+    def trajectory_metrics(
+        self, batch: TurnHintBatch, inputs: TeacherInputs, supervised_per_row: list[float], weights: list[float]
+    ) -> dict:
+        return hint_metrics(batch.hinted_per_row, inputs.extra_fields, inputs.traj_of_row, supervised_per_row, weights)

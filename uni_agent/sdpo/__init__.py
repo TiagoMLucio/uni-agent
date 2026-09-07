@@ -2,7 +2,8 @@
 teacher sub-row per hinted turn, scored only on that turn.
 
 ``hints`` pairs the hints with their turns and renders them under the chat template,
-``splice`` builds the spliced teacher row and its mask, ``turn_hint_teacher`` is the
+``splice`` builds the spliced teacher row and its mask, ``metrics`` reads hint reach and
+placement off a batch, ``turn_hint_teacher`` is the
 :class:`~verl.trainer.ppo.sdpo.SDPOTeacher` the trainer selects through
 ``self_distillation.teacher`` (verl's ``sdpo_teacher/turn_hints.yaml``).
 """

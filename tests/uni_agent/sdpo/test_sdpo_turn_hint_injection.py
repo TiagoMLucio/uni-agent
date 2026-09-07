@@ -163,11 +163,11 @@ def test_select_hinted_turns_reads_call_placement():
     assert select_hinted_turns(extra, 9) == [HintedTurn(1, 4, 9, "b", "call")]
 
 
-# --- channel balance (call_loss_weight) ----------------------------------------------------
+# --- channel balance (call_loss_weight as the call rows' weight_scale) ---------------------
 
 
 def test_trace_weights_default_matches_one_per_supervised_row():
-    w = trace_weights([10.0, 0.0, 5.0], [("a", "0"), ("a", "0"), ("b", "0")], [False] * 3)
+    w = trace_weights([10.0, 0.0, 5.0], [("a", "0"), ("a", "0"), ("b", "0")])
     assert sum(w) == pytest.approx(2.0), "weights renormalise to the supervised-row count"
     assert w[1] == 0.0, "unsupervised rows stay at zero"
 
@@ -175,7 +175,7 @@ def test_trace_weights_default_matches_one_per_supervised_row():
 def test_trace_weights_split_a_condensed_trajectory_by_supervision():
     # one trajectory, two segments: the 3:1 supervision split sets their relative weight,
     # and the renormalisation restores the supervised-row count (not the trajectory count)
-    w = trace_weights([30.0, 10.0], [("a", "0"), ("a", "0")], [False, False])
+    w = trace_weights([30.0, 10.0], [("a", "0"), ("a", "0")])
     assert w[0] / w[1] == pytest.approx(3.0)
     assert sum(w) == pytest.approx(2.0)
 
@@ -183,9 +183,8 @@ def test_trace_weights_split_a_condensed_trajectory_by_supervision():
 def test_call_loss_weight_reallocates_between_channels_without_changing_scale():
     rows = [("a", "0"), ("b", "0"), ("c", "0"), ("d", "0")]
     sup = [4.0, 4.0, 4.0, 4.0]
-    is_call = [True, False, False, False]
-    base = trace_weights(sup, rows, is_call, 1.0)
-    down = trace_weights(sup, rows, is_call, 0.1)
+    base = trace_weights(sup, rows, [1.0, 1.0, 1.0, 1.0])
+    down = trace_weights(sup, rows, [0.1, 1.0, 1.0, 1.0])
     assert sum(base) == pytest.approx(4.0) and sum(down) == pytest.approx(4.0), "scale preserved"
     assert down[0] < base[0], "the call row loses influence"
     assert down[1] > base[1], "turn rows gain it"
@@ -193,12 +192,12 @@ def test_call_loss_weight_reallocates_between_channels_without_changing_scale():
 
 
 def test_call_loss_weight_zero_silences_call_rows_only():
-    w = trace_weights([4.0, 4.0], [("a", "0"), ("b", "0")], [True, False], 0.0)
+    w = trace_weights([4.0, 4.0], [("a", "0"), ("b", "0")], [0.0, 1.0])
     assert w[0] == 0.0 and w[1] == pytest.approx(2.0)
 
 
 def test_call_loss_weight_is_inert_when_every_row_is_one_channel():
     rows, sup = [("a", "0"), ("b", "0")], [4.0, 4.0]
     for lam in (0.1, 1.0, 5.0):
-        assert trace_weights(sup, rows, [True, True], lam) == pytest.approx([1.0, 1.0])
-        assert trace_weights(sup, rows, [False, False], lam) == pytest.approx([1.0, 1.0])
+        assert trace_weights(sup, rows, [lam, lam]) == pytest.approx([1.0, 1.0])
+        assert trace_weights(sup, rows, [1.0, 1.0]) == pytest.approx([1.0, 1.0])
