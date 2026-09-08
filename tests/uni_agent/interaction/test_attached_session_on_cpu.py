@@ -217,7 +217,7 @@ def test_an_action_cannot_outlive_what_is_left_of_the_kill_wall():
     class _Env:
         attached_command, attached_seconds, attached_at_prompt = "cat", 2.1, False
 
-        async def send_input(self, command, action_timeout):
+        async def send_input(self, command, action_timeout, max_observation_length=None):
             seen["timeout"] = action_timeout
             raise ActionTimeoutError("still running")
 
@@ -229,6 +229,7 @@ def test_an_action_cannot_outlive_what_is_left_of_the_kill_wall():
     it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 5.0, 1
+    it.max_observation_length = 100_000
     it.tools_manager = _t.SimpleNamespace(
         get_tool_action=lambda _tc: _t.SimpleNamespace(command="teste", is_input=True, timeout=10),
         format_args_example=lambda args: str(args),
@@ -248,7 +249,7 @@ def test_a_yield_reports_the_balance_but_a_kill_does_not_bother():
             attached_command, attached_at_prompt = "cat", False
             attached_seconds = spent
 
-            async def send_input(self, command, action_timeout):
+            async def send_input(self, command, action_timeout, max_observation_length=None):
                 raise ActionTimeoutError("partial output")
 
             async def kill_attached(self):
@@ -259,6 +260,7 @@ def test_a_yield_reports_the_balance_but_a_kill_does_not_bother():
         it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
         it.action_timeout, it.yield_timeout = 30, 5
         it.attached_kill_timeout, it.timeout_budget = wall, 1
+        it.max_observation_length = 100_000
         it.tools_manager = _t.SimpleNamespace(
             get_tool_action=lambda _tc: _t.SimpleNamespace(command="x", is_input=True, timeout=1),
             format_args_example=lambda args: str(args),
@@ -299,7 +301,7 @@ def test_the_kill_note_states_the_real_remaining_allowance(budget, expected):
     class _Env:
         attached_command, attached_seconds, attached_at_prompt = "cat", 99.0, False
 
-        async def send_input(self, command, action_timeout):
+        async def send_input(self, command, action_timeout, max_observation_length=None):
             raise ActionTimeoutError("partial")
 
         async def kill_attached(self):
@@ -310,6 +312,7 @@ def test_the_kill_note_states_the_real_remaining_allowance(budget, expected):
     it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 45.0, budget
+    it.max_observation_length = 100_000
     it.tools_manager = _t.SimpleNamespace(
         get_tool_action=lambda _tc: _t.SimpleNamespace(command="x", is_input=True, timeout=1),
         format_args_example=lambda args: str(args),
@@ -524,6 +527,7 @@ def test_attached_refusal_quotes_a_literal_cancel_call_and_clips_echoes():
     it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.max_observation_length = 100_000
     long_cmd = "grep -rn pattern " + "y" * 200
     it.tools_manager = _t.SimpleNamespace(
         get_tool_action=lambda _tc: _t.SimpleNamespace(command=long_cmd, is_input=False, timeout=None),
@@ -552,6 +556,7 @@ def test_input_without_attached_quotes_a_literal_rerun_call():
     it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.max_observation_length = 100_000
     it.tools_manager = _t.SimpleNamespace(
         get_tool_action=lambda _tc: _t.SimpleNamespace(command="ls", is_input=True, timeout=None),
         format_args_example=lambda args: f"EXAMPLE({args['command']}, {args['is_input']})",
@@ -571,7 +576,7 @@ def test_yield_note_quotes_a_literal_cancel_call():
         attached_command, attached_at_prompt = "cat", False
         attached_seconds = 2.0
 
-        async def send_input(self, command, action_timeout):
+        async def send_input(self, command, action_timeout, max_observation_length=None):
             raise ActionTimeoutError("partial output")
 
     noop = lambda *a, **k: None  # noqa: E731
@@ -579,6 +584,7 @@ def test_yield_note_quotes_a_literal_cancel_call():
     it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
     it.action_timeout, it.yield_timeout = 30, 5
     it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.max_observation_length = 100_000
     it.tools_manager = _t.SimpleNamespace(
         get_tool_action=lambda _tc: _t.SimpleNamespace(command="", is_input=True, timeout=1),
         format_args_example=lambda args: '{"command": "C-c", "is_input": true}',

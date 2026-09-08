@@ -41,10 +41,10 @@ class TurnHintTeacher(SDPOTeacher):
     ``max_prefix_len`` caps the spliced prefix, which is the student's real prompt (segment
     rows reach ~24k): the student's own prompt budget, not the reprompt one. The keyword
     options are ``uni_agent/conf/sdpo_teacher/turn_hints.yaml``: ``turn_hint_template``
-    (``{hint}`` is the only placeholder), ``chat_template_kwargs`` (the rollout's
+    (``{hint}`` is the only placeholder) and ``chat_template_kwargs`` (the rollout's
     ``apply_chat_template`` kwargs, so the header and hint fragments match the rollout tokens;
-    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here) and
-    ``max_hinted_turns`` (keeps the first ones; None hints every turn the reflector wrote for).
+    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here). Every
+    hint the reflector shipped is spliced; its ``max_selected_turns`` is the one cap.
     """
 
     needs_prompts = True
@@ -58,7 +58,6 @@ class TurnHintTeacher(SDPOTeacher):
         success_reward_threshold: Optional[float] = None,
         turn_hint_template: str,
         chat_template_kwargs: Optional[dict] = None,
-        max_hinted_turns: Optional[int] = 3,
     ):
         super().__init__(
             tokenizer,
@@ -69,7 +68,6 @@ class TurnHintTeacher(SDPOTeacher):
         _validate_hint_template("turn_hint_template", turn_hint_template)
         self.turn_hint_template = turn_hint_template
         self.template_kwargs = dict(chat_template_kwargs or {})
-        self.max_hinted_turns = max_hinted_turns
         self.header_ids = torch.tensor(
             assistant_header_ids(tokenizer, template_kwargs=self.template_kwargs), dtype=torch.int64
         )
@@ -84,7 +82,7 @@ class TurnHintTeacher(SDPOTeacher):
         from verl.utils.debug_breakpoints import should_break
 
         hinted_per_row = [
-            select_hinted_turns(extra_fields, response.shape[0], self.max_hinted_turns)
+            select_hinted_turns(extra_fields, response.shape[0])
             for extra_fields, response in zip(inputs.extra_fields, inputs.responses, strict=True)
         ]
         teacher_seqs, seq_meta, mask_rows, loss_mask_rows = [], [], [], []

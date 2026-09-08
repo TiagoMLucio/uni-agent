@@ -9,7 +9,6 @@ from uni_agent.reflection.base import AbstractReflector, BaseReflectionConfig
 REFLECTOR_REGISTRY: dict[str, type[AbstractReflector]] = {}
 
 REFLECTOR_MODULES: dict[str, str] = {
-    "single": "uni_agent.reflection.single",
     "pipeline": "uni_agent.reflection.pipeline",
 }
 
@@ -35,14 +34,19 @@ def _reflector_class(name: str) -> type[AbstractReflector]:
     return REFLECTOR_REGISTRY[name]
 
 
-def build_reflection_config(config: dict[str, Any] | None) -> BaseReflectionConfig:
+def build_reflection_config(config: dict[str, Any]) -> BaseReflectionConfig:
     """Validate the ``reflection`` block against the strategy its ``name`` selects.
 
     The caller reads ``enabled`` and ``failed_only`` before deciding to reflect at all, so the
     config is built separately from the reflector itself.
     """
-    config = dict(config or {})
-    return _reflector_class(config.get("name", "single")).Config(**config)
+    config = dict(config)
+    if not config.get("name"):
+        raise ValueError(
+            "reflection.name is required: the block carries a strategy's prompts, and no prompt lives in "
+            f"code. Available: {sorted(REFLECTOR_MODULES)}"
+        )
+    return _reflector_class(config["name"]).Config(**config)
 
 
 def load_reflector(model: Any, config: BaseReflectionConfig, run_id: str = "",

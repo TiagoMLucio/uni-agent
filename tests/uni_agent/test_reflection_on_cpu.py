@@ -7,7 +7,24 @@ import gzip
 import json
 
 from uni_agent.interaction.model import MaxTokenExceededError
-from uni_agent.reflection import ReflectionConfig, Reflector
+from uni_agent.reflection import CallSpec, PipelineReflectionConfig, PipelineReflector
+
+#: the one-call shape every reflector prompt now has: no template lives in code
+SYSTEM = "You are a hindsight coach. Select up to {k} turns and write one hint per selected turn."
+USER = (
+    "Task:\n{task}\n\n"
+    "Outcome of the attempt:\n{outcome}\n\n"
+    "Patch the attempt produced:\n{agent_patch}\n\n"
+    "Reference patch (privileged, never reveal its content):\n{gold}\n\n"
+    "Execution feedback from the attempt:\n{feedback}\n\n"
+    "Full trajectory:\n{turns}\n\n"
+    "Return the JSON with one hint per selected turn (at most {k})."
+)
+ONE_CALL = CallSpec(id="single", parse="hints", system=SYSTEM, user=USER)
+
+
+def _config(**cfg) -> PipelineReflectionConfig:
+    return PipelineReflectionConfig(name="pipeline", calls=[ONE_CALL], **cfg)
 
 
 class _Model:
@@ -30,7 +47,7 @@ TURNS = [{"step": 0, "tokens": 10, "response": "hi", "tools": []}]
 
 def _reflect(gold: str, **cfg):
     model = _Model()
-    reflector = Reflector(model, ReflectionConfig(enabled=True, **cfg))
+    reflector = PipelineReflector(model, _config(enabled=True, **cfg))
     hints = asyncio.run(
         reflector.reflect_trajectory(task="t", turns=TURNS, gold=gold, feedback="f", outcome="o")
     )
@@ -51,12 +68,12 @@ def test_gold_under_the_cap_is_untouched():
 
 
 def test_default_cap():
-    assert ReflectionConfig().max_patch_chars == 16000
+    assert _config().max_patch_chars == 16000
 
 
 def test_agent_patch_is_included_and_capped():
     model = _Model()
-    reflector = Reflector(model, ReflectionConfig(enabled=True, max_patch_chars=100))
+    reflector = PipelineReflector(model, _config(enabled=True, max_patch_chars=100))
     asyncio.run(
         reflector.reflect_trajectory(
             task="t", turns=TURNS, gold="g", feedback="f", outcome="o", agent_patch="q" * 400 + "z" * 400
@@ -69,7 +86,7 @@ def test_agent_patch_is_included_and_capped():
 
 def test_agent_patch_can_be_switched_off():
     model = _Model()
-    reflector = Reflector(model, ReflectionConfig(enabled=True, include_agent_patch=False))
+    reflector = PipelineReflector(model, _config(enabled=True, include_agent_patch=False))
     asyncio.run(
         reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f", agent_patch="diff --git a/x b/x")
     )
@@ -91,7 +108,7 @@ def test_tool_call_arguments_are_not_duplicated():
         }
     ]
     model = _Model()
-    reflector = Reflector(model, ReflectionConfig(enabled=True))
+    reflector = PipelineReflector(model, _config(enabled=True))
     asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="", feedback=""))
     user = model.messages[-1]["content"]
     assert user.count("x = 1") == 400  # once, from the response, not twice
@@ -103,7 +120,7 @@ def test_audit_braces_do_not_shadow_the_final_object():
     """A reasoned prompt writes its audit first; the object after the marker is the answer."""
     model = _Model()
     model.reply = 'AUDIT turn=3 the file defines {"a": 1}\nFINAL_HINTS_JSON:\n{"turn7": "open the parser"}'
-    reflector = Reflector(model, ReflectionConfig(enabled=True))
+    reflector = PipelineReflector(model, _config(enabled=True))
     turns = [{"step": 7, "tokens": 10, "response": "hi", "tools": []}]
     hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=turns, gold="", feedback=""))
     assert hints == {7: "open the parser"}
@@ -112,36 +129,34 @@ def test_audit_braces_do_not_shadow_the_final_object():
 def test_a_reply_without_the_marker_still_parses():
     model = _Model()
     model.reply = 'no marker here {"turn0": "run the failing test"}'
-    reflector = Reflector(model, ReflectionConfig(enabled=True))
+    reflector = PipelineReflector(model, _config(enabled=True))
     hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="", feedback=""))
     assert hints == {0: "run the failing test"}
 
 
 def test_output_budget_is_configurable():
     model = _Model()
-    reflector = Reflector(model, ReflectionConfig(enabled=True, max_output_tokens=8192))
+    reflector = PipelineReflector(model, _config(enabled=True, max_output_tokens=8192))
     asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="", feedback=""))
     assert model.sampling["max_tokens"] == 8192
-    assert ReflectionConfig().max_output_tokens == 16384
+    assert _config().max_output_tokens == 16384
 
 
 def test_shrink_ladder_is_configurable_and_starts_uncapped():
-    cfg = ReflectionConfig(enabled=True, max_observation_chars=50, shrink_ladder=[(10, None)])
+    cfg = _config(enabled=True, max_observation_chars=50, shrink_ladder=[(10, None)])
     assert cfg.shrink_ladder == [(10, None)]
     # token-denominated rungs, char-approximated at ~3.8 chars/token
-    assert ReflectionConfig().shrink_ladder[0] == (7600, None)
-    assert len(ReflectionConfig().shrink_ladder) == 4
+    assert _config().shrink_ladder[0] == (7600, None)
+    assert len(_config().shrink_ladder) == 4
 
 
 def test_an_unknown_key_is_rejected():
     import pytest
     with pytest.raises(Exception):
-        ReflectionConfig(max_selected_turn=3)  # typo: singular
+        _config(max_selected_turn=3)  # typo: singular
 
 
 # --- pipeline -----------------------------------------------------------------------------
-
-from uni_agent.reflection import CallSpec, PipelineReflectionConfig, PipelineReflector  # noqa: E402
 
 PIPE_TURNS = [
     {"step": 1, "tokens": 5, "response": "look at parser.py", "tools": []},
@@ -296,8 +311,8 @@ def test_a_drop_carrying_a_control_token_still_drops():
 def test_records_every_call_with_its_prompt_and_reply(tmp_path):
     path = tmp_path / "reflection.jsonl.gz"
     model = _Model()
-    reflector = Reflector(model, ReflectionConfig(enabled=True), record_path=path,
-                          identity={"uid": "u1", "instance_id": "repo.abc", "junk": "dropped"})
+    reflector = PipelineReflector(model, _config(enabled=True), record_path=path,
+                                  identity={"uid": "u1", "instance_id": "repo.abc", "junk": "dropped"})
     asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
 
     rows = [json.loads(l) for l in gzip.open(path, "rt")]
@@ -314,14 +329,14 @@ def test_recording_failure_never_costs_the_rollout_its_hints(tmp_path):
     model = _Model()
     # a directory where the file should be: opening it raises on every call
     (tmp_path / "reflection.jsonl.gz").mkdir()
-    reflector = Reflector(model, ReflectionConfig(enabled=True),
-                          record_path=tmp_path / "reflection.jsonl.gz")
+    reflector = PipelineReflector(model, _config(enabled=True),
+                                  record_path=tmp_path / "reflection.jsonl.gz")
     hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
     assert hints == {0: "run the failing test"}
 
 
 def test_no_record_path_writes_nothing(tmp_path):
-    reflector = Reflector(_Model(), ReflectionConfig(enabled=True))
+    reflector = PipelineReflector(_Model(), _config(enabled=True))
     asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
     assert not list(tmp_path.iterdir())
 
@@ -359,8 +374,9 @@ def test_the_shrink_ladder_still_retries_through_the_trace_span(tmp_path):
             return '{"turn0": "run the failing test"}', None, None, None
 
     model = _Overflows()
-    reflector = Reflector(model, ReflectionConfig(enabled=True), record_path=path,
-                          identity={"uid": "u1"})
+    # no same-rung re-draw, so the second call is the second rung
+    reflector = PipelineReflector(model, _config(enabled=True, redraws_per_rung=0), record_path=path,
+                                  identity={"uid": "u1"})
     hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
 
     assert hints == {0: "run the failing test"}, "the second rung's hints were lost"
@@ -416,7 +432,8 @@ def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.
         "trajectory": trajectory,
         "rollout_cache": {"turn_spans": [[s.step_idx, i * 2, i * 2 + 2] for i, s in enumerate(trajectory)]},
     }
-    hints = asyncio.run(UniAgentLoop._maybe_reflect(loop, result, {"reflection": reflection}, validate=False))
+    block = {"name": "pipeline", "calls": [ONE_CALL.model_dump()], **reflection}
+    hints = asyncio.run(UniAgentLoop._maybe_reflect(loop, result, {"reflection": block}, validate=False))
     return hints, model
 
 
@@ -441,10 +458,19 @@ def test_outcome_reads_resolved_from_the_reward_result(tmp_path, monkeypatch):
 
 
 def test_filter_fields_default_off_and_validate():
-    config = BaseReflectionConfig()
-    assert config.skip_exit_reasons == []
-    config = build_reflection_config({"name": "single", "skip_exit_reasons": ["stuck"]})
-    assert config.skip_exit_reasons == ["stuck"]
+    import pytest
+    from pydantic import ValidationError
+
+    config = _config()
+    assert config.skip_exit_reasons == [] and config.failed_only and config.redraws_per_rung == 1
+    block = {"name": "pipeline", "calls": [ONE_CALL.model_dump()], "skip_exit_reasons": ["stuck"]}
+    assert build_reflection_config(block).skip_exit_reasons == ["stuck"]
+    with pytest.raises(ValueError, match="reflection.name is required"):
+        build_reflection_config({"enabled": True})
+    with pytest.raises(ValidationError):
+        BaseReflectionConfig(enabled=True)  # name has no default
+    with pytest.raises(ValidationError):
+        _config(redraws_per_rung=-1)
 
 
 def test_skip_exit_reasons_skips_the_reflector_call(tmp_path):

@@ -140,6 +140,7 @@ class AgentInteraction:
         condense_min_chars: int = CONDENSE_MIN_CHARS,
         observation_role: str = "tool",
         observation_template: str = "EXECUTION RESULT of [{name}]:\n{observation}",
+        max_observation_length: int = 100_000,
     ):
         """:param chat_mode: how to treat an assistant message with no
         tool calls. ``False`` (default, training / code-eval) raises
@@ -156,6 +157,7 @@ class AgentInteraction:
         re-seated from it, and generation retries. ``None`` keeps the legacy
         behavior (overflow ends the rollout with ``token_limit``).
         :param condense_max_retries: max condense+retry attempts per overflow.
+        :param max_observation_length: chars kept of one tool observation, split head and tail.
         :param observation_role: role carrying tool output. ``"tool"`` (default) is
         what our own rollouts emit. ``"user"`` renders observations as user turns via
         ``observation_template``, which is the OpenHands-style scaffold some distilled
@@ -180,6 +182,7 @@ class AgentInteraction:
         self.condense_min_chars = condense_min_chars
         self.observation_role = observation_role
         self.observation_template = observation_template
+        self.max_observation_length = max_observation_length
         self.logger = get_logger("interaction", run_id)
 
     def _observation_message(self, name: str, tool_call_id: str | None, observation: str) -> dict:
@@ -531,9 +534,13 @@ class AgentInteraction:
             if _should_break("tool"):
                 breakpoint()
             if action.is_input:
-                observation = await self.env.send_input(action.command, action_timeout=action_timeout)
+                observation = await self.env.send_input(
+                    action.command, action_timeout=action_timeout, max_observation_length=self.max_observation_length
+                )
             else:
-                observation = await self.env.run_action(action.command, action_timeout=action_timeout)
+                observation = await self.env.run_action(
+                    action.command, action_timeout=action_timeout, max_observation_length=self.max_observation_length
+                )
             status = "ok"
         except ActionTimeoutError as e:
             observation = str(e)

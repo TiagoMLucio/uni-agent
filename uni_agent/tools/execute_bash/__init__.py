@@ -1,7 +1,5 @@
 """Execute bash command tool."""
 
-from pathlib import Path
-
 from pydantic import BaseModel, Field
 
 from uni_agent.tools.base import AbstractTool
@@ -58,13 +56,12 @@ class ExecuteBashArguments(BaseModel):
 
 @register_tool("execute_bash")
 class ExecuteBashTool(AbstractTool):
+    # the call's command runs in the session as is (tools_manager); no script is installed
+    copy_to_remote = False
+
     @property
     def name(self) -> str:
         return "execute_bash"
-
-    @property
-    def local_path(self) -> Path:
-        return Path(__file__).parent / "execute_bash"
 
     def get_tool_schema(self) -> dict:
         return self.build_tool_schema(

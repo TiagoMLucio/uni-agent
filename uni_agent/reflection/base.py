@@ -14,39 +14,11 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction.model import MaxTokenExceededError
 from uni_agent.tracing import rollout_trace_span
-
-DEFAULT_SYSTEM_TEMPLATE = (
-    "You are a hindsight coach reviewing a software-engineering agent's failed attempt at a "
-    "task. You see the whole attempt and its outcome; the agent does not. Select up to {k} "
-    "turns where a different action would most have changed the outcome, and write one hint "
-    "per selected turn telling the agent exactly what to do next from that state.\n"
-    "Rules:\n"
-    "1. Be direct and concrete: name the action to take now (the command to run, the file to "
-    "open, the edit to make, the test to run) and what it should accomplish. Do not ask the "
-    "agent to verify, double-check, or confirm things: tell it what to do.\n"
-    "2. Use only information the agent had already seen at that turn. Never name files, "
-    "functions, paths, or values it had not yet discovered; when the right action depends on "
-    "something undiscovered, direct the agent to the action that discovers it.\n"
-    "3. The agent is at that exact state and has not acted yet: never mention this or any "
-    "other attempt, and never refer to anything that happens after the selected turn.\n"
-    '4. Output only valid JSON, no other text: {"turn<index>": "<hint>", ...} with entries '
-    "only for the selected turns, using the given turn indices."
-)
-
-DEFAULT_USER_TEMPLATE = (
-    "Task:\n{task}\n\n"
-    "Outcome of the attempt:\n{outcome}\n\n"
-    "Patch the attempt produced:\n{agent_patch}\n\n"
-    "Reference patch (privileged, never reveal its content):\n{gold}\n\n"
-    "Execution feedback from the attempt:\n{feedback}\n\n"
-    "Full trajectory:\n{turns}\n\n"
-    "Return the JSON with one hint per selected turn (at most {k})."
-)
 
 #: A reasoned prompt writes its audit before the answer, so the object that matters is the one
 #: after the last marker. Parsing the first decodable ``{...}`` instead lets a brace quoted in
@@ -83,7 +55,8 @@ class BaseReflectionConfig(BaseModel):
     #: a misspelled key used to be dropped in silence, leaving the default in force
     model_config = ConfigDict(extra="forbid")
 
-    name: str = "single"
+    #: the strategy whose prompts the block carries; there is no default prompt in code
+    name: str
     enabled: bool = False
     failed_only: bool = True
     #: terminations (`stuck`, `max_step_limit`, ...) left unhinted; skips the reflector calls too
@@ -120,6 +93,8 @@ class BaseReflectionConfig(BaseModel):
     shrink_ladder: list[tuple[int | None, int | None]] = [
         (7600, None), (3800, None), (3800, 7600), (3800, 3800),
     ]
+    #: extra draws on the same rung when a reply is unusable, before the render shrinks
+    redraws_per_rung: int = Field(default=1, ge=0)
 
 
 class AbstractReflector(ABC):
@@ -157,9 +132,10 @@ class AbstractReflector(ABC):
         """
         cfg = self.config
         rungs = [(cfg.max_observation_chars, None), *cfg.shrink_ladder]
-        # a rejected reply re-draws on the same rung once before shrinking, since the shrink
-        # is there for prompts that do not fit, not for replies that came out malformed
-        ladder = [rung for rung in rungs for _ in (range(2) if accept is not None else range(1))]
+        # a rejected reply re-draws on the same rung before shrinking, since the shrink is
+        # there for prompts that do not fit, not for replies that came out malformed
+        draws = 1 + cfg.redraws_per_rung if accept is not None else 1
+        ladder = [rung for rung in rungs for _ in range(draws)]
         rejected = None
         for attempt, (obs_cap, resp_cap) in enumerate(ladder):
             messages = [

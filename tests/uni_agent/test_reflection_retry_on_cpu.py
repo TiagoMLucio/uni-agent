@@ -44,9 +44,9 @@ def config(**over):
     return cfg
 
 
-def run(replies):
+def run(replies, **over):
     model = Model(replies)
-    r = PipelineReflector(model, config())
+    r = PipelineReflector(model, config(**over))
     hints = asyncio.run(
         r.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f", outcome="o", agent_patch="p")
     )
@@ -64,6 +64,13 @@ def test_a_usable_reply_is_not_redrawn():
     good = MARKER + '\n{"turn1": "look at the parser in foo.py before editing it"}'
     hints, calls = run([good])
     assert hints and calls == 1, (hints, calls)
+
+
+def test_redraws_per_rung_is_the_draw_count_on_one_rung():
+    # one rung only, so every extra call is a same-rung re-draw
+    for redraws, calls in ((0, 1), (1, 2), (3, 4)):
+        _, seen = run(["no object here at all"], shrink_ladder=[], redraws_per_rung=redraws)
+        assert seen == calls, (redraws, seen)
 
 
 def test_an_unescaped_quote_still_yields_its_hint():

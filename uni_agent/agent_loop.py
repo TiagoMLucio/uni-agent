@@ -327,7 +327,9 @@ class UniAgentLoop(AgentLoopBase):
     async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
         """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: hint}."""
         try:
-            config = build_reflection_config(config_dict.get("reflection"))
+            if not config_dict.get("reflection"):
+                return {}
+            config = build_reflection_config(config_dict["reflection"])
             if not config.enabled or validate:
                 return {}
             if config.failed_only and interaction_result.get("reward_score"):

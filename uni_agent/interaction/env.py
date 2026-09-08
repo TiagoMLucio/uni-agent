@@ -154,7 +154,7 @@ class AgentEnv:
             self.logger.info("Running post_setup_cmd...")
             await self.communicate(self.post_setup_cmd, check="raise")
         if self.privileged_setup_cmd:
-            output = await self.communicate(self.privileged_setup_cmd, timeout=300, check="raise")
+            output = await self.communicate(self.privileged_setup_cmd, check="raise")
             self.privileged_context = output.strip()
             self.logger.info(f"Captured {len(self.privileged_context)} chars of privileged context")
 
@@ -179,7 +179,9 @@ class AgentEnv:
             install_cmd = tool.get_install_command()
             if install_cmd:
                 await self.communicate(install_cmd, check="raise")
-            # check if tool is installed
+            # neither installs a program (execute_bash runs the call's command itself): nothing to check
+            if not (tool.copy_to_remote or install_cmd):
+                continue
             await self.communicate(f"which {tool_name}", check="raise", error_msg=f"Failed to install tool {tool_name}")
             self.logger.info(f"Tool {tool_name} successfully installed")
 

@@ -18,6 +18,8 @@ from .think import ThinkTool
 
 class ToolConfig(BaseModel):
     name: str
+    #: replaces the tool module's DESCRIPTION in the schema the model reads; None keeps it
+    description: str | None = None
 
     def get_tool(self) -> AbstractTool:
         """Return a tool instance (for env.install_tools / init_for_interaction)."""

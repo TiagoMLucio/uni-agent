@@ -5,13 +5,11 @@ the student never saw, selects the few turns where better guidance would most ha
 outcome, and writes one hint per selected turn. Hints condition the distillation teacher and are
 never a training target.
 
-``reflection.name`` picks the strategy: ``single`` is one call per rollout, ``pipeline`` runs
-several, including per-turn calls whose context is truncated to that turn's prefix.
+``reflection.name`` picks the strategy; ``pipeline`` runs one or more calls, including per-turn
+calls whose context is truncated to that turn's prefix. Every prompt is in the config block.
 """
 
 from uni_agent.reflection.base import (
-    DEFAULT_SYSTEM_TEMPLATE,
-    DEFAULT_USER_TEMPLATE,
     FINAL_MARKER,
     TOOL_TEMPLATE,
     TURN_TEMPLATE,
@@ -25,14 +23,8 @@ from uni_agent.reflection.registry import (
     load_reflector,
     register_reflector,
 )
-from uni_agent.reflection.single import Reflector, SingleCallReflectionConfig
-
-#: the block a plain `reflection:` config validates against, kept as the historical name
-ReflectionConfig = SingleCallReflectionConfig
 
 __all__ = [
-    "DEFAULT_SYSTEM_TEMPLATE",
-    "DEFAULT_USER_TEMPLATE",
     "FINAL_MARKER",
     "REFLECTOR_REGISTRY",
     "TOOL_TEMPLATE",
@@ -42,9 +34,6 @@ __all__ = [
     "PipelineReflectionConfig",
     "PipelineReflector",
     "BaseReflectionConfig",
-    "ReflectionConfig",
-    "Reflector",
-    "SingleCallReflectionConfig",
     "build_reflection_config",
     "load_reflector",
     "register_reflector",

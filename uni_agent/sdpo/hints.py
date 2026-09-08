@@ -1,6 +1,6 @@
 """Reflector hints paired with the turns they land on, and their chat-template rendering."""
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 __all__ = [
     "HintedTurn",
@@ -20,13 +20,10 @@ class HintedTurn(NamedTuple):
     text: str
 
 
-def select_hinted_turns(
-    extra_fields: dict, response_len: int, max_hinted_turns: Optional[int] = None
-) -> list[HintedTurn]:
+def select_hinted_turns(extra_fields: dict, response_len: int) -> list[HintedTurn]:
     """Pair a sample's turn spans with its hints. A ``turn_hints`` entry is ``[step, text]``.
 
-    Spans are clamped to the (possibly truncated) response; with a cap, the first
-    ``max_hinted_turns`` turns are kept (earliest, before the trajectory loses coherence).
+    Spans are clamped to the (possibly truncated) response.
     """
     hint_by_step = {int(entry[0]): entry[1] for entry in (extra_fields.get("turn_hints") or [])}
     hinted = []
@@ -34,8 +31,6 @@ def select_hinted_turns(
         step, start, end = int(step), int(start), min(int(end), response_len)
         if step in hint_by_step and start < end:
             hinted.append(HintedTurn(step, start, end, hint_by_step[step]))
-    if max_hinted_turns is not None and len(hinted) > max_hinted_turns:
-        hinted = hinted[:max_hinted_turns]
     return hinted
 
 

@@ -69,7 +69,10 @@ class AbstractTool(ABC):
     installs separately and is already on PATH inside the runtime (e.g.
     ``lark-cli`` via ``npm install -g``, ``gh`` via apt). When False,
     ``install_tools`` skips copy+chmod and only runs ``get_install_command()``
-    + ``which <name>`` as a presence check; ``local_path`` is ignored.
+    + ``which <name>`` as a presence check; ``local_path`` is ignored. False
+    with no install command means the tool is not a program at all
+    (``execute_bash`` runs the call's command in the session): nothing is
+    installed or checked.
     """
 
     @property

@@ -15,7 +15,7 @@ from typing import Optional, Dict, List, Tuple
 # sys.stdout.reconfigure(encoding='utf-8')
 
 STATE_FILE = "/root/editor_state.json"
-SNIPPET_LINES = 4
+SNIPPET_LINES = int(os.getenv("STR_REPLACE_SNIPPET_LINES", "4"))
 
 # We ignore certain warnings from tree_sitter (optional).
 warnings.simplefilter("ignore", category=FutureWarning)
@@ -25,7 +25,7 @@ TRUNCATED_MESSAGE = (
     "You should retry this tool after you have searched inside the file "
     "with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>"
 )
-MAX_RESPONSE_LEN = 16000
+MAX_RESPONSE_LEN = int(os.getenv("STR_REPLACE_MAX_RESPONSE_LEN", "16000"))
 MAX_WINDOW_EXPANSION_VIEW = int(os.getenv("MAX_WINDOW_EXPANSION_VIEW", "0"))
 MAX_WINDOW_EXPANSION_EDIT_CONFIRM = int(os.getenv("MAX_WINDOW_EXPANSION_EDIT_CONFIRM", "0"))
 USE_FILEMAP = os.getenv("USE_FILEMAP", "true").lower() == "true"
@@ -36,11 +36,11 @@ EXPLAIN_EDIT_FAILURES = os.getenv("EXPLAIN_EDIT_FAILURES", "true").lower() == "t
 # imperative resend line: measured to raise retry self-fixes to 98% (indent) / 83%
 # (trailing) / 31% (window) against 19% with the diagnosis alone.
 STR_REPLACE_DID_YOU_MEAN = os.getenv("STR_REPLACE_DID_YOU_MEAN", "false").lower() == "true"
-DID_YOU_MEAN_MAX_CHARS = 20000
-DID_YOU_MEAN_MIN_RATIO = 0.8
+DID_YOU_MEAN_MAX_CHARS = int(os.getenv("STR_REPLACE_DID_YOU_MEAN_MAX_CHARS", "20000"))
+DID_YOU_MEAN_MIN_RATIO = float(os.getenv("STR_REPLACE_DID_YOU_MEAN_MIN_RATIO", "0.8"))
 EXPLAIN_MAX_FILE_BYTES = 2000000
 EXPLAIN_MAX_OLD_LINES = 200
-EXPLAIN_MAX_DIFF_LINES = 5
+EXPLAIN_MAX_DIFF_LINES = int(os.getenv("STR_REPLACE_EXPLAIN_MAX_DIFF_LINES", "5"))
 
 
 if hasattr(sys.stdout, "buffer"):
@@ -100,9 +100,9 @@ def _describe_old_str(old_str: str) -> str:
     return f"old_str ({len(lines)} lines, {len(old_str)} chars, starting `{first}`)"
 
 
-OCCURRENCE_CONTEXT_LINES = 5
-MAX_OCCURRENCES_SHOWN = 4
-OCCURRENCE_EDGE_LINES = 3
+OCCURRENCE_CONTEXT_LINES = int(os.getenv("STR_REPLACE_OCCURRENCE_CONTEXT_LINES", "5"))
+MAX_OCCURRENCES_SHOWN = int(os.getenv("STR_REPLACE_MAX_OCCURRENCES_SHOWN", "4"))
+OCCURRENCE_EDGE_LINES = int(os.getenv("STR_REPLACE_OCCURRENCE_EDGE_LINES", "3"))
 
 
 def _occurrence_context(file_content: str, occurrences: list, old_str: str) -> str:

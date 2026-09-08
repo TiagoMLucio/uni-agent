@@ -154,14 +154,14 @@ _COLLECTION_ABORT_RE = re.compile(r"Interrupted:\s*\d+\s*error[s]?\s+during coll
 _COLLECTION_ERROR_RE = re.compile(r"^ERROR\s+(\S+)\s+-\s+(.+)$", re.M)
 
 
-def _collection_abort(output: str) -> str | None:
+def _collection_abort(output: str, max_files: int) -> str | None:
     """The collection errors that aborted the run, or ``None`` if it ran normally."""
     if not output or not _COLLECTION_ABORT_RE.search(output):
         return None
     hits = _COLLECTION_ERROR_RE.findall(output)
     if not hits:
         return "a module failed to import during collection"
-    return "; ".join(f"{f} ({r.strip()})" for f, r in hits[:COLLECTION_ABORT_MAX_FILES])
+    return "; ".join(f"{f} ({r.strip()})" for f, r in hits[:max_files])
 
 
 #: A ``--tb=long`` run writes one block per failure under ``=== FAILURES ===`` (and per setup
@@ -254,8 +254,6 @@ _PARAM_SUFFIX_RE = re.compile(r"\[.*\]$")
 
 # names kept per failing bucket; passing names are counted, never listed
 TRACE_REPORT_FAILURES = 40
-# import failures named when pytest aborts at collection
-COLLECTION_ABORT_MAX_FILES = 3
 
 
 def clip_eval_report(report, cap=TRACE_REPORT_FAILURES):
@@ -356,6 +354,8 @@ class FeedbackConfig(BaseModel):
     #: its share donates the rest, so the whole budget is used whenever there is content for it.
     #: Weight 0 (or absence) renders that part as a name list instead.
     traceback_ratio: dict[str, int] = Field(default_factory=lambda: {"failing_tests": 3, "regressions": 1})
+    #: import failures named when pytest aborts at collection
+    collection_abort_max_files: int = 3
 
     model_config = ConfigDict(extra="forbid")
 
@@ -373,7 +373,7 @@ class FeedbackConfig(BaseModel):
         # a run that passed any test was not aborted at collection, whatever the output says:
         # pytest's and pylint's own suites print "Interrupted: N errors during collection" as
         # expected output of the tests under test
-        abort = None if _any_passed(result) else _collection_abort(output)
+        abort = None if _any_passed(result) else _collection_abort(output, self.collection_abort_max_files)
         # the budget is shared across parts, so the split is decided once, before rendering
         blocks = None if abort else _extract_tracebacks(output)
         failing = _failing_ids(result)

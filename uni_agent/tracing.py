@@ -29,7 +29,7 @@ except ImportError:
     def rollout_trace_event(*args, **kwargs):
         pass
 
-    def trace_clip(text, cap=8000):
+    def trace_clip(text, cap):
         return text
 
     def rollout_trace_generation(*args, **kwargs):

@@ -28,8 +28,17 @@ class ToolsManager:
     def __init__(self, tools_manager_config: ToolsManagerConfig):
         self.tools_manager_config = tools_manager_config
         self.tools = [tc.get_tool() for tc in tools_manager_config.tools]
-        self.tools_schemas = [t.get_tool_schema() for t in self.tools]
+        self.tools_schemas = [
+            self._schema(tool, tc) for tool, tc in zip(self.tools, tools_manager_config.tools, strict=True)
+        ]
         self._tool_parser = get_tool_parser(tools_manager_config.parser)
+
+    @staticmethod
+    def _schema(tool, tool_config: ToolConfig) -> dict:
+        schema = tool.get_tool_schema()
+        if tool_config.description is not None:
+            schema["function"]["description"] = tool_config.description
+        return schema
 
     def format_args_example(self, args: dict) -> str:
         """A literal tool-call arguments example in the configured call notation.

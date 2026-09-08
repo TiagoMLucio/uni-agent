@@ -23,6 +23,3 @@ turn_hint_template: "[Guidance for your next action: {hint}\nWork out in your ow
 # Rollout-side apply_chat_template kwargs, mirrored when deriving header/hint fragments
 # (e.g. {enable_thinking: false} for Qwen3.5); must match the agent config's value
 chat_template_kwargs: {}
-
-# Cap on hinted turns per sample (keeps the first ones; null = all)
-max_hinted_turns: 3

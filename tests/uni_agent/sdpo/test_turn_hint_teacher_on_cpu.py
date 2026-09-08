@@ -103,7 +103,7 @@ def _inputs(extra_fields, uids, seq_scores, feedback, responses=None, traj_of_ro
 
 def test_turn_hint_teacher_matches_the_splice_and_decodes_nothing():
     tok = ToyTokenizer()
-    cfg = SelfDistillationConfig(teacher=turn_hints_options(max_hinted_turns=None))
+    cfg = SelfDistillationConfig(teacher=turn_hints_options())
     teacher = make_teacher(cfg, tok, max_prefix_len=4096)
     assert isinstance(teacher, TurnHintTeacher) and teacher.needs_prompts
     assert cfg.teacher["_target_"] == "uni_agent.sdpo.TurnHintTeacher"
@@ -218,9 +218,7 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     params = inspect.signature(TurnHintTeacher.__init__).parameters
     trainer_provided = {"self", "tokenizer", "max_prefix_len", "apply_chat_template_kwargs", "success_reward_threshold"}
     assert set(options) - {"_target_"} == set(params) - trainer_provided
-    assert params["max_hinted_turns"].default == options["max_hinted_turns"] == 3, (
-        "turn_hints.yaml and the constructor default differ"
-    )
+    assert set(options) == {"_target_", "turn_hint_template", "chat_template_kwargs"}
     assert options["chat_template_kwargs"] == {}
 
     teacher = make_teacher(
@@ -230,13 +228,15 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
         apply_chat_template_kwargs={"a": 1},
     )
     assert teacher.template_kwargs == {"enable_thinking": False} and teacher.apply_chat_template_kwargs == {"a": 1}
-    assert teacher.max_hinted_turns == 3 and teacher.success_reward_threshold == 1.0
+    assert teacher.success_reward_threshold == 1.0
 
     def build(**overrides):
         return make_teacher(SelfDistillationConfig(teacher=turn_hints_options(**overrides)), tok, max_prefix_len=4096)
 
     with pytest.raises(TypeError, match="max_reprompt_len"):
         build(max_reprompt_len=8)
+    with pytest.raises(TypeError, match="max_hinted_turns"):
+        build(max_hinted_turns=3)  # the reflector's max_selected_turns is the one cap
     with pytest.raises(ValueError, match="turn_hint_template"):
         build(turn_hint_template="no placeholder")
     with pytest.raises(ValueError, match="turn_hint_template"):
