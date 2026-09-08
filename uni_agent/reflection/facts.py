@@ -7,16 +7,12 @@ repeated verbatim, whether a submit followed any passing check at all.
 
 import re
 
-ARG_PATH_RE = re.compile(r"--path\s+(\S+)")
-CMD_RE = re.compile(r"str_replace_editor\s+(\w+)")
-EDIT_CMDS = {"str_replace", "insert", "create"}
+from uni_agent.interaction.behaviour import EDIT_CMDS, edit_command, edit_path, is_source_path
 
 
 def call_facts(call: dict) -> tuple:
     action = call.get("action") or ""
-    cmd = (CMD_RE.match(action) or [None, None])[1] if CMD_RE.match(action) else None
-    path = (ARG_PATH_RE.search(action) or [None, None])[1] if ARG_PATH_RE.search(action) else None
-    return cmd, path, action, call.get("observation") or ""
+    return edit_command(action), edit_path(action), action, call.get("observation") or ""
 
 
 def turn_candidates(turns: list[dict]) -> str:
@@ -31,10 +27,7 @@ def turn_candidates(turns: list[dict]) -> str:
         step = turn.get("step")
         for call in turn.get("tools") or []:
             cmd, path, action, obs = call_facts(call)
-            # on the basename, not the path: every task lives under /testbed/, so matching
-            # "test" anywhere killed this branch and with it the two placement signals below
-            name = path.rsplit("/", 1)[-1] if path else ""
-            src = bool(name) and "reproduce" not in name and "test" not in name
+            src = is_source_path(path)
             if call.get("name") == "execute_bash" and "python" in action and ran is None:
                 ran = step
                 notes.append(f"turn {step}: the first time anything is actually run")

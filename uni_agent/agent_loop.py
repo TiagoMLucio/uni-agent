@@ -19,6 +19,7 @@ from uni_agent.interaction import (
     ToolsManager,
     ToolsManagerConfig,
 )
+from uni_agent.interaction.behaviour import behaviour_metrics
 from uni_agent.reflection import build_reflection_config, load_reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
@@ -274,6 +275,10 @@ class UniAgentLoop(AgentLoopBase):
                     # execution_time; without them a trajectory's wall clock cannot be accounted for
                     interaction_result["metrics"]["env_setup"] = env_setup_s
                     interaction_result["metrics"]["loop_wall"] = interaction_result.get("execution_time", 0.0)
+                    interaction_result["metrics"].update({
+                        AGENT_METRIC_PREFIX + name: value
+                        for name, value in behaviour_metrics(interaction_result["trajectory"]).items()
+                    })
                     if rollout_span is not None:
                         trajectory = interaction_result.get("trajectory") or []
                         rollout_span.update(

@@ -87,11 +87,14 @@ class TurnHintTeacher(SDPOTeacher):
         ]
         teacher_seqs, seq_meta, mask_rows, loss_mask_rows = [], [], [], []
         hint_fallbacks = 0
+        prefix_clips = 0
         for prompt_ids, response_ids, response_mask, hinted in zip(
             inputs.prompts, inputs.responses, inputs.response_mask, hinted_per_row, strict=True
         ):
             if hinted:
                 if should_break("teacher_build_row"): breakpoint()  # noqa: E701
+                # a clipped prefix is a teacher conditioned on less than the student wrote from
+                prefix_clips += int(prompt_ids.shape[0] > self.max_prefix_len)
                 seq, meta, fallbacks, spans = build_spliced_teacher_row(
                     prompt_ids,
                     response_ids,
@@ -124,6 +127,7 @@ class TurnHintTeacher(SDPOTeacher):
                 sum(len(hinted) for hinted in hinted_per_row) / num_hinted if num_hinted else 0.0
             ),
             "self_distillation/hint_injection_fallbacks": hint_fallbacks,
+            "self_distillation/teacher_prefix_clips": prefix_clips,
         }
         return TurnHintBatch(fields=fields, metrics=metrics, hinted_per_row=hinted_per_row)
 

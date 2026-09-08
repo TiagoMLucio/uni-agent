@@ -147,6 +147,7 @@ def test_turn_hint_teacher_matches_the_splice_and_decodes_nothing():
         "self_distillation/hinted_sample_fraction": 2 / 3,
         "self_distillation/hinted_turns_per_sample": 1.5,
         "self_distillation/hint_injection_fallbacks": 0,
+        "self_distillation/teacher_prefix_clips": 0,
     }
 
 
@@ -164,6 +165,23 @@ def test_turn_hint_teacher_counts_one_fallback_per_hint_without_its_header():
     assert out.metrics["self_distillation/hint_injection_fallbacks"] == 2
     assert [len(h) for h in out.hinted_per_row] == [2, 1, 2]
     assert torch.equal(out.fields["self_distillation_mask"][1][1 : len(TURN0)], torch.ones(len(TURN0) - 1))
+
+
+def test_turn_hint_teacher_counts_a_prefix_the_budget_clipped():
+    """A prompt longer than ``max_prefix_len`` is left-truncated, so the teacher scores the turn
+    from a shorter history than the student wrote it from. Counted, and only on hinted rows."""
+    tok = ToyTokenizer()
+    teacher = make_teacher(SelfDistillationConfig(teacher=turn_hints_options()), tok, max_prefix_len=4096)
+    extra = [{"turn_spans": SPANS, "turn_hints": [[0, "h0"]]}, {"turn_spans": SPANS, "turn_hints": []}]
+    inputs = _inputs(extra, ["a", "b"], [0.0, 0.0], [None, None])
+    whole = teacher.build(inputs)
+    assert whole.metrics["self_distillation/teacher_prefix_clips"] == 0
+
+    teacher.max_prefix_len = PROMPT.shape[0] - 1
+    clipped = teacher.build(inputs)
+    assert clipped.metrics["self_distillation/teacher_prefix_clips"] == 1
+    # one token short, and it is the oldest one that went
+    assert torch.equal(clipped.fields["teacher_input_ids"][0], whole.fields["teacher_input_ids"][0][1:])
 
 
 def test_turn_hint_teacher_trajectory_metrics():
@@ -371,6 +389,7 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
         "self_distillation/hinted_sample_fraction": 3 / 5,
         "self_distillation/hinted_turns_per_sample": 4 / 3,
         "self_distillation/hint_injection_fallbacks": 0,
+        "self_distillation/teacher_prefix_clips": 0,
         "rollout/condensed_trace_fraction": 1 / 4,
         "rollout/segments_per_trace": 5 / 4,
         "rollout/solve_rate_1seg": 0.0,
