@@ -11,6 +11,7 @@ import gzip
 import json
 import re
 from abc import ABC, abstractmethod
+from collections import Counter
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -24,6 +25,11 @@ from uni_agent.tracing import rollout_trace_span
 #: after the last marker. Parsing the first decodable ``{...}`` instead lets a brace quoted in
 #: the audit shadow the real hints, which costs the rollout its supervision silently.
 FINAL_MARKER = "FINAL_HINTS_JSON:"
+
+#: the ``_record`` error that marks a render the ladder had to shrink past
+OVER_BUDGET = "over budget"
+#: what the reflector cost one trajectory, reported by the agent loop
+CALL_METRICS = ("reflect_calls", "reflect_redraws", "reflect_over_budget", "reflect_rung")
 
 TURN_TEMPLATE = "### Turn {step}\nASSISTANT:\n{response}\n{tools}"
 # the response is the model's raw output, so it already carries the tool call and its arguments;
@@ -113,6 +119,8 @@ class AbstractReflector(ABC):
         self._record_path = Path(record_path) if record_path else None
         self.identity = {k: v for k, v in (identity or {}).items()
                          if k in ("uid", "instance_id", "run_id")}
+        # the agent loop builds one reflector per rollout, so these count the trajectory in flight
+        self._counts: Counter = Counter()
 
     @abstractmethod
     async def reflect_trajectory(
@@ -122,28 +130,24 @@ class AbstractReflector(ABC):
 
     async def _ask(self, system: str, render_user, max_output_tokens: int | None = None,
                    stage: str = "", step: int | None = None, accept=None) -> str | None:
-        """One call, retried down the shrink ladder. ``render_user(obs_cap, resp_cap) -> str``.
+        """One call, re-drawn on an unusable reply and shrunk down the ladder on an over-budget
+        render. ``render_user(obs_cap, resp_cap) -> str``.
 
         ``accept(text) -> bool`` decides whether a reply is usable. A reply that parses to
         nothing is a wasted rollout, and contract failures are drawn per sample rather than
         being properties of the trace (measured: zero traces failed in all three repeats of
         one experiment, Cohen's kappa about 0), so re-drawing recovers most of them where rewording
-        the prompt does not. Without it, only an over-budget render was ever retried.
+        the prompt does not.
         """
         cfg = self.config
         rungs = [(cfg.max_observation_chars, None), *cfg.shrink_ladder]
-        # a rejected reply re-draws on the same rung before shrinking, since the shrink is
-        # there for prompts that do not fit, not for replies that came out malformed
         draws = 1 + cfg.redraws_per_rung if accept is not None else 1
-        attempts = len(rungs) * draws
         max_tokens = max_output_tokens or cfg.max_output_tokens
         # the same ceiling query() enforces: the config's, else the client's own
         limit = cfg.max_model_len or getattr(self.model, "max_model_len", None)
-        attempt = 0
         rejected = None
-        for obs_cap, resp_cap in rungs:
-            for _ in range(draws):
-                attempt += 1
+        for rung, (obs_cap, resp_cap) in enumerate(rungs):
+            for draw in range(draws):
                 messages = [
                     {"role": "system", "content": system},
                     {"role": "user", "content": render_user(obs_cap, resp_cap)},
@@ -177,36 +181,55 @@ class AbstractReflector(ABC):
                         )
                     self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
                                      f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
-                    self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap)
+                    self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, draw=draw)
                     if accept is None or accept(text):
+                        self._counts["reflect_rung"] = max(self._counts["reflect_rung"], rung)
                         return text
                     rejected = text
-                    self.logger.info(f"Reflection reply unusable (attempt {attempt}/{attempts}, "
-                                     f"obs_cap={obs_cap}); re-drawing")
+                    self.logger.info(f"Reflection reply unusable (draw {draw + 1}/{draws}, "
+                                     f"obs_cap={obs_cap})")
                 except MaxTokenExceededError as exc:
                     self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
-                    self._record(stage, step, messages, None, None, obs_cap, resp_cap, error="over budget")
+                    self._record(stage, step, messages, None, None, obs_cap, resp_cap,
+                                 error=OVER_BUDGET, draw=draw)
                     # deterministic at this rung: the redraws would render the same prompt
                     break
                 except Exception as exc:
                     self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
-                    self._record(stage, step, messages, None, None, obs_cap, resp_cap, error=repr(exc))
+                    self._record(stage, step, messages, None, None, obs_cap, resp_cap,
+                                 error=repr(exc), draw=draw)
                     return None
+            else:
+                # the ladder is there for a render that does not fit; a reply the parser could not
+                # use is no reason to ask again from a deliberately smaller view of the trajectory
+                break
         if rejected is not None:
             # hand back the last reply anyway: the caller's own parse is the arbiter, and a
             # reply it cannot use is no worse than the None this used to return
-            self.logger.warning("Reflection: no usable reply in %d attempts", attempts)
+            self.logger.warning("Reflection: no usable reply in %d draws", draws)
             return rejected
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
         return None
 
-    def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error=""):
-        """Append one call to the rollout's reflection log, if the loop asked for one.
+    def call_metrics(self) -> dict[str, float]:
+        """What the reflector cost this trajectory, every stage summed: calls, re-draws after an
+        unusable reply, over-budget renders, and the worst rung an accepted answer was written
+        from (0 is the full view, and under overflow-only shrinking only overflow raises it)."""
+        return {key: float(self._counts[key]) for key in CALL_METRICS}
+
+    def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error="", draw=0):
+        """Tally one call, and append it to the rollout's reflection log if the loop asked for one.
 
         What each stage was shown and answered is not recoverable from anything else the
         rollout writes, so it is captured here or not at all. Never raises: a reflector
         that dies over its own bookkeeping would cost the rollout its supervision.
         """
+        if error == OVER_BUDGET:
+            self._counts["reflect_over_budget"] += 1
+        elif not error:
+            self._counts["reflect_calls"] += 1
+            if draw:
+                self._counts["reflect_redraws"] += 1
         if self._record_path is None:
             return
         try:

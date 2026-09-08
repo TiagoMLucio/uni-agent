@@ -455,7 +455,7 @@ def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.
     }
     block = {"name": "pipeline", "calls": [ONE_CALL.model_dump()], **reflection}
     hints = asyncio.run(UniAgentLoop._maybe_reflect(loop, result, {"reflection": block}, validate=False))
-    return hints, model
+    return hints, model, result
 
 
 def test_outcome_reads_resolved_from_the_reward_result(tmp_path, monkeypatch):
@@ -464,7 +464,7 @@ def test_outcome_reads_resolved_from_the_reward_result(tmp_path, monkeypatch):
     from uni_agent.agent_loop import UniAgentLoop
 
     trajectory = [_traj_step(0), _traj_step(1)]
-    _, model = _maybe_reflect(
+    _, model, _ = _maybe_reflect(
         tmp_path, {"enabled": True, "failed_only": False}, trajectory, reward_score=1.0, resolved=True
     )
     assert "resolved: True" in model.messages[1]["content"]
@@ -496,15 +496,27 @@ def test_filter_fields_default_off_and_validate():
 
 def test_skip_exit_reasons_skips_the_reflector_call(tmp_path):
     trajectory = [_traj_step(0, exit_reason="stuck")]
-    hints, model = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
+    hints, model, _ = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
     assert hints == {} and model.messages == [], "the reflector must not even be queried"
     # unset, the same trajectory is hinted as before
-    hints, model = _maybe_reflect(tmp_path, {"enabled": True}, trajectory)
+    hints, model, _ = _maybe_reflect(tmp_path, {"enabled": True}, trajectory)
     assert hints == {0: "run the failing test"} and model.messages
     # a termination outside the list is untouched
     trajectory = [_traj_step(0, exit_reason="max_step_limit")]
-    hints, _ = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
+    hints, _, _ = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
     assert hints == {0: "run the failing test"}
+
+
+def test_the_call_metrics_reach_the_interaction_result(tmp_path):
+    """Zeros included: a step where nothing was over budget must read 0, not go missing."""
+    hints, _, result = _maybe_reflect(tmp_path, {"enabled": True}, [_traj_step(0)])
+    assert hints
+    assert result["metrics"] == {"agent/reflect_calls": 1.0, "agent/reflect_redraws": 0.0,
+                                 "agent/reflect_over_budget": 0.0, "agent/reflect_rung": 0.0}
+    # a trajectory the reflector never saw reports none of them, as reflect_empty does not
+    _, _, skipped = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]},
+                                   [_traj_step(0, exit_reason="stuck")])
+    assert skipped["metrics"] == {}
 
 
 def test_the_cap_sentinel_does_not_shadow_the_last_real_turn(tmp_path):

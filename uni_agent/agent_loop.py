@@ -35,6 +35,10 @@ from uni_agent.tracing import (
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
 
+#: Metrics under this prefix are reported per step by the trainer, which never reads their names.
+#: The prefix is the whole contract, so a new one needs no change on the training side.
+AGENT_METRIC_PREFIX = "agent/"
+
 #: Every top-level key the agent yaml may carry: what ``UniAgentLoop`` reads, plus ``name``
 #: and ``_target_``, which verl's registry and hydra need to instantiate it. Unlisted keys are
 #: rejected so a typo cannot silently leave the loop on a code default.
@@ -426,8 +430,10 @@ class UniAgentLoop(AgentLoopBase):
                 outcome=outcome,
                 agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
             )
+            metrics = interaction_result.setdefault("metrics", {})
+            metrics.update({AGENT_METRIC_PREFIX + k: v for k, v in reflector.call_metrics().items()})
             if not hints:
-                interaction_result.setdefault("metrics", {})["reflect_empty"] = 1.0
+                metrics["reflect_empty"] = 1.0
             return hints
         except Exception as e:  # hints are optional supervision; never kill the rollout over them
             self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
