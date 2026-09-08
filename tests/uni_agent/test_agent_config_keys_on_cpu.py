@@ -64,3 +64,17 @@ def test_a_typo_inside_validation_overrides_fails_only_on_validation(tmp_path):
     _loop(path)._init_config({})
     with pytest.raises(ValueError, match="setup_timout"):
         _loop(path)._init_config({}, validate=True)
+
+
+def test_a_prompts_block_is_a_known_key(tmp_path):
+    """The loop composes the opening messages from it, so it has to reach the config."""
+    block = _block(EXAMPLE_CONFIGS[0]) | {"prompts": {"system": "be careful", "task": "fix {workdir}"}}
+    config = _loop(_write(tmp_path, block))._init_config({})
+    assert config["prompts"]["task"] == "fix {workdir}", "and arrives unformatted"
+
+
+def test_allowing_prompts_did_not_loosen_the_rest(tmp_path):
+    block = _block(EXAMPLE_CONFIGS[0]) | {"prompt": {"system": "be careful"}}
+    with pytest.raises(ValueError) as e:
+        _loop(_write(tmp_path, block))._init_config({})
+    assert "did you mean prompts?" in str(e.value)

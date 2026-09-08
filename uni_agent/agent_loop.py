@@ -2,6 +2,7 @@ import asyncio
 import difflib
 import json
 import pickle
+import string
 import time
 import uuid
 from pathlib import Path
@@ -57,6 +58,7 @@ AGENT_CONFIG_KEYS = frozenset(
         "log_dir",
         "mask_abnormal_exit_traj",
         "max_completion_tokens",
+        "prompts",
         "reflection",
         "reward",
         "setup_retries",
@@ -72,6 +74,62 @@ AGENT_CONFIG_KEYS = frozenset(
 #: row for it. `response_logprobs` is the sampler's own log-prob per token, which the SDPO loss
 #: uses as `old_log_probs` for its IS ratio, so it cannot be recomputed after the fact.
 SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn_spans")
+
+
+def opening_messages(prompts: dict | None, raw_prompt, values: dict) -> list[dict[str, str]]:
+    """What the rollout opens with: composed from the config's ``prompts`` block when there is
+    one, else the row's baked ``raw_prompt``. Never a merge of the two, so a run can always say
+    which prompt it ran on.
+    """
+    return list(raw_prompt) if prompts is None else compose_messages(prompts, values)
+
+
+def compose_messages(prompts: dict, values: dict) -> list[dict[str, str]]:
+    """The two opening messages, from the config's ``prompts`` block and the row's values.
+
+    ``system`` is used verbatim; ``task`` is formatted. The fields are checked before formatting
+    so the error names every one the row is missing, rather than the first one and nothing about
+    which template wanted it. Either way it raises: a prompt shipping a literal
+    ``{problem_statement}`` would corrupt every rollout of the run in silence.
+    """
+    missing = sorted(_template_fields(prompts["task"]) - set(values))
+    if missing:
+        raise KeyError(
+            f"prompts.task needs {missing}, which this row's extra_info.prompt_values does not "
+            f"carry (it has {sorted(values)})"
+        )
+    return [
+        {"role": "system", "content": prompts["system"]},
+        {"role": "user", "content": prompts["task"].format(**values)},
+    ]
+
+
+def _template_fields(template: str) -> set[str]:
+    """Every name ``str.format`` will look up in ``template``, ``{a.b}`` and ``{a[0]}`` included."""
+    return {
+        field.split(".")[0].split("[")[0]
+        for _, field, _, _ in string.Formatter().parse(template)
+        if field
+    }
+
+
+def reward_metrics(reward_result: dict, applied_edits: float) -> dict[str, float]:
+    """The reward's own health flags, per trajectory.
+
+    ``empty_patch`` and ``work_lost`` are absent when the reward did not report the flag:
+    defaulting it to False would read a prediction that was never extracted as an agent that
+    changed nothing, and the step metrics take an absent key as never measured.
+    """
+    out = {
+        "eval_completed": float(bool(reward_result.get("eval_completed", True))),
+        "patch_apply_failed": float(bool(reward_result.get("patch_apply_failed", False))),
+    }
+    if "empty_patch" in reward_result:
+        out["empty_patch"] = float(bool(reward_result["empty_patch"]))
+        # edits landed and none of them reached the graded patch: scored as an ordinary
+        # wrong answer, so it biases every number the run reports
+        out["work_lost"] = float(out["empty_patch"] > 0 and applied_edits > 0)
+    return out
 
 
 def setup_metrics(attempts: int) -> dict[str, float]:
@@ -157,12 +215,17 @@ class UniAgentLoop(AgentLoopBase):
         self.condenser, condense_policy = self._init_condense(config_dict.get("condense"))
         self.env = self._init_env(config_dict["env"])
         self.output_dir = Path(config_dict["log_dir"]) / self.run_id
+        messages = opening_messages(
+            config_dict.get("prompts"),
+            kwargs.get("raw_prompt"),
+            (kwargs.get("extra_info") or {}).get("prompt_values") or {},
+        )
         self.interaction = AgentInteraction(
             run_id=self.run_id,
             env=self.env,
             model=self.chat_model,
             tools_manager=self.tools_manager,
-            messages=list(kwargs["raw_prompt"]),
+            messages=messages,
             skills_manager=self.skills_manager,
             condenser=self.condenser,
             **condense_policy,
@@ -179,9 +242,7 @@ class UniAgentLoop(AgentLoopBase):
             self.reward_spec = None
 
         # trace identity up front: survives even if the final outcome update is lost on kill
-        task_text = next(
-            (m.get("content", "") for m in kwargs.get("raw_prompt") or [] if m.get("role") == "user"), ""
-        )
+        task_text = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
         reward_meta = (config_dict.get("reward") or {}).get("metadata") or {}
         image = ((config_dict.get("env") or {}).get("deployment") or {}).get("image")
         identity = {
@@ -333,22 +394,9 @@ class UniAgentLoop(AgentLoopBase):
                             interaction_result["metrics"]["eval_execution"] = float(
                                 reward_result["eval_execution_time"]
                             )
-                        interaction_result["metrics"]["eval_completed"] = float(
-                            bool(reward_result.get("eval_completed", True))
+                        interaction_result["metrics"].update(
+                            reward_metrics(reward_result, applied_edits)
                         )
-                        interaction_result["metrics"]["patch_apply_failed"] = float(
-                            bool(reward_result.get("patch_apply_failed", False))
-                        )
-                        # absent when the prediction was never extracted: defaulting it to False
-                        # would report a lost patch as an agent that changed nothing
-                        if "empty_patch" in reward_result:
-                            empty_patch = float(bool(reward_result["empty_patch"]))
-                            interaction_result["metrics"]["empty_patch"] = empty_patch
-                            # edits landed and none of them reached the graded patch: scored as an
-                            # ordinary wrong answer, so it biases every number the run reports
-                            interaction_result["metrics"]["work_lost"] = float(
-                                empty_patch > 0 and applied_edits > 0
-                            )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
                     if isinstance(reward_result, dict):
