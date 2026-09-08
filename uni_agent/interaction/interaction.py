@@ -496,9 +496,10 @@ class AgentInteraction:
             observation = (
                 f"Your command was NOT executed: `git {refused}` is not available here. Everything "
                 "you change is collected from the working tree, so a command that commits it or "
-                "throws it away loses the fix along with it. To undo an edit, put the original text "
-                "back with the editor. Reading the repository still works: `git diff`, `git status`, "
-                "`git log`, `git show`."
+                "throws it away loses the fix along with it. To put one file back the way it was, "
+                "run `git show HEAD:path/to/file.py > path/to/file.py` from the repository root. "
+                "Reading still works: `git diff`, `git status`, `git log`, `git show`, "
+                "`git stash list`."
             )
             self.logger.error(observation)
             # a refused call, like the two below: "skipped" would trip the terminal_dead abort

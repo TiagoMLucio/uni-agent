@@ -24,12 +24,20 @@ from uni_agent.interaction.tools_manager import (
 )
 
 ALLOWED = ["git diff", "git log --oneline -5", "git show HEAD", "git status", "git blame f.py",
-           "git diff --cached", "git add -A", "git apply /tmp/p.diff", "git rev-parse HEAD"]
+           "git diff --cached", "git add -A", "git apply /tmp/p.diff", "git rev-parse HEAD",
+           # the restore the refusal points at, and the two stash forms that only look
+           "git show HEAD:src/a.py > src/a.py", "git stash list", "git stash show -p"]
 
 
 @pytest.mark.parametrize("sub", sorted(DESTRUCTIVE_GIT_SUBCOMMANDS))
 def test_every_destructive_subcommand_is_caught(sub):
     assert destructive_git_subcommand(f"git {sub}") == sub
+
+
+@pytest.mark.parametrize("command", ["git stash push -m wip", "git stash pop", "git stash apply",
+                                     "git stash -u", "git stash", "git stash drop"])
+def test_the_stash_forms_that_move_work_are_still_refused(command):
+    assert destructive_git_subcommand(command) == "stash"
 
 
 @pytest.mark.parametrize("command", ALLOWED)
@@ -97,8 +105,16 @@ def test_the_refusal_is_an_observation_the_model_can_act_on():
     assert "NOT executed" in result.observation
     assert "git stash" in result.observation, "it has to name what was refused"
     assert "working tree" in result.observation, "and why"
-    assert "editor" in result.observation, "and what to do instead"
+    assert "git show HEAD:" in result.observation, "and an alternative that is not itself refused"
     assert "git diff" in result.observation, "and that reading the repository still works"
+
+
+def test_the_alternative_the_refusal_offers_is_itself_allowed():
+    """A refusal naming a blocked workaround is worse than no refusal: it burns the recovery."""
+    offered = _call("git checkout -- src/a.py").observation
+    recipe = offered.split("run `", 1)[1].split("`", 1)[0]
+    assert destructive_git_subcommand(recipe) is None, recipe
+    assert "undo_edit" not in offered, "it only reverses the last edit, so it cannot restore a file"
 
 
 def test_a_refused_call_never_reaches_the_session():

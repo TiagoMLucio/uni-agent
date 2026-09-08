@@ -25,6 +25,10 @@ _COMMAND_SEPARATORS = re.compile(r"[;\n|&()`]+")
 #: git's own options, before the subcommand. These take a separate value, so it is skipped too.
 _GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
 
+#: Forms of a blocked subcommand that only look. Refusing these costs the agent a way to see
+#: what it stashed without giving it a way to lose anything.
+READ_ONLY_GIT_FORMS = {"stash": frozenset({"list", "show"})}
+
 
 def destructive_git_subcommand(command: str) -> str | None:
     """The first working-tree-destroying git subcommand in ``command``, or ``None``.
@@ -50,6 +54,9 @@ def destructive_git_subcommand(command: str) -> str | None:
                 elif arg.startswith("-"):
                     continue
                 elif arg in DESTRUCTIVE_GIT_SUBCOMMANDS:
+                    form = next((a for a in args if not a.startswith("-")), None)
+                    if form in READ_ONLY_GIT_FORMS.get(arg, ()):
+                        break
                     return arg
                 else:
                     break
