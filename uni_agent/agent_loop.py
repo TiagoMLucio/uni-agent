@@ -125,6 +125,47 @@ def _template_fields(template: str) -> set[str]:
     }
 
 
+def turn_entropy_records(segments: list[dict], trajectory: list) -> list[dict]:
+    """Per generating turn: the mean surprisal of the tokens the model produced, and what it called.
+
+    ``-log p(sampled)`` is an unbiased single-sample estimate of the entropy of the distribution
+    the token was drawn from, so a mean over a run's turns costs no extra forward pass. It
+    measures the distribution as sampled, at the run's own temperature.
+
+    Only the turn's own generated span counts. The observation tokens appended after it carry a
+    padded log-prob of 0.0, which reads as a perfectly predicted token, and including them would
+    pull each turn's mean toward zero in proportion to how much output its tools produced, which
+    is exactly the quantity that varies along a trajectory.
+
+    Empty unless the rollout asked for log-probs: requesting them is the switch.
+    """
+    tools: dict[int, list[str]] = {}
+    for step in trajectory:
+        if step.tool_results:
+            tools.setdefault(step.step_idx, [call.name for call in step.tool_results])
+    records = []
+    for segment in segments:
+        cache = segment["rollout_cache"]
+        logprobs = cache.get("response_logprobs") or []
+        mask = cache.get("response_mask") or []
+        if not logprobs:
+            continue
+        for turn, start, end in cache.get("turn_spans") or []:
+            # the span alone is the generated run; the mask is the second reading of the same fact
+            surprisal = [-lp for lp, m in zip(logprobs[start:end], mask[start:end], strict=False) if m]
+            if not surprisal:
+                continue
+            records.append({
+                "turn": int(turn),
+                "entropy": sum(surprisal) / len(surprisal),
+                "tokens": len(surprisal),
+                "tools": tools.get(int(turn), []),
+            })
+    for record in records:
+        record["turns"] = len(records)
+    return records
+
+
 def reward_metrics(reward_result: dict, applied_edits: float) -> dict[str, float]:
     """The reward's own health flags, per trajectory.
 
@@ -640,6 +681,7 @@ class UniAgentLoop(AgentLoopBase):
             "messages": interaction_result["messages"],
             "metrics": interaction_result.get("metrics", {}),
             "reward_score": interaction_result.get("reward_score", None),
+            "resolved": interaction_result.get("resolved"),
             # Everything downstream analysis needs, so a rollout log is self-describing and
             # offline tooling never has to reconstruct it from a trace backend that may have
             # dropped events. Written on the training filesystem, never in the agent's sandbox.
@@ -648,6 +690,9 @@ class UniAgentLoop(AgentLoopBase):
             "gold_patch": getattr(self.env, "privileged_context", "") or "",
             "turn_hints": interaction_result.get("turn_hints") or {},
         }
+        # absent, not empty, on a run that did not ask for log-probs: there is nothing to say
+        if records := turn_entropy_records(segments, interaction_result["trajectory"]):
+            save_content["turn_entropy"] = records
         (self.output_dir / "interaction_result.json").write_text(
             json.dumps(save_content, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",

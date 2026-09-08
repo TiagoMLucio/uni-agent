@@ -17,7 +17,12 @@ import pytest
 
 pytest.importorskip("verl.experimental.agent_loop")
 
-from uni_agent.agent_loop import compose_messages, opening_messages, reward_metrics  # noqa: E402
+from uni_agent.agent_loop import (  # noqa: E402
+    _template_fields,
+    compose_messages,
+    opening_messages,
+    reward_metrics,
+)
 from uni_agent.interaction.interaction import AgentInteraction  # noqa: E402
 
 SYSTEM = "You are a software engineer.\n\nYou work in a container.\n\nOnly your diff is graded."
@@ -67,19 +72,25 @@ def test_composition_matches_what_data_prep_would_have_baked():
 
 
 PROMPTS_DIR = Path(__file__).parents[3] / "base" / "prompts"
+SYSTEM_FILE = PROMPTS_DIR / "system.txt"
+TASK_FILES = sorted(PROMPTS_DIR.glob("families/*.task*.txt"))
 
 
-@pytest.mark.skipif(not PROMPTS_DIR.is_dir(), reason="needs the orchestration checkout's prompts")
-def test_composition_matches_the_real_prompt_files():
-    """The same equality against the text a run actually ships, not a fixture that resembles it."""
-    family = "swe_repo_fix"
-    core = (PROMPTS_DIR / "system.txt").read_text().strip()
-    block = (PROMPTS_DIR / "families" / f"{family}.system.txt").read_text().strip()
-    task = (PROMPTS_DIR / "families" / f"{family}.task.txt").read_text().strip()
-    values = {"family": family, "workdir": "/testbed", "language": "python",
-              "problem_statement": "the issue text"}
+@pytest.mark.skipif(
+    not (SYSTEM_FILE.is_file() and TASK_FILES), reason="needs the orchestration checkout's prompts"
+)
+@pytest.mark.parametrize("task_file", TASK_FILES or [None], ids=lambda p: p.name if p else "none")
+def test_composition_matches_the_real_prompt_files(task_file):
+    """The same equality against text a run actually ships, not a fixture that resembles it.
 
-    system = "\n\n".join(part for part in (core, block) if part)
+    Which files exist and how a system prompt is joined belong to the orchestration repo and
+    change there, so this reads whatever is on disk and fills whatever fields the template names.
+    """
+    system = SYSTEM_FILE.read_text().strip()
+    task = task_file.read_text().strip()
+    known = {"workdir": "/testbed", "language": "python", "problem_statement": "the issue text"}
+    values = {field: known.get(field, f"<{field}>") for field in _template_fields(task)}
+
     baked = [{"role": "system", "content": system}, {"role": "user", "content": task.format(**values)}]
     assert compose_messages({"system": system, "task": task}, values) == baked
 
