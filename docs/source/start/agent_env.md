@@ -234,13 +234,15 @@ The dependency is installed in the current sandbox and persists for the rest of 
 
 **2. Create a script and write its output to a file**
 
-Create a small Python script with `str_replace_editor`, then run it and redirect its stdout to a file:
+Create a small Python script with `str_replace_editor`, then run it and redirect its stdout to a file.
+`str_replace_editor` is installed as a program in the sandbox; `execute_bash` is not, since its
+`command` runs in the session as written, which is what `communicate` does here:
 
 ```python
 import shlex
 _script = "import numpy as np; print(np.array([1,2,3]).sum())"
 env.communicate(f"str_replace_editor create --path /tmp/demo.py --file_text {shlex.quote(_script)}")
-env.communicate("execute_bash 'python3 /tmp/demo.py > /tmp/demo_out.txt'")
+env.communicate("python3 /tmp/demo.py > /tmp/demo_out.txt")
 ```
 
 **3. View the result**

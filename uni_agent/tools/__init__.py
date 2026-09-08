@@ -3,7 +3,7 @@
 Scaffold tools.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .finish import FinishTool
 from .registry import get_tool, AbstractTool
@@ -17,6 +17,8 @@ from .think import ThinkTool
 
 
 class ToolConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     #: replaces the tool module's DESCRIPTION in the schema the model reads; None keeps it
     description: str | None = None

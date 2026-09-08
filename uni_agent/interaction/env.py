@@ -154,7 +154,8 @@ class AgentEnv:
             self.logger.info("Running post_setup_cmd...")
             await self.communicate(self.post_setup_cmd, check="raise")
         if self.privileged_setup_cmd:
-            output = await self.communicate(self.privileged_setup_cmd, check="raise")
+            # the loop's setup_timeout around start() is the binding budget, not this cap
+            output = await self.communicate(self.privileged_setup_cmd, timeout=300, check="raise")
             self.privileged_context = output.strip()
             self.logger.info(f"Captured {len(self.privileged_context)} chars of privileged context")
 

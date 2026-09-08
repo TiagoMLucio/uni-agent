@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import pickle
 import time
@@ -33,6 +34,34 @@ from uni_agent.tracing import (
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
+
+#: Every top-level key the agent yaml may carry: what ``UniAgentLoop`` reads, plus ``name``
+#: and ``_target_``, which verl's registry and hydra need to instantiate it. Unlisted keys are
+#: rejected so a typo cannot silently leave the loop on a code default.
+AGENT_CONFIG_KEYS = frozenset(
+    {
+        "_target_",
+        "name",
+        "chat_template_kwargs",
+        "concurrency",
+        "condense",
+        "context_budget",
+        "declare_tools",
+        "env",
+        "interaction",
+        "log_dir",
+        "mask_abnormal_exit_traj",
+        "max_completion_tokens",
+        "reflection",
+        "reward",
+        "setup_retries",
+        "setup_timeout",
+        "skills",
+        "tool_parser",
+        "tools",
+        "validation_overrides",
+    }
+)
 
 #: What a saved segment grid keeps: enough to locate a turn's tokens and rebuild the training
 #: row for it. `response_logprobs` is the sampler's own log-prob per token, which the SDPO loss
@@ -349,14 +378,17 @@ class UniAgentLoop(AgentLoopBase):
                 "",
             )
             trajectory = interaction_result.get("trajectory") or []
-            steps = {step.step_idx: step for step in trajectory}
+            # the cap and stuck exits append a sentinel under the last real step's index
+            steps = {}
+            for step in trajectory:
+                steps.setdefault(step.step_idx, step)
             termination = _termination(trajectory)
             if termination in config.skip_exit_reasons:
                 return {}
             resolved = bool(interaction_result.get("resolved"))
             outcome = (
                 f"resolved: {resolved} | reward: {interaction_result.get('reward_score')} | "
-                f"termination: {termination} | turns: {len(trajectory)}"
+                f"termination: {termination} | turns: {len(steps)}"
             )
             segments = interaction_result.get("segments") or [{"rollout_cache": interaction_result["rollout_cache"]}]
             # a turn lives in exactly one segment's spans: the union ordered by step is the full turn table
@@ -576,6 +608,17 @@ class UniAgentLoop(AgentLoopBase):
         if kwargs.get("validate") and isinstance(config_dict.get("validation_overrides"), dict):
             config_dict = _deep_merge(config_dict, config_dict["validation_overrides"])
 
+        unknown = sorted(set(config_dict) - AGENT_CONFIG_KEYS)
+        if unknown:
+            hints = [
+                f"{key} (did you mean {m[0]}?)" if (m := difflib.get_close_matches(key, AGENT_CONFIG_KEYS, 1)) else key
+                for key in unknown
+            ]
+            raise ValueError(
+                f"Unknown top-level agent config key(s): {', '.join(hints)}. "
+                f"Known keys: {', '.join(sorted(AGENT_CONFIG_KEYS))}"
+            )
+
         rollout_config = self.config.actor_rollout_ref.rollout
         engine_len = (
             rollout_config.max_model_len
@@ -654,8 +697,9 @@ class UniAgentLoop(AgentLoopBase):
         """
         reward_score = interaction_result.get("reward_score", None)
         trajectory = interaction_result.get("trajectory", [])
-        num_turns = len(trajectory)
-        traj_exit_reason = trajectory[-1].exit_reason if num_turns > 0 else "unknown"
+        # the cap and stuck sentinels share the last real step's index
+        num_turns = len({step.step_idx for step in trajectory})
+        traj_exit_reason = trajectory[-1].exit_reason if trajectory else "unknown"
         metrics = interaction_result.get("metrics", {})
         # an eval that never ran scores resolved=False, which is indistinguishable from a real failure
         eval_incomplete = metrics.get("eval_completed", 1.0) < 1.0

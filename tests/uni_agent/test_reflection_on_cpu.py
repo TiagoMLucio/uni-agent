@@ -484,3 +484,40 @@ def test_skip_exit_reasons_skips_the_reflector_call(tmp_path):
     trajectory = [_traj_step(0, exit_reason="max_step_limit")]
     hints, _ = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]}, trajectory)
     assert hints == {0: "run the failing test"}
+
+
+def test_the_cap_sentinel_does_not_shadow_the_last_real_turn(tmp_path):
+    """max_step_limit and stuck append a bare StepOutput under the last real step's index; the
+    reflector must render that step's response and tool call, and count the turns without it."""
+    from uni_agent.agent_loop import UniAgentLoop
+    from uni_agent.interaction.interaction import StepOutput
+
+    def _turn(idx, response, command, observation):
+        # the call reaches the reflector inside the raw response; TOOL_TEMPLATE renders name and observation
+        step = _traj_step(idx, tools=[("execute_bash", command, observation)])
+        step.response = (
+            f"{response}\n<tool_call>\n<function=execute_bash>\n"
+            f"<parameter=command>{command}</parameter>\n</function>\n</tool_call>"
+        )
+        return step
+
+    last = _turn(2, "the real last turn", "pytest -x", "1 failed")
+    first = _turn(1, "listing the repo", "ls /testbed", "a.py")
+    trajectory = [first, last, StepOutput(step_idx=2, exit_reason="max_step_limit")]
+    model = _Model()
+    loop = types.SimpleNamespace(
+        env=types.SimpleNamespace(privileged_context="gold"), chat_model=model, run_id="run",
+        output_dir=tmp_path, identity={}, logger=None,
+    )
+    result = {
+        "reward_score": 0.0, "resolved": False, "reward_extra_info": {"feedback": "f", "agent_patch": ""},
+        "metrics": {}, "messages": [{"role": "user", "content": "t"}], "trajectory": trajectory,
+        "rollout_cache": {"turn_spans": [[1, 0, 2], [2, 2, 4]]},
+    }
+    block = {"name": "pipeline", "calls": [ONE_CALL.model_dump()], "enabled": True}
+    asyncio.run(UniAgentLoop._maybe_reflect(loop, result, {"reflection": block}, validate=False))
+
+    rendered = model.messages[1]["content"]
+    assert "the real last turn" in rendered and "pytest -x" in rendered and "1 failed" in rendered
+    assert "degenerate turn" not in rendered
+    assert "termination: max_step_limit | turns: 2" in rendered

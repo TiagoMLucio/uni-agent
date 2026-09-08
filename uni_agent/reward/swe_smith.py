@@ -257,13 +257,17 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                 if feedback_span is not None:
                     feedback_span.update(output=trace_clip(extra_info["feedback"], TRACE_FEEDBACK_CHARS))
         if self.agent_patch_diff_args:
-            # a wider re-render of the same prediction, for the reflector only
-            with rollout_trace_span(
-                "patch_extract", metadata={"diff_args": self.agent_patch_diff_args}
-            ) as wide_span:
-                extra_info["agent_patch"] = await self._get_interaction_env_patch(self.agent_patch_diff_args)
-                if wide_span is not None:
-                    wide_span.update(output=trace_clip(extra_info["agent_patch"], TRACE_PATCH_CHARS))
+            # a wider re-render of the same prediction, for the reflector only; never fails a graded row
+            try:
+                with rollout_trace_span(
+                    "patch_extract", metadata={"diff_args": self.agent_patch_diff_args}
+                ) as wide_span:
+                    extra_info["agent_patch"] = await self._get_interaction_env_patch(self.agent_patch_diff_args)
+                    if wide_span is not None:
+                        wide_span.update(output=trace_clip(extra_info["agent_patch"], TRACE_PATCH_CHARS))
+            except Exception as e:
+                self.logger.error(f"Failed to extract the agent patch for the reflector: {e}")
+                extra_info["agent_patch"] = ""
         if extra_info:
             result["reward_extra_info"] = extra_info
         # graded prediction, for the trace outcome only: kept out of reward_extra_info

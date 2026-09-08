@@ -73,6 +73,69 @@ def test_redraws_per_rung_is_the_draw_count_on_one_rung():
         assert seen == calls, (redraws, seen)
 
 
+class SizedModel(Model):
+    """Prompt length = chars // 4; over-budget prompts raise where the real client does."""
+
+    def __init__(self, replies, max_model_len):
+        super().__init__(replies)
+        self.max_model_len = max_model_len
+        self.renders = []
+        self.queries = []
+
+    async def prepare_rollout_cache(self, messages, include_tools=True, chat_template_kwargs=None):
+        n = sum(len(m["content"]) for m in messages) // 4
+        self.renders.append(n)
+        return {"prompt_ids": list(range(n))}
+
+    async def query(self, messages, rollout_cache, sampling_params=None, max_model_len=None, **kwargs):
+        from uni_agent.interaction.model import MaxTokenExceededError
+
+        n = len(rollout_cache["prompt_ids"])
+        if n >= (max_model_len or self.max_model_len):
+            raise MaxTokenExceededError(f"{n} >= {max_model_len}")
+        self.queries.append((n, sampling_params["max_tokens"]))
+        return await super().query(messages, rollout_cache)
+
+
+def turns_with_observations(n_turns, obs_chars):
+    return [
+        {"step": i + 1, "response": "resp " * 50,
+         "tools": [{"name": "execute_bash", "action": "python x.py", "observation": "o" * obs_chars}]}
+        for i in range(n_turns)
+    ]
+
+
+def run_ladder(n_turns, obs_chars, max_model_len=262144, **over):
+    good = MARKER + '\n{"turn2": "run the snippet you printed at turn 1 before editing"}'
+    model = SizedModel([good], max_model_len)
+    r = PipelineReflector(model, config(max_model_len=max_model_len, max_observation_chars=1_000_000,
+                                       max_output_tokens=16384, **over))
+    hints = asyncio.run(r.reflect_trajectory(task="t", turns=turns_with_observations(n_turns, obs_chars),
+                                             gold="g", feedback="f"))
+    return hints, model
+
+
+def test_an_over_budget_rung_is_rendered_once():
+    """Rungs 0 and 1 overflow, rung 2 fits: three renders however many redraws a rung allows,
+    since an over-budget render is deterministic and the redraws would repeat it."""
+    for redraws in (0, 1, 3):
+        hints, model = run_ladder(230, 100_000, redraws_per_rung=redraws)
+        assert hints == {2: "run the snippet you printed at turn 1 before editing"}
+        assert len(model.renders) == 3, (redraws, model.renders)
+        assert len(model.queries) == 1 and model.queries[0][1] == 16384
+
+
+def test_a_prompt_without_reply_room_is_over_budget():
+    """A prompt that fits but leaves less than max_output_tokens of room is not sent: the staged
+    reply could not close, and the shrink ladder moves on without paying the prefill."""
+    hints, model = run_ladder(250, 100_000, redraws_per_rung=1)
+    assert model.queries == [], "every rung leaves under 16384 tokens of room"
+    assert hints == {}
+    assert len(model.renders) == 5, "one render per rung, none repeated"
+    assert all(n < 262144 for n in model.renders[2:]), "the last rungs fit by prompt length alone"
+    assert all(n + 16384 > 262144 for n in model.renders[2:])
+
+
 def test_an_unescaped_quote_still_yields_its_hint():
     # one stray quote used to cost the rollout every hint in the reply
     reply = MARKER + '\n{"turn2": "the call passes "utf-8" positionally, so it lands in errors="}'

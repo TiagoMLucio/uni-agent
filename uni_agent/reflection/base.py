@@ -135,55 +135,67 @@ class AbstractReflector(ABC):
         # a rejected reply re-draws on the same rung before shrinking, since the shrink is
         # there for prompts that do not fit, not for replies that came out malformed
         draws = 1 + cfg.redraws_per_rung if accept is not None else 1
-        ladder = [rung for rung in rungs for _ in range(draws)]
+        attempts = len(rungs) * draws
+        max_tokens = max_output_tokens or cfg.max_output_tokens
+        # the same ceiling query() enforces: the config's, else the client's own
+        limit = cfg.max_model_len or getattr(self.model, "max_model_len", None)
+        attempt = 0
         rejected = None
-        for attempt, (obs_cap, resp_cap) in enumerate(ladder):
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": render_user(obs_cap, resp_cap)},
-            ]
-            # every call reaches Langfuse as an identical model_call, so a pipeline's stages are
-            # indistinguishable there without a span naming the one they belong to
-            label = "reflect:{}".format(stage or "call") + ("" if step is None else f"@turn{step}")
-            try:
-                with rollout_trace_span(label, metadata={"obs_cap": obs_cap, "resp_cap": resp_cap}):
-                    # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
-                    cache = await self.model.prepare_rollout_cache(
-                        messages, include_tools=False, chat_template_kwargs=cfg.chat_template_kwargs
-                    )
-                    # the engine is sized for this call, not for a rollout: rollouts condense to the
-                    # agent's budget while a reflector prompt is the whole trajectory at once, so its
-                    # prefill is what sets the peak activation the rollout engine has to fit
-                    prompt_tokens = len(cache.get("prompt_ids") or ())
-                    sampling_params = {
-                        **(getattr(self.model, "sampling_params", None) or {}),
-                        "max_tokens": max_output_tokens or cfg.max_output_tokens,
-                    }
-                    text, _, _, _ = await self.model.query(
-                        messages=messages, rollout_cache=cache, sampling_params=sampling_params,
-                        max_model_len=cfg.max_model_len,
-                    )
-                self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
-                                 f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
-                self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap)
-                if accept is None or accept(text):
-                    return text
-                rejected = text
-                self.logger.info(f"Reflection reply unusable (attempt {attempt + 1}/{len(ladder)}, "
-                                 f"obs_cap={obs_cap}); re-drawing")
-                continue
-            except MaxTokenExceededError as exc:
-                self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
-                self._record(stage, step, messages, None, None, obs_cap, resp_cap, error="over budget")
-                continue
-            except Exception as exc:
-                self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
-                self._record(stage, step, messages, None, None, obs_cap, resp_cap, error=repr(exc))
-                return None
+        for obs_cap, resp_cap in rungs:
+            for _ in range(draws):
+                attempt += 1
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": render_user(obs_cap, resp_cap)},
+                ]
+                # every call reaches Langfuse as an identical model_call, so a pipeline's stages are
+                # indistinguishable there without a span naming the one they belong to
+                label = "reflect:{}".format(stage or "call") + ("" if step is None else f"@turn{step}")
+                try:
+                    with rollout_trace_span(label, metadata={"obs_cap": obs_cap, "resp_cap": resp_cap}):
+                        # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
+                        cache = await self.model.prepare_rollout_cache(
+                            messages, include_tools=False, chat_template_kwargs=cfg.chat_template_kwargs
+                        )
+                        # the engine is sized for this call, not for a rollout: rollouts condense to the
+                        # agent's budget while a reflector prompt is the whole trajectory at once, so its
+                        # prefill is what sets the peak activation the rollout engine has to fit
+                        prompt_tokens = len(cache.get("prompt_ids") or ())
+                        # a prompt that fits but leaves less than the reply's room is over budget too:
+                        # the staged reply cannot close, and the same prefill would be paid again
+                        if limit and prompt_tokens + max_tokens > limit:
+                            raise MaxTokenExceededError(
+                                f"prompt_tokens {prompt_tokens} + max_tokens {max_tokens} exceeds max_model_len {limit}"
+                            )
+                        sampling_params = {
+                            **(getattr(self.model, "sampling_params", None) or {}),
+                            "max_tokens": max_tokens,
+                        }
+                        text, _, _, _ = await self.model.query(
+                            messages=messages, rollout_cache=cache, sampling_params=sampling_params,
+                            max_model_len=cfg.max_model_len,
+                        )
+                    self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
+                                     f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
+                    self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap)
+                    if accept is None or accept(text):
+                        return text
+                    rejected = text
+                    self.logger.info(f"Reflection reply unusable (attempt {attempt}/{attempts}, "
+                                     f"obs_cap={obs_cap}); re-drawing")
+                except MaxTokenExceededError as exc:
+                    self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
+                    self._record(stage, step, messages, None, None, obs_cap, resp_cap, error="over budget")
+                    # deterministic at this rung: the redraws would render the same prompt
+                    break
+                except Exception as exc:
+                    self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
+                    self._record(stage, step, messages, None, None, obs_cap, resp_cap, error=repr(exc))
+                    return None
         if rejected is not None:
             # hand back the last reply anyway: the caller's own parse is the arbiter, and a
             # reply it cannot use is no worse than the None this used to return
-            self.logger.warning("Reflection: no usable reply in %d attempts", len(ladder))
+            self.logger.warning("Reflection: no usable reply in %d attempts", attempts)
             return rejected
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
         return None
@@ -264,7 +276,6 @@ class AbstractReflector(ABC):
         return "\n\n".join(
             TURN_TEMPLATE.format(
                 step=turn["step"],
-                tokens=turn.get("tokens", "?"),
                 response=(
                     # mark breakdown turns so the reflector coaches recovery instead of inventing content (rule 3)
                     f"(degenerate turn: the model emitted almost no output and no tool call) "

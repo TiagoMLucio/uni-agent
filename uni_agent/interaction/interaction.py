@@ -300,7 +300,10 @@ class AgentInteraction:
 
         # Persist the assistant message in api-shape (with tool_calls)
         # so replay preserves the assistant<->tool linkage.
-        assistant_msg: dict[str, object] = {"role": "assistant", "content": model_output}
+        # the decoded output carries the sampler's eos; the template appends its own on re-render
+        eos_token = getattr(getattr(self.model, "tokenizer", None), "eos_token", None)
+        stored_output = model_output.removesuffix(eos_token) if eos_token else model_output
+        assistant_msg: dict[str, object] = {"role": "assistant", "content": stored_output}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         self.messages.append(assistant_msg)
