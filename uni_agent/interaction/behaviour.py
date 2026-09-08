@@ -48,7 +48,11 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
     repeat an earlier turn's, and the tail after the last turn that changed source.
 
     ``idle_turns_after_edit`` is absent when no edit to source ever landed, so its step mean is
-    read over the trajectories that changed source; ``source_edit_turns`` is how many those were.
+    read over the trajectories that changed source and ``source_edited`` is that share. Without
+    the share, a run that drives trajectories to stop editing reads as a shorter idle tail.
+
+    ``edit_failures`` is out of ``edit_calls_run``, not out of ``edit_attempts``: the difference
+    is the calls the harness refused before the editor saw them.
     """
     steps: dict[int, StepOutput] = {}
     for step in trajectory:
@@ -56,8 +60,8 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
     ordered = [steps[idx] for idx in sorted(steps)]
 
     out = dict.fromkeys(
-        ("tool_calls", "edit_attempts", "edit_failures", "format_errors", "acting_turns",
-         "repeated_turns", "source_edit_turns"), 0
+        ("tool_calls", "edit_attempts", "edit_calls_run", "edit_failures", "format_errors",
+         "acting_turns", "repeated_turns", "source_edit_turns", "source_edited"), 0
     )
     out.update({f"tool_{status}": 0 for status in get_args(ToolStatus)})
     seen: set[int] = set()
@@ -85,6 +89,7 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
             # outcome; its own tool status already carries it
             if call.status != "ok":
                 continue
+            out["edit_calls_run"] += 1
             if not any(done in call.observation for done in EDIT_DONE):
                 out["edit_failures"] += 1
             else:
@@ -93,5 +98,6 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
             out["source_edit_turns"] += 1
             last_source_edit = step.step_idx
     if last_source_edit is not None:
+        out["source_edited"] = 1
         out["idle_turns_after_edit"] = sum(1 for step in ordered if step.step_idx > last_source_edit)
     return {name: float(value) for name, value in out.items()}

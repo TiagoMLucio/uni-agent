@@ -55,6 +55,7 @@ def test_behaviour_metrics_count_outcomes_edits_repeats_and_the_idle_tail():
         "tool_skipped": 1.0,
         # the skipped call carries no action, so it is not an edit that was attempted
         "edit_attempts": 3.0,
+        "edit_calls_run": 3.0,
         "edit_failures": 1.0,
         "format_errors": 1.0,
         "acting_turns": 8.0,
@@ -62,6 +63,7 @@ def test_behaviour_metrics_count_outcomes_edits_repeats_and_the_idle_tail():
         "repeated_turns": 2.0,
         # only turn 1 changed source: turn 3's edit was refused and the reproducer is not source
         "source_edit_turns": 1.0,
+        "source_edited": 1.0,
         "idle_turns_after_edit": 8.0,
     }
 
@@ -79,8 +81,9 @@ def test_the_idle_tail_is_absent_when_nothing_edited_source():
         step(2, call("str_replace_editor", only_tests, "The file /testbed/tests/test_mod.py has been edited. ")),
     ])
     assert "idle_turns_after_edit" not in metrics
-    assert metrics["source_edit_turns"] == 0.0
-    assert (metrics["edit_attempts"], metrics["edit_failures"]) == (1.0, 0.0)
+    # the population the idle tail would be read over, and this trajectory is not in it
+    assert (metrics["source_edited"], metrics["source_edit_turns"]) == (0.0, 0.0)
+    assert (metrics["edit_attempts"], metrics["edit_calls_run"], metrics["edit_failures"]) == (1.0, 1.0, 0.0)
 
 
 def test_an_edit_the_loop_never_ran_is_an_attempt_but_not_an_editor_refusal():
@@ -89,6 +92,7 @@ def test_an_edit_the_loop_never_ran_is_an_attempt_but_not_an_editor_refusal():
     metrics = behaviour_metrics([
         step(1, call("str_replace_editor", EDIT, "Your command is NOT executed.", status="syntax_error")),
     ])
-    assert (metrics["edit_attempts"], metrics["edit_failures"]) == (1.0, 0.0)
+    # the refusal rate is read out of edit_calls_run, which this call never entered
+    assert (metrics["edit_attempts"], metrics["edit_calls_run"], metrics["edit_failures"]) == (1.0, 0.0, 0.0)
     assert metrics["tool_syntax_error"] == 1.0
-    assert "idle_turns_after_edit" not in metrics
+    assert (metrics["source_edited"], "idle_turns_after_edit" in metrics) == (0.0, False)
