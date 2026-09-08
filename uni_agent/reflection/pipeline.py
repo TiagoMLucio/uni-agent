@@ -27,6 +27,13 @@ TRACE_FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", 
 TURN_FIELDS = frozenset({"prefix", "turn", "hint"})
 #: the previous call's reply, so a stage can react to one without being handed the trajectory
 PREV_FIELD = "prev"
+#: each privileged input and the user fields it fills; {delta} is built from both patches, so a
+#: stage naming it consumes them without naming either
+INPUT_FIELDS = {
+    "include_gold": ("gold", "delta"),
+    "include_agent_patch": ("agent_patch", "delta"),
+    "include_exec_feedback": ("feedback",),
+}
 
 _JSON_DECODER = json.JSONDecoder()
 _DROP = {"DROP", "NONE", "REMOVE"}
@@ -87,7 +94,25 @@ class PipelineReflectionConfig(BaseReflectionConfig):
                 raise ValueError(f"call {call.id!r}: a per-turn call cannot select the turns")
             if call.edit == "delete_only" and call.parse != "hints":
                 raise ValueError(f"call {call.id!r}: edit=delete_only only applies to parse=hints")
+        if self.enabled:
+            self._check_inputs()
         return self
+
+    def _check_inputs(self) -> None:
+        """Each privileged input against the fields the stages name: an input nothing names is
+        gathered for nothing, and a field whose input is off renders as "(not available)", so the
+        prompt reasons from something it was never given."""
+        named = set().union(*(_fields(call.user) for call in self.calls))
+        for flag, fields in INPUT_FIELDS.items():
+            used = sorted(f for f in fields if f in named)
+            slots = " or ".join("{" + f + "}" for f in fields)
+            if getattr(self, flag) and not used:
+                raise ValueError(f"{flag} is on but no call names {slots}")
+            if not getattr(self, flag) and used:
+                raise ValueError(
+                    f"{flag} is off but a call names {' and '.join('{' + f + '}' for f in used)}, "
+                    "which would render as (not available)"
+                )
 
 
 @register_reflector("pipeline")

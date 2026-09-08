@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import json
+from string import Formatter
 
 from uni_agent.interaction.model import MaxTokenExceededError
 from uni_agent.reflection import CallSpec, PipelineReflectionConfig, PipelineReflector
@@ -84,9 +85,20 @@ def test_agent_patch_is_included_and_capped():
     assert user.count("q") == 50 and user.count("z") == 50
 
 
-def test_agent_patch_can_be_switched_off():
+def test_switching_an_input_off_needs_a_prompt_that_does_not_name_it():
+    """Switching an input off leaves its slot rendering "(not available)", so the prompt has to
+    drop the slot too; a config that keeps it is refused rather than run."""
+    import pytest
+    with pytest.raises(Exception, match="include_agent_patch is off"):
+        _config(enabled=True, include_agent_patch=False)
+
     model = _Model()
-    reflector = PipelineReflector(model, _config(enabled=True, include_agent_patch=False))
+    without = CallSpec(id="single", parse="hints", system=SYSTEM,
+                       user=USER.replace("Patch the attempt produced:\n{agent_patch}\n\n", ""))
+    reflector = PipelineReflector(
+        model,
+        PipelineReflectionConfig(name="pipeline", enabled=True, calls=[without], include_agent_patch=False),
+    )
     asyncio.run(
         reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f", agent_patch="diff --git a/x b/x")
     )
@@ -188,7 +200,7 @@ class _ScriptedModel:
 
 def _pipeline(replies, calls, **cfg):
     model = _ScriptedModel(replies)
-    config = PipelineReflectionConfig(enabled=True, name="pipeline", calls=calls, **cfg)
+    config = PipelineReflectionConfig(enabled=True, name="pipeline", calls=calls, **{**_given(calls), **cfg})
     reflector = PipelineReflector(model, config)
     hints = asyncio.run(
         reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="GOLDPATCH", feedback="f", outcome="o")
@@ -200,6 +212,14 @@ DRAFT = CallSpec(id="draft", parse="hints", system="DRAFT {k}",
                  user="{task}\n{gold}\n{turns}")
 REPAIR = CallSpec(id="repair", per="turn", parse="hints", edit="delete_only", system="REPAIR",
                   user="{task}\nprefix:\n{prefix}\nturn {turn}\nhint: {hint}")
+
+
+def _given(calls):
+    """The privileged inputs these stages name, which a config has to declare."""
+    named = set().union(*({n for _, n, _, _ in Formatter().parse(c.user) if n} for c in calls))
+    return {"include_gold": bool({"gold", "delta"} & named),
+            "include_agent_patch": bool({"agent_patch", "delta"} & named),
+            "include_exec_feedback": "feedback" in named}
 
 
 def test_a_per_turn_stage_replaces_each_hint_with_what_it_returns():
@@ -232,7 +252,7 @@ def test_a_failed_repair_call_drops_the_hint_rather_than_keeping_it():
 
     model = _Flaky({"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}'})
     reflector = PipelineReflector(model, PipelineReflectionConfig(enabled=True, name="pipeline",
-                                                                 calls=[DRAFT, REPAIR]))
+                                                                 calls=[DRAFT, REPAIR], **_given([DRAFT, REPAIR])))
     hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
     assert hints == {}
 
@@ -272,7 +292,7 @@ def test_a_failing_repair_drops_rather_than_ships_the_draft():
 
     model = _Flaky({"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}'})
     reflector = PipelineReflector(model, PipelineReflectionConfig(enabled=True, name="pipeline",
-                                                                 calls=[DRAFT, REPAIR]))
+                                                                 calls=[DRAFT, REPAIR], **_given([DRAFT, REPAIR])))
     hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
     assert hints == {}
 
@@ -348,7 +368,8 @@ def test_a_pipeline_records_each_stage_separately(tmp_path):
         "REPAIR": "FINAL_HINTS_JSON:\nDELETE",
     })
     reflector = PipelineReflector(
-        model, PipelineReflectionConfig(enabled=True, name="pipeline", calls=[DRAFT, REPAIR]),
+        model, PipelineReflectionConfig(enabled=True, name="pipeline", calls=[DRAFT, REPAIR],
+                                 **_given([DRAFT, REPAIR])),
         record_path=path, identity={"uid": "u9"})
     asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="G", feedback="f"))
 
