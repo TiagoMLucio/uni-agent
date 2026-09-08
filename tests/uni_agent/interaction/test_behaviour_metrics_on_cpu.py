@@ -58,6 +58,8 @@ def test_behaviour_metrics_count_outcomes_edits_repeats_and_the_idle_tail():
         "edit_calls_run": 3.0,
         "edit_failures": 1.0,
         "format_errors": 1.0,
+        # nothing here reached for a destructive git subcommand
+        "git_refusals": 0.0,
         "acting_turns": 8.0,
         # turn 3 repeats turn 1's edit, turn 6 turn 5's command
         "repeated_turns": 2.0,

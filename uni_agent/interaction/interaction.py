@@ -25,7 +25,7 @@ from .env import (
 from .model import AgentChatModel, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
 from .tool_schemas import OpenAIFunctionToolCall
-from .tools_manager import ToolsManager
+from .tools_manager import ToolsManager, destructive_git_subcommand
 
 # "yielded": the command hit its timeout but is still running and still reachable, so it
 # is normal operation, not a failure. Only "timeout" (the kill) spends the budget.
@@ -491,6 +491,21 @@ class AgentInteraction:
         """Run one tool call in the env; errors become the observation (status marks the kind)."""
         action = self.tools_manager.get_tool_action(tool_call)
         self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
+        refused = None if action.is_input else destructive_git_subcommand(action.command)
+        if refused:
+            observation = (
+                f"Your command was NOT executed: `git {refused}` is not available here. Everything "
+                "you change is collected from the working tree, so a command that commits it or "
+                "throws it away loses the fix along with it. To undo an edit, put the original text "
+                "back with the editor. Reading the repository still works: `git diff`, `git status`, "
+                "`git log`, `git show`."
+            )
+            self.logger.error(observation)
+            # a refused call, like the two below: "skipped" would trip the terminal_dead abort
+            return ToolResult(
+                tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
+                observation=observation, status="syntax_error", execution_time=0.0,
+            )
         # unasked, a command gets the short yield timeout: it is not killed when that
         # expires, so the cost of guessing low is one polling turn. A model that knows
         # its command is slow may ask for more, up to the ceiling, but never past it.

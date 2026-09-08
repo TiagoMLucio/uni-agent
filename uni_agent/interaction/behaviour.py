@@ -9,6 +9,7 @@ import re
 from typing import TYPE_CHECKING, get_args
 
 from uni_agent.interaction.interaction import ToolStatus
+from uni_agent.interaction.tools_manager import destructive_git_subcommand
 
 if TYPE_CHECKING:
     from uni_agent.interaction.interaction import StepOutput
@@ -53,6 +54,9 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
 
     ``edit_failures`` is out of ``edit_calls_run``, not out of ``edit_attempts``: the difference
     is the calls the harness refused before the editor saw them.
+
+    ``git_refusals`` is out of ``tool_calls``: blocking ``checkout`` takes a move the policy makes
+    today, so whether it fires has to be measured rather than assumed.
     """
     steps: dict[int, StepOutput] = {}
     for step in trajectory:
@@ -61,7 +65,7 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
 
     out = dict.fromkeys(
         ("tool_calls", "edit_attempts", "edit_calls_run", "edit_failures", "format_errors",
-         "acting_turns", "repeated_turns", "source_edit_turns", "source_edited"), 0
+         "acting_turns", "repeated_turns", "source_edit_turns", "source_edited", "git_refusals"), 0
     )
     out.update({f"tool_{status}": 0 for status in get_args(ToolStatus)})
     seen: set[int] = set()
@@ -82,6 +86,8 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
         for call in step.tool_results:
             out["tool_calls"] += 1
             out[f"tool_{call.status}"] += 1
+            if destructive_git_subcommand(call.action):
+                out["git_refusals"] += 1
             if edit_command(call.action) not in EDIT_CMDS:
                 continue
             out["edit_attempts"] += 1

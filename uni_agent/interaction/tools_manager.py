@@ -1,4 +1,5 @@
 import json
+import re
 import shlex
 
 from pydantic import BaseModel, ConfigDict
@@ -11,6 +12,48 @@ from uni_agent.interaction.tool_schemas import (
     OpenAIFunctionToolSchema,
 )
 from uni_agent.tools import ToolConfig
+
+#: Git subcommands that move or discard the working tree. The graded patch is taken from that
+#: tree (``git add -A`` then ``git diff --cached``), so a commit hides a correct fix behind HEAD
+#: and the others throw the work away; inspecting the repository stays available.
+DESTRUCTIVE_GIT_SUBCOMMANDS = frozenset({"commit", "stash", "reset", "checkout", "restore", "clean"})
+
+#: What ends one command and starts the next, substitutions included. ``cd /testbed && git stash``
+#: is the shape that matters, and reading only the first word of the line misses exactly it.
+_COMMAND_SEPARATORS = re.compile(r"[;\n|&()`]+")
+
+#: git's own options, before the subcommand. These take a separate value, so it is skipped too.
+_GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
+
+
+def destructive_git_subcommand(command: str) -> str | None:
+    """The first working-tree-destroying git subcommand in ``command``, or ``None``.
+
+    Every ``git`` in every segment is read, not the first word of the line, so composition
+    (``cd /testbed && git stash``) and the runner idioms (``| xargs git checkout``) are covered.
+    A determined evader still gets through (an absolute path, ``bash -c``, quoting), which is not
+    what this is for: agents reach for ``git stash`` and ``git checkout`` to tidy up, and lose the
+    fix they already had.
+    """
+    for segment in _COMMAND_SEPARATORS.split(command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        for index, token in enumerate(tokens):
+            if token != "git":
+                continue
+            args = iter(tokens[index + 1:])
+            for arg in args:
+                if arg in _GIT_VALUE_OPTIONS:
+                    next(args, None)
+                elif arg.startswith("-"):
+                    continue
+                elif arg in DESTRUCTIVE_GIT_SUBCOMMANDS:
+                    return arg
+                else:
+                    break
+    return None
 
 
 class ToolsManagerConfig(BaseModel):
