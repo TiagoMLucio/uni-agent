@@ -362,7 +362,8 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
     put_keys, fields = stub.put
     assert put_keys == keys
     assert set(fields.keys()) == {
-        "teacher_input_ids", "teacher_seq_meta", "self_distillation_mask", "loss_mask", "trace_weight", "traj_id"
+        "teacher_input_ids", "teacher_seq_meta", "self_distillation_mask", "loss_mask", "trace_weight", "traj_id",
+        "row_id"
     }
     # supervised tokens: turn 0 minus the observation token at index 1, plus the whole of turn 1
     supervised = [len(TURN0) - 1 + len(TURN1), 0, len(TURN1), 0, len(TURN0) - 1]
