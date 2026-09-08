@@ -8,7 +8,7 @@ SCRIPT = Path(__file__).parents[2] / "uni_agent" / "tools" / "str_replace_editor
 
 
 def run_edit(path: Path, old: str, new: str = "REPLACED", explain: bool = True):
-    env = {**os.environ, "EXPLAIN_EDIT_FAILURES": "true" if explain else "false"}
+    env = {**os.environ, "STR_REPLACE_EXPLAIN_EDIT_FAILURES": "true" if explain else "false"}
     return subprocess.run(
         [sys.executable, str(SCRIPT), "str_replace", "--path", str(path),
          "--old_str", old, "--new_str", new],
@@ -17,7 +17,7 @@ def run_edit(path: Path, old: str, new: str = "REPLACED", explain: bool = True):
 
 
 def run_create(path: Path, file_text: str, explain: bool = True):
-    env = {**os.environ, "EXPLAIN_EDIT_FAILURES": "true" if explain else "false"}
+    env = {**os.environ, "STR_REPLACE_EXPLAIN_EDIT_FAILURES": "true" if explain else "false"}
     return subprocess.run(
         [sys.executable, str(SCRIPT), "create", "--path", str(path),
          "--file_text", file_text],
@@ -143,7 +143,7 @@ def test_snippet_in_success_message(tmp_path):
     assert "line_15 = 150" in out
 
 
-# --- failure diagnosis (EXPLAIN_EDIT_FAILURES) ---
+# --- failure diagnosis (STR_REPLACE_EXPLAIN_EDIT_FAILURES) ---
 
 FUNC = (
     "import numpy as np\n"
@@ -295,7 +295,7 @@ def test_non_python_files_never_lint(tmp_path):
 # --- did-you-mean suggestion (STR_REPLACE_DID_YOU_MEAN=true) ------------------------------
 
 def run_edit_dym(path: Path, old: str, dym: bool = True):
-    env = {**os.environ, "EXPLAIN_EDIT_FAILURES": "true",
+    env = {**os.environ, "STR_REPLACE_EXPLAIN_EDIT_FAILURES": "true",
            "STR_REPLACE_DID_YOU_MEAN": "true" if dym else "false"}
     return subprocess.run(
         [sys.executable, str(SCRIPT), "str_replace", "--path", str(path),

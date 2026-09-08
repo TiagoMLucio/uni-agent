@@ -26,12 +26,12 @@ TRUNCATED_MESSAGE = (
     "with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>"
 )
 MAX_RESPONSE_LEN = int(os.getenv("STR_REPLACE_MAX_RESPONSE_LEN", "16000"))
-MAX_WINDOW_EXPANSION_VIEW = int(os.getenv("MAX_WINDOW_EXPANSION_VIEW", "0"))
-MAX_WINDOW_EXPANSION_EDIT_CONFIRM = int(os.getenv("MAX_WINDOW_EXPANSION_EDIT_CONFIRM", "0"))
-USE_FILEMAP = os.getenv("USE_FILEMAP", "true").lower() == "true"
+MAX_WINDOW_EXPANSION_VIEW = int(os.getenv("STR_REPLACE_MAX_WINDOW_EXPANSION_VIEW", "0"))
+MAX_WINDOW_EXPANSION_EDIT_CONFIRM = int(os.getenv("STR_REPLACE_MAX_WINDOW_EXPANSION_EDIT_CONFIRM", "0"))
+USE_FILEMAP = os.getenv("STR_REPLACE_USE_FILEMAP", "true").lower() == "true"
 # Failed str_replace calls get a diagnosis (closest region + exact difference) instead of an
 # echo of old_str; "false" restores the legacy echo messages byte-for-byte.
-EXPLAIN_EDIT_FAILURES = os.getenv("EXPLAIN_EDIT_FAILURES", "true").lower() == "true"
+EXPLAIN_EDIT_FAILURES = os.getenv("STR_REPLACE_EXPLAIN_EDIT_FAILURES", "true").lower() == "true"
 # On a confident near-miss, additionally print the matching file region verbatim with an
 # imperative resend line: measured to raise retry self-fixes to 98% (indent) / 83%
 # (trailing) / 31% (window) against 19% with the diagnosis alone.
