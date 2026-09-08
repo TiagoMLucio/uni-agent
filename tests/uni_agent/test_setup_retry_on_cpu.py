@@ -9,6 +9,8 @@ import asyncio
 
 import pytest
 
+from uni_agent.agent_loop import setup_metrics
+
 
 class FlakyEnv:
     """Fails ``fail_times`` starts, then succeeds. Records lifecycle calls."""
@@ -73,3 +75,15 @@ def test_persistent_failure_still_raises_after_the_budget():
 def test_retry_covers_any_setup_exception_not_just_timeouts():
     ledger = []
     assert asyncio.run(_run_setup(ledger, fail_times=1, setup_retries=2, exc=ConnectionError)) == 2
+
+
+
+def test_the_attempts_are_counted_so_a_degrading_site_is_visible():
+    """A run where every rollout needed a second sandbox reads as a healthy one without these."""
+    assert setup_metrics(1) == {"agent/setup_attempts": 1.0, "agent/setup_retried": 0.0}
+    assert setup_metrics(2) == {"agent/setup_attempts": 2.0, "agent/setup_retried": 1.0}
+
+
+def test_the_counters_are_never_conditional():
+    """Both keys on every trajectory, so a pooled retry rate is the ratio of two step means."""
+    assert setup_metrics(1).keys() == setup_metrics(3).keys()

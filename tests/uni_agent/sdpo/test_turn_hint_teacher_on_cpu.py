@@ -393,6 +393,7 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
         "self_distillation/teacher_prefix_clips": 0,
         "rollout/condensed_trace_fraction": 1 / 4,
         "rollout/segments_per_trace": 5 / 4,
+        "rollout/harness_abort_fraction": 0.0,
         "rollout/solve_rate_1seg": 0.0,
         "rollout/trace_fraction_1seg": 3 / 4,
         "rollout/solve_rate_2seg": 1.0,

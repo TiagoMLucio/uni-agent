@@ -74,6 +74,16 @@ AGENT_CONFIG_KEYS = frozenset(
 SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn_spans")
 
 
+def setup_metrics(attempts: int) -> dict[str, float]:
+    """Per-trajectory setup counters, reported like the behaviour ones: never conditional, so a
+    pooled retry rate is the ratio of two step means. A run where every rollout needed a second
+    sandbox is otherwise indistinguishable from a healthy one."""
+    return {
+        f"{AGENT_METRIC_PREFIX}setup_attempts": float(attempts),
+        f"{AGENT_METRIC_PREFIX}setup_retried": float(attempts > 1),
+    }
+
+
 def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge ``overrides`` on top of ``base``, returning a new dict.
 
@@ -258,11 +268,12 @@ class UniAgentLoop(AgentLoopBase):
                                 self.interaction.env = self.env
                                 if self.reward_spec is not None:
                                     self.reward_spec.env = self.env
+                        setup_attempts = attempt + 1
                         if env_span is not None:
                             env_span.update(
-                                output={"status": "ready", "attempts": attempt + 1,
+                                output={"status": "ready", "attempts": setup_attempts,
                                         "tools_installed": len(self.tools_manager.tools)},
-                                metadata={"retried": attempt > 0},
+                                metadata={"retried": setup_attempts > 1},
                             )
 
                     setup_done = True
@@ -275,10 +286,12 @@ class UniAgentLoop(AgentLoopBase):
                     # execution_time; without them a trajectory's wall clock cannot be accounted for
                     interaction_result["metrics"]["env_setup"] = env_setup_s
                     interaction_result["metrics"]["loop_wall"] = interaction_result.get("execution_time", 0.0)
+                    behaviour = behaviour_metrics(interaction_result["trajectory"])
+                    applied_edits = behaviour["edit_calls_run"] - behaviour["edit_failures"]
                     interaction_result["metrics"].update({
-                        AGENT_METRIC_PREFIX + name: value
-                        for name, value in behaviour_metrics(interaction_result["trajectory"]).items()
+                        AGENT_METRIC_PREFIX + name: value for name, value in behaviour.items()
                     })
+                    interaction_result["metrics"].update(setup_metrics(setup_attempts))
                     if rollout_span is not None:
                         trajectory = interaction_result.get("trajectory") or []
                         rollout_span.update(
@@ -328,6 +341,11 @@ class UniAgentLoop(AgentLoopBase):
                         )
                         interaction_result["metrics"]["empty_patch"] = float(
                             bool(reward_result.get("empty_patch", False))
+                        )
+                        # edits landed and none of them reached the graded patch: scored as an
+                        # ordinary wrong answer, so it biases every number the run reports
+                        interaction_result["metrics"]["work_lost"] = float(
+                            interaction_result["metrics"]["empty_patch"] > 0 and applied_edits > 0
                         )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")

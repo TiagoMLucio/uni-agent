@@ -3,8 +3,15 @@ import shlex
 from pathlib import Path, PurePath
 from typing import Literal
 
+import aiohttp
 from pydantic import BaseModel, ConfigDict, Field
-from swerex.exceptions import BashIncorrectSyntaxError, CommandTimeoutError
+from swerex.exceptions import (
+    BashIncorrectSyntaxError,
+    CommandTimeoutError,
+    DeploymentNotStartedError,
+    SessionDoesNotExistError,
+    SessionNotInitializedError,
+)
 from swerex.runtime.abstract import (
     BashAction,
     BashInterruptAction,
@@ -20,7 +27,6 @@ from uni_agent.deployment import DeployConfig
 from uni_agent.skills.manager import SkillsManager
 from uni_agent.tools.base import AbstractTool
 from uni_agent.utils import auto_await
-
 
 # A program awaiting input never prints the shell's PS1, so interactive sends must also
 # expect the program's own prompt or they wait out the full timeout and return nothing.
@@ -60,6 +66,20 @@ class ActionIncorrectSyntaxError(Exception):
 
 class TerminalNotAliveError(Exception):
     pass
+
+
+# The sandbox is no longer there to run the command: its session or the deployment is gone, or
+# the transport gave up reaching it. Kept apart from a command that merely failed or timed out,
+# so losing an environment ends the rollout under its own reason instead of as a harness bug.
+# Order matters at every catch site: CommandTimeoutError is also a TimeoutError.
+SANDBOX_GONE_ERRORS = (
+    SessionNotInitializedError,
+    SessionDoesNotExistError,
+    DeploymentNotStartedError,
+    aiohttp.ClientError,
+    ConnectionError,
+    TimeoutError,
+)
 
 
 class EnvAction(BaseModel):
@@ -409,6 +429,11 @@ class AgentEnv:
             )
             raise ActionIncorrectSyntaxError(error_message) from None
 
+        except SANDBOX_GONE_ERRORS as e:
+            raise TerminalNotAliveError(
+                f"The sandbox stopped answering ({type(e).__name__}: {e}); the session is gone."
+            ) from None
+
         return self._format_observation(
             observation,
             max_observation_length,
@@ -515,6 +540,10 @@ class AgentEnv:
             # the program is still there and still reachable, so this is a yield like any
             # other: the caller decides whether to keep waiting or give up on it
             raise ActionTimeoutError(observation) from None
+        except SANDBOX_GONE_ERRORS as e:
+            raise TerminalNotAliveError(
+                f"The sandbox stopped answering ({type(e).__name__}: {e}); the session is gone."
+            ) from None
         matched = getattr(r, "expect_string", "")
         output = self._unshown(r.output)
         # The prompt left unread by the timed-out command is still buffered, so this

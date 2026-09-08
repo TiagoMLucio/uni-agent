@@ -241,6 +241,10 @@ class AgentInteraction:
             ``completed_with_tool_errors``, ``format_error``.
           - set by :meth:`run`: ``max_step_limit``, ``stuck``, ``unknown_error``.
 
+        ``terminal_dead`` is where a lost sandbox lands: the env layer raises
+        :class:`TerminalNotAliveError` for it, which leaves ``unknown_error`` as the residual
+        for what only a harness bug can produce.
+
         ``turn_done`` is gated on ``self.chat_mode`` (see ``__init__``).
         """
         # step index start from 1
@@ -684,7 +688,7 @@ class AgentInteraction:
                     self.trajectory.append(step_output)
                     break
             except Exception as e:
-                # this should not happen, if it happens, we should fix the code
+                # the residual: environment loss has its own reason, so what is left is a bug
                 _msg = (
                     f"[step{step_idx}] unknown_error: {type(e).__name__}: {e} "
                     f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
