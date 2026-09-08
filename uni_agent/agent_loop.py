@@ -76,12 +76,24 @@ AGENT_CONFIG_KEYS = frozenset(
 SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn_spans")
 
 
-def opening_messages(prompts: dict | None, raw_prompt, values: dict) -> list[dict[str, str]]:
+def opening_messages(prompts: dict | None, raw_prompt, extra_info: dict | None) -> list[dict[str, str]]:
     """What the rollout opens with: composed from the config's ``prompts`` block when there is
     one, else the row's baked ``raw_prompt``. Never a merge of the two, so a run can always say
     which prompt it ran on.
+
+    A configured block with no ``prompt_values`` on the row is a data and config pair that do not
+    agree, which has to raise: a template carrying no fields would otherwise compose the same
+    constant prompt for every task and nothing would notice.
     """
-    return list(raw_prompt) if prompts is None else compose_messages(prompts, values)
+    if prompts is None:
+        return list(raw_prompt)
+    extra_info = extra_info or {}
+    if "prompt_values" not in extra_info:
+        raise KeyError(
+            "the agent config carries a prompts block, so the row must carry "
+            f"extra_info.prompt_values; this row has {sorted(extra_info)}"
+        )
+    return compose_messages(prompts, extra_info["prompt_values"] or {})
 
 
 def compose_messages(prompts: dict, values: dict) -> list[dict[str, str]]:
@@ -216,10 +228,9 @@ class UniAgentLoop(AgentLoopBase):
         self.env = self._init_env(config_dict["env"])
         self.output_dir = Path(config_dict["log_dir"]) / self.run_id
         messages = opening_messages(
-            config_dict.get("prompts"),
-            kwargs.get("raw_prompt"),
-            (kwargs.get("extra_info") or {}).get("prompt_values") or {},
+            config_dict.get("prompts"), kwargs.get("raw_prompt"), kwargs.get("extra_info")
         )
+        self.opening_messages = messages
         self.interaction = AgentInteraction(
             run_id=self.run_id,
             env=self.env,
@@ -534,6 +545,7 @@ class UniAgentLoop(AgentLoopBase):
 
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
         extra_fields["traj_exit_reason"] = exit_reason
+        extra_fields["raw_prompt"] = self.opening_messages
         if getattr(self, "emit_feedback", False):
             extra_fields["reward_extra_info"] = {"feedback": None}
         extra_fields["turn_spans"] = []
@@ -788,6 +800,9 @@ class UniAgentLoop(AgentLoopBase):
 
         shared_extra: dict[str, Any] = {
             "traj_exit_reason": traj_exit_reason,
+            # what the rollout actually opened with, which is not the dataset column once the
+            # config composes it; every offline reconstruction reads this
+            "raw_prompt": self.opening_messages,
             # AgentLoopMetrics is a fixed schema the sync trainer never surfaces, so the
             # per-trajectory timings ride along here instead
             "timings": {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},

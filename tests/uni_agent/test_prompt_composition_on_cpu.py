@@ -87,20 +87,36 @@ def test_composition_matches_the_real_prompt_files():
 BAKED = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": TASK.format(**VALUES)}]
 
 
+EXTRA_INFO = {"index": 3, "prompt_values": VALUES}
+
+
 def test_without_a_prompts_block_the_row_is_used_exactly_as_before():
-    assert opening_messages(None, BAKED, VALUES) == BAKED
+    assert opening_messages(None, BAKED, EXTRA_INFO) == BAKED
 
 
 def test_the_fallback_copies_the_row_rather_than_aliasing_it():
     """The loop hands these to AgentInteraction, which appends to them for the whole rollout."""
-    out = opening_messages(None, BAKED, VALUES)
-    assert out is not BAKED
+    assert opening_messages(None, BAKED, EXTRA_INFO) is not BAKED
+
+
+def test_the_fallback_does_not_need_prompt_values_at_all():
+    """An existing parquet has no prompt_values and must keep working untouched."""
+    assert opening_messages(None, BAKED, {"index": 3}) == BAKED
 
 
 def test_a_prompts_block_composes_and_the_row_is_not_consulted():
     """Mutually exclusive: the baked messages here are wrong on purpose."""
     stale = [{"role": "system", "content": "an older system prompt"}]
-    assert opening_messages({"system": SYSTEM, "task": TASK}, stale, VALUES) == BAKED
+    assert opening_messages({"system": SYSTEM, "task": TASK}, stale, EXTRA_INFO) == BAKED
+
+
+def test_a_row_without_prompt_values_under_a_prompts_block_is_loud():
+    """The config and the data disagree. It cannot fall back to raw_prompt, which would run the
+    old prompt in silence, and a field-less template would otherwise compose a constant."""
+    with pytest.raises(KeyError) as excinfo:
+        opening_messages({"system": SYSTEM, "task": "no fields here"}, BAKED, {"index": 3})
+    assert "prompt_values" in str(excinfo.value)
+    assert "index" in str(excinfo.value), "and what the row did carry"
 
 
 class _Skills:
