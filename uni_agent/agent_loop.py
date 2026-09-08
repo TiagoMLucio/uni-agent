@@ -339,14 +339,16 @@ class UniAgentLoop(AgentLoopBase):
                         interaction_result["metrics"]["patch_apply_failed"] = float(
                             bool(reward_result.get("patch_apply_failed", False))
                         )
-                        interaction_result["metrics"]["empty_patch"] = float(
-                            bool(reward_result.get("empty_patch", False))
-                        )
-                        # edits landed and none of them reached the graded patch: scored as an
-                        # ordinary wrong answer, so it biases every number the run reports
-                        interaction_result["metrics"]["work_lost"] = float(
-                            interaction_result["metrics"]["empty_patch"] > 0 and applied_edits > 0
-                        )
+                        # absent when the prediction was never extracted: defaulting it to False
+                        # would report a lost patch as an agent that changed nothing
+                        if "empty_patch" in reward_result:
+                            empty_patch = float(bool(reward_result["empty_patch"]))
+                            interaction_result["metrics"]["empty_patch"] = empty_patch
+                            # edits landed and none of them reached the graded patch: scored as an
+                            # ordinary wrong answer, so it biases every number the run reports
+                            interaction_result["metrics"]["work_lost"] = float(
+                                empty_patch > 0 and applied_edits > 0
+                            )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
                     if isinstance(reward_result, dict):

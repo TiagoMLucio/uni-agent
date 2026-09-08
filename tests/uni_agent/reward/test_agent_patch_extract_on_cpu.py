@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
 
+from uni_agent.reward.base import PATCH_EXTRACT_OK
 from uni_agent.reward.swe_bench import SWEBenchRewardSpec
 
 
@@ -21,7 +22,7 @@ class Env:
         self.isolated_calls += 1
         if self.isolated_calls > 1:
             raise RuntimeError("container exited")
-        return ""
+        return PATCH_EXTRACT_OK
 
     async def read_file(self, path):
         return "diff --git a/x.py b/x.py\n+fix\n"

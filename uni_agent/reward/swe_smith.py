@@ -38,7 +38,12 @@ from swesmith.profiles import registry
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
-from uni_agent.reward.base import AbstractRewardSpec
+from uni_agent.reward.base import (
+    PATCH_EXTRACT_OK,
+    AbstractRewardSpec,
+    empty_patch_flag,
+    patch_extract_command,
+)
 from uni_agent.reward.registry import register_reward_spec
 from uni_agent.reward.swe_bench import FeedbackConfig, _feedback_seed, clip_eval_report
 from uni_agent.tracing import (
@@ -169,14 +174,15 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             try:
                 patch = await self._get_interaction_env_patch()
             except Exception as e:
-                patch = ""
+                # None, not "": an extraction that failed is not the agent changing nothing
+                patch = None
                 result["eval_error"] = f"patch harvest failed: {type(e).__name__}: {e}"
             if patch_span is not None:
                 patch_span.update(
                     output=trace_clip(patch, TRACE_PATCH_CHARS),
                     metadata={"chars": len(patch or "")},
                 )
-        eval_script_list = _make_eval_script_list(instance_id, patch, test_command, test_files)
+        eval_script_list = _make_eval_script_list(instance_id, patch or "", test_command, test_files)
         # -x would echo every conda-activation line into the captured output and eat the
         # feedback budget before pytest has said anything
         eval_script = "\n".join(["#!/bin/bash", "set -uo pipefail"] + eval_script_list) + "\n"
@@ -241,8 +247,9 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                 except Exception as e:
                     self.logger.error(f"Failed to close sibling eval env: {e}")
 
-        # distinct from patch_apply_failed: the agent produced no diff at all
-        result["empty_patch"] = not (patch or "").strip()
+        # distinct from patch_apply_failed: the agent produced no diff at all. A failed
+        # extraction reports itself under eval_error instead.
+        result.update(empty_patch_flag(patch))
 
         extra_info: dict = {}
         if self.feedback.enabled:
@@ -308,18 +315,13 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         """
         try:
             env_patch_file = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
-            attrs = "/tmp/.uniagent_gitattributes"
             # side session: the agent's own session may still be running whatever it
             # left attached, which would swallow this command until the timeout
-            # binaries the agent left behind are unstaged: a text diff cannot carry them and
-            # the stub git writes instead makes the whole patch unapplicable
-            await self.env.communicate_isolated(
-                f"cd /testbed && printf '*.py diff=python\\n' > {attrs} && git add -A && "
-                "(git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
-                "| xargs -r -d '\\n' git reset -q --) ; "
-                f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
-                f"> {env_patch_file.as_posix()}",
+            output = await self.env.communicate_isolated(
+                patch_extract_command(env_patch_file.as_posix(), diff_args)
             )
+            if PATCH_EXTRACT_OK not in output:
+                raise RuntimeError(f"the extraction never reached the diff: {output.strip()[-500:]}")
             return await self.env.read_file(env_patch_file)
         except Exception as e:
             self.logger.error(f"Failed to get interaction environment patch: {e}")

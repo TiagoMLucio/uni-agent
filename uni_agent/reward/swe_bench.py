@@ -22,7 +22,12 @@ from swebench.harness.utils import get_modified_files
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
-from uni_agent.reward.base import AbstractRewardSpec
+from uni_agent.reward.base import (
+    PATCH_EXTRACT_OK,
+    AbstractRewardSpec,
+    empty_patch_flag,
+    patch_extract_command,
+)
 from uni_agent.reward.registry import register_reward_spec
 from uni_agent.tracing import (
     TRACE_FEEDBACK_CHARS,
@@ -624,7 +629,8 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                 try:
                     patch = await self._get_interaction_env_patch()
                 except Exception as e:
-                    patch = ""
+                    # None, not "": an extraction that failed is not the agent changing nothing
+                    patch = None
                     result["eval_error"] = f"patch harvest failed: {type(e).__name__}: {e}"
                 if patch_span is not None:
                     patch_span.update(
@@ -696,6 +702,10 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
                 except Exception as e:
                     self.logger.error(f"Failed to close sibling eval env: {e}")
 
+        # distinct from patch_apply_failed: the agent produced no diff at all. Absent when the
+        # patch was never extracted, which this path does only when isolating or rendering feedback.
+        result.update(empty_patch_flag(patch))
+
         extra_info: dict = {}
         if self.feedback.enabled:
             instance_id = self.metadata.get("instance_id", "")
@@ -759,18 +769,13 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         """
         try:
             env_patch_file = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
-            attrs = "/tmp/.uniagent_gitattributes"
             # side session: the agent's own session may still be running whatever it
             # left attached, which would swallow this command until the timeout
-            # a text diff cannot carry a binary (git emits only "Binary files differ", which no
-            # apply command accepts), so binaries the agent left behind are unstaged first
-            await self.env.communicate_isolated(
-                f"cd /testbed && printf '*.py diff=python\\n' > {attrs} && git add -A && "
-                "(git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
-                "| xargs -r -d '\\n' git reset -q --) ; "
-                f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
-                f"> {env_patch_file.as_posix()}",
+            output = await self.env.communicate_isolated(
+                patch_extract_command(env_patch_file.as_posix(), diff_args)
             )
+            if PATCH_EXTRACT_OK not in output:
+                raise RuntimeError(f"the extraction never reached the diff: {output.strip()[-500:]}")
             patch_content = await self.env.read_file(env_patch_file)
             return patch_content
         except Exception as e:
