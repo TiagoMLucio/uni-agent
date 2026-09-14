@@ -51,6 +51,31 @@ INTERACTIVE_PROMPTS = [
 # program, which is what lets the second one run at ANY prompt.
 BUFFERED_READ_TIMEOUT = 0.5
 
+#: Where a multi-line command is parked before it is sourced; one file per session.
+MULTILINE_COMMAND_PATH = "/tmp/.uni_agent_cmd.sh"
+
+
+def as_single_line(command: str, path: str = MULTILINE_COMMAND_PATH) -> tuple[str, str] | None:
+    """The file contents and the one-line command to run in place of a multi-line one.
+
+    A heredoc is the only thing bashlex leaves multi-line (everything else it joins with
+    ``;``), so those lines reach the shell's pty one by one and bash prints one prompt
+    more than the runtime consumes. The agent's commands run with ``check="ignore"``,
+    which returns right after the first prompt, so the extra one stays buffered and every
+    later observation is the previous command's output, for the rest of the session. This
+    was 7.2% of all `view` calls and 27% of trajectories in the reference run; every one
+    of the 72 desynced observations followed that trajectory's first heredoc.
+
+    Sourcing keeps ``cd`` and ``export`` in the session, as sending the lines did, and
+    ``bash -n`` first keeps the syntax check the runtime would otherwise have done on the
+    text itself. Returns ``None`` for a command that needs no rewriting.
+    """
+    if "\n" not in command:
+        return None
+    content = command if command.endswith("\n") else command + "\n"
+    return content, f"bash -n {path} && source {path}"
+
+
 # Every path that frees the session says so: without it the model is left thinking it
 # still holds one, and spends its next turn on an is_input that can only be refused.
 FREED_NOTE = "\n<NOTE>The program is no longer running: the session is free, so run a new command.</NOTE>"
@@ -664,10 +689,15 @@ class AgentEnv:
             output: output from container
         """
         self.logger.debug(f"Input:\n{input}")
+        sent = input
+        rewritten = as_single_line(input)
+        if rewritten is not None:
+            content, sent = rewritten
+            await self.write_file(MULTILINE_COMMAND_PATH, content)
         # `check` is a Literal string, so a truthiness test always picked "silent" and
         # paid swe-rex's extra exit-code round trip on every command
         rex_check = "ignore" if check == "ignore" else "silent"
-        r = await self.deployment.runtime.run_in_session(BashAction(command=input, timeout=timeout, check=rex_check))
+        r = await self.deployment.runtime.run_in_session(BashAction(command=sent, timeout=timeout, check=rex_check))
         output = r.output
         self.logger.debug(f"Output:\n{output}")
         if check != "ignore" and r.exit_code != 0:
