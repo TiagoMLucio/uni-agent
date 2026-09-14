@@ -57,9 +57,48 @@ from uni_agent.utils import auto_await
 
 #: HEREDOC delimiter unlikely to appear in a diff (matches swe_bench's convention).
 _HEREDOC_DELIMITER = "EOF_114329324912"
+PYTEST_PLUGINS_OFF = "-p no:sugar -p no:randomly"
 
 
-def _make_eval_script_list(instance_id, patch, test_command, test_files):
+_SAFE_PATH_RE = re.compile(r"^[\w./-]+$")
+
+
+def _prediction_adds_files(patch: str) -> list[str]:
+    """Paths the prediction *creates*, as opposed to edits."""
+    added = []
+    for block in patch.split("diff --git ")[1:]:
+        head, _, body = block.partition("\n")
+        if not re.match(r"^\S+ b/(.+)$", head) or "\nnew file mode " not in "\n" + body:
+            continue
+        added.append(re.match(r"^\S+ b/(.+)$", head).group(1))
+    return added
+
+
+def _files_to_drop(patch: str, gold_bug_patch: str, graded_files: list[str]) -> list[str]:
+    """Files created by the prediction that the eval must delete before running tests.
+
+    pytest *imports* a file to collect it, so a scratch ``test_*.py`` the agent left behind
+    runs its module-level code during collection; one failed assertion there aborts the
+    session and no graded test runs at all. The harness already discards the agent's edits
+    to existing test files; this is the same rule for the files it adds.
+
+    The gate: SWE-smith's gold fix is the bug patch reversed, so a gold that creates a file
+    shows up as ``deleted file mode`` in the bug patch. When the reference needs no new file,
+    no correct fix needs one either and dropping additions is safe. When it does (the ``pr_*``
+    mirrors), drop nothing and leave the run exactly as it was.
+
+    A graded test file is never dropped. The agent works with those files deleted, so writing
+    one back reads as an addition here, and the eval has just restored the repo's own copy.
+    """
+    if not patch or "deleted file mode " in (gold_bug_patch or ""):
+        return []
+    graded = set(graded_files or ())
+    return [
+        f for f in _prediction_adds_files(patch) if _SAFE_PATH_RE.match(f) and f not in graded
+    ]
+
+
+def _make_eval_script_list(instance_id, patch, test_command, test_files, drop_files=()):
     """Build the SWE-smith eval script (run in a clean checkout of the instance image).
 
     Replicates ``swesmith.harness.utils.run_patch_in_container`` as a single bash
@@ -85,6 +124,7 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
         apply_lines.append(f"if [ \"$_applied\" -eq 0 ]; then echo '{APPLY_PATCH_FAIL}'; fi")
 
     revert_tests = f"git checkout -- {' '.join(test_files)}" if test_files else "echo 'no test files to reset'"
+    drop_added = [f"rm -f -- {' '.join(drop_files)}"] if drop_files else []
 
     return [
         f"cd {repo_directory}",
@@ -96,8 +136,14 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files):
         # Stage the agent's prediction and apply it.
         f"cat <<'{_HEREDOC_DELIMITER}' > /tmp/swesmith_pred.diff\n{patch}\n{_HEREDOC_DELIMITER}",
         *apply_lines,
-        # Tests are graded from the repo's own copy — discard any agent edits to them.
+        # Tests are graded from the repo's own copy — discard any agent edits to them,
+        # and the files it added, which pytest would otherwise import during collection.
         revert_tests,
+        *drop_added,
+        # pytest-sugar rewrites the result lines the log parser reads (the clean alive-progress
+        # tree graded 0/218 with 168 "regressions") and pytest-randomly reorders tests. Both
+        # auto-load when present; an env var reaches pytest however the profile invokes it.
+        f'export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} {PYTEST_PLUGINS_OFF}"',
         f"echo '{TEST_OUTPUT_START}'",
         test_command,
         f"echo '{TEST_OUTPUT_END}'",
@@ -182,7 +228,11 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     output=trace_clip(patch, TRACE_PATCH_CHARS),
                     metadata={"chars": len(patch or "")},
                 )
-        eval_script_list = _make_eval_script_list(instance_id, patch or "", test_command, test_files)
+        drop_files = _files_to_drop(patch or "", instance.get("patch") or "", test_files)
+        result["dropped_agent_files"] = drop_files
+        eval_script_list = _make_eval_script_list(
+            instance_id, patch or "", test_command, test_files, drop_files=drop_files
+        )
         # -x would echo every conda-activation line into the captured output and eat the
         # feedback budget before pytest has said anything
         eval_script = "\n".join(["#!/bin/bash", "set -uo pipefail"] + eval_script_list) + "\n"
