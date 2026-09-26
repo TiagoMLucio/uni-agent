@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -43,6 +44,27 @@ def _shell_join(parts: list[str]) -> str:
 def _sanitize_name(value: str) -> str:
     sanitized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip("-").lower()
     return sanitized or "uni-agent-local"
+
+
+def _process_tree(root: int) -> list[int]:
+    """Every descendant of ``root``, read from /proc before any of them is signalled."""
+    children: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                # the command name is parenthesised and may contain spaces; ppid is the 2nd field after it
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    tree, stack = [], [root]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            tree.append(child)
+            stack.append(child)
+    return tree
 
 
 def _is_running_in_container() -> bool:
@@ -384,12 +406,14 @@ class LocalDeployment(AbstractDeployment):
 
         if self._server_process:
             try:
-                if self._server_process.poll() is None:
-                    self._server_process.terminate()
-                    await asyncio.to_thread(self._server_process.wait, 10)
-            except subprocess.TimeoutExpired:
-                self._server_process.kill()
-                await asyncio.to_thread(self._server_process.wait)
+                # without a pid namespace the sandbox's processes outlive the apptainer client it
+                # was started with (and keep its mounts), so the whole tree goes
+                for pid in [*_process_tree(self._server_process.pid), self._server_process.pid]:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                await asyncio.to_thread(self._server_process.wait, 10)
             except Exception as exc:
                 self.logger.error(f"Failed to stop local Apptainer process: {exc}")
             finally:
