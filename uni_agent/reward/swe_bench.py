@@ -151,6 +151,8 @@ DEFAULT_FEEDBACK_JOIN_TEMPLATE = "{parts}"
 DEFAULT_FEEDBACK_SEPARATOR = "\n\n"  # between parts
 DEFAULT_FEEDBACK_ITEM_SEPARATOR = "\n"  # between list items
 
+_APPLY_OK = "__uniagent_patch_applied__"
+
 
 #: pytest aborts the whole session when a module fails to import at collection time, so no
 #: test runs at all. Every listed test is then absent from the status map and grades as a
@@ -776,7 +778,8 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             )
             if PATCH_EXTRACT_OK not in output:
                 raise RuntimeError(f"the extraction never reached the diff: {output.strip()[-500:]}")
-            patch_content = await self.env.read_file(env_patch_file)
+            # a non-UTF-8 text file the agent left behind must not make the whole prediction unreadable
+            patch_content = await self.env.read_file(env_patch_file, errors="backslashreplace")
             return patch_content
         except Exception as e:
             self.logger.error(f"Failed to get patch: {e}")
@@ -792,23 +795,30 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             return
         patch_path = Path(f"/tmp/patch_{uuid.uuid4()}.diff")
         await env.write_file(patch_path, patch)
-        # the official harness's ladder (swebench.harness.run_evaluation.GIT_APPLY_CMDS); no
-        # --whitespace=fix, which would rewrite the agent's lines before grading them
+        # the official harness's apply step (swebench.harness.run_evaluation: GIT_APPLY_CMDS, the
+        # pristine-tree reset between attempts, the reverse check); no --whitespace=fix, which
+        # would rewrite the agent's lines before grading them
         commands = [
-            f"cd /testbed && git apply --verbose {patch_path.as_posix()}",
-            f"cd /testbed && git apply --verbose --reject {patch_path.as_posix()}",
-            f"cd /testbed && patch --batch --fuzz=5 -p1 -i {patch_path.as_posix()}",
+            f"git apply --verbose {patch_path.as_posix()}",
+            f"git apply --verbose --3way {patch_path.as_posix()}",
+            f"git apply --verbose --reject {patch_path.as_posix()}",
+            f"patch --batch --forward --fuzz=5 -p1 -i {patch_path.as_posix()}",
         ]
-        last_error: Exception | None = None
-        for cmd in commands:
-            try:
-                await env.communicate(cmd, check="raise")
+        # check="raise" closes the env on a non-zero exit, so a failed attempt would leave every
+        # later one running against a dead sandbox; success is read from a sentinel instead
+        output = ""
+        for attempt, cmd in enumerate(commands):
+            if attempt:
+                await env.communicate("cd /testbed && git checkout -- . ; git clean -fd", check="ignore")
+            output = await env.communicate(f"cd /testbed && {cmd} && echo {_APPLY_OK}", check="ignore")
+            if _APPLY_OK in output:
                 self.logger.info("Applied patch successfully!")
                 return
-            except RuntimeError as e:
-                last_error = e
-                continue
-        raise RuntimeError("Failed to apply patch with any command") from last_error
+        reverse = f"cd /testbed && git apply --check --reverse {patch_path.as_posix()} && echo {_APPLY_OK}"
+        if _APPLY_OK in await env.communicate(reverse, check="ignore"):
+            self.logger.info("Applied patch successfully! (verified already applied)")
+            return
+        raise RuntimeError(f"Failed to apply patch with any command: {output.strip()[-500:]}")
 
     def _get_logs_eval(self, eval_output: str):
         instance = self.metadata
