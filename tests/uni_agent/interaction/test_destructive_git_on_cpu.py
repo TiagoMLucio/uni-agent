@@ -130,18 +130,56 @@ def test_a_refused_call_never_reaches_the_session():
     assert env_calls == []
 
 
-def _step(status: str, action: str, idx: int = 1):
+EDIT_WITH_A_GIT_COMMENT = (
+    "str_replace_editor str_replace /testbed/a.py --old_str 'a = 1' "
+    "--new_str 'a = 1\n# callers must not git checkout here\nb = 2'"
+)
+
+
+def test_an_editor_call_is_file_content_not_a_shell_command():
+    """The guard splits on newlines and shlex keeps `#`, so a comment line read as `git checkout`."""
+    assert destructive_git_subcommand(EDIT_WITH_A_GIT_COMMENT) == "checkout"
+    env_calls = []
+    it = _interaction()
+    it.env.run_action = lambda *a, **k: env_calls.append(a)
+    it.tools_manager = types.SimpleNamespace(
+        get_tool_action=lambda _tc: types.SimpleNamespace(
+            command=EDIT_WITH_A_GIT_COMMENT, is_input=False, timeout=None),
+        format_args_example=lambda args: str(args),
+    )
+    tc = types.SimpleNamespace(id="c1", function=types.SimpleNamespace(name="str_replace_editor"))
+    try:
+        asyncio.run(AgentInteraction._execute_tool_call(it, tc))
+    except Exception:
+        pass  # the stub env returns nothing; reaching it is the point
+    assert env_calls, "the edit was refused"
+    edit = _step("ok", EDIT_WITH_A_GIT_COMMENT, name="str_replace_editor")
+    assert behaviour_metrics([edit])["git_refusals"] == 0.0
+
+
+def _step(status: str, action: str, idx: int = 1, name: str = "execute_bash"):
     return types.SimpleNamespace(
         step_idx=idx, exit_reason="completed_with_tool_errors",
-        tool_results=[ToolResult(tool_call_id="c", name="execute_bash", action=action,
+        tool_results=[ToolResult(tool_call_id="c", name=name, action=action,
                                  observation="refused", status=status, execution_time=0.0)],
     )
 
 
+def _refused_step(command: str, idx: int = 1):
+    return types.SimpleNamespace(step_idx=idx, exit_reason="completed_with_tool_errors", tool_results=[_call(command)])
+
+
 def test_the_refusals_are_counted_per_trajectory():
-    metrics = behaviour_metrics([_step("syntax_error", "git stash"), _step("ok", "git diff", idx=2)])
+    metrics = behaviour_metrics([_refused_step("git stash"), _step("ok", "git diff", idx=2)])
     assert metrics["git_refusals"] == 1.0
     assert metrics["tool_calls"] == 2.0
+
+
+def test_a_call_the_guard_let_through_is_not_a_refusal():
+    """is_input keystrokes go to whatever is attached, unguarded; naming git does not make them refused."""
+    let_through = _step("ok", "git checkout .")
+    failed_otherwise = _step("syntax_error", "git checkout .")
+    assert behaviour_metrics([let_through, failed_otherwise])["git_refusals"] == 0.0
 
 
 def test_the_counter_is_reported_even_when_nothing_fired():
@@ -151,7 +189,8 @@ def test_the_counter_is_reported_even_when_nothing_fired():
 
 def test_the_refusals_do_not_enter_the_edit_accounting():
     """`edit_calls_run` is the editor-call denominator; a refused git call must not touch it."""
-    metrics = behaviour_metrics([_step("syntax_error", "git checkout .")])
+    metrics = behaviour_metrics([_refused_step("git checkout .")])
+    assert metrics["git_refusals"] == 1.0
     assert (metrics["edit_attempts"], metrics["edit_calls_run"], metrics["edit_failures"]) == (0.0, 0.0, 0.0)
 
 

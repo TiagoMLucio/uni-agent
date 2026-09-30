@@ -9,7 +9,7 @@ import re
 from typing import TYPE_CHECKING, get_args
 
 from uni_agent.interaction.interaction import ToolStatus
-from uni_agent.interaction.tools_manager import destructive_git_subcommand
+from uni_agent.interaction.tools_manager import GIT_REFUSAL_PREFIX
 
 if TYPE_CHECKING:
     from uni_agent.interaction.interaction import StepOutput
@@ -86,7 +86,8 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
         for call in step.tool_results:
             out["tool_calls"] += 1
             out[f"tool_{call.status}"] += 1
-            if destructive_git_subcommand(call.action):
+            # what the guard refused, not what merely names git (is_input keystrokes, editor file text)
+            if call.status == "syntax_error" and call.observation.startswith(GIT_REFUSAL_PREFIX):
                 out["git_refusals"] += 1
             if edit_command(call.action) not in EDIT_CMDS:
                 continue

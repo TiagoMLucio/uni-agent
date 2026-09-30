@@ -29,6 +29,9 @@ _GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--names
 #: what it stashed without giving it a way to lose anything.
 READ_ONLY_GIT_FORMS = {"stash": frozenset({"list", "show"})}
 
+#: How a refused call's observation opens; the per-trajectory refusal count reads it back.
+GIT_REFUSAL_PREFIX = "Your command was NOT executed: `git "
+
 
 def destructive_git_subcommand(command: str) -> str | None:
     """The first working-tree-destroying git subcommand in ``command``, or ``None``.

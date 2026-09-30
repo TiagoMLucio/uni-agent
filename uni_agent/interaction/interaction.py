@@ -25,7 +25,7 @@ from .env import (
 from .model import AgentChatModel, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
 from .tool_schemas import OpenAIFunctionToolCall
-from .tools_manager import ToolsManager, destructive_git_subcommand
+from .tools_manager import GIT_REFUSAL_PREFIX, ToolsManager, destructive_git_subcommand
 
 # "yielded": the command hit its timeout but is still running and still reachable, so it
 # is normal operation, not a failure. Only "timeout" (the kill) spends the budget.
@@ -491,10 +491,12 @@ class AgentInteraction:
         """Run one tool call in the env; errors become the observation (status marks the kind)."""
         action = self.tools_manager.get_tool_action(tool_call)
         self.logger.info(f"🎬 ACTION ({tool_call.function.name}):\n{action.command}")
-        refused = None if action.is_input else destructive_git_subcommand(action.command)
+        # only a shell command runs git; an editor call's text is file content, comments included
+        shell = tool_call.function.name == "execute_bash" and not action.is_input
+        refused = destructive_git_subcommand(action.command) if shell else None
         if refused:
             observation = (
-                f"Your command was NOT executed: `git {refused}` is not available here. Everything "
+                f"{GIT_REFUSAL_PREFIX}{refused}` is not available here. Everything "
                 "you change is collected from the working tree, so a command that commits it or "
                 "throws it away loses the fix along with it. To put one file back the way it was, "
                 "run `git show HEAD:path/to/file.py > path/to/file.py` from the repository root. "
