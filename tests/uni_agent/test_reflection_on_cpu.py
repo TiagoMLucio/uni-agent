@@ -425,8 +425,9 @@ def _traj_step(idx, tools=(), exit_reason="turn_done"):
     )
 
 
-def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.0, resolved=False):
-    """The real ``UniAgentLoop._maybe_reflect`` over a fake loop; errors fail the test."""
+def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.0, resolved=False, logger=None):
+    """The real ``UniAgentLoop._maybe_reflect`` over a fake loop; errors fail the test unless a
+    ``logger`` takes them."""
     from uni_agent.agent_loop import UniAgentLoop
 
     model = _Model()
@@ -442,7 +443,7 @@ def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.
         run_id="run",
         output_dir=tmp_path,
         identity={},
-        logger=types.SimpleNamespace(critical=_raise),
+        logger=logger or types.SimpleNamespace(critical=_raise),
     )
     result = {
         "reward_score": reward_score,
@@ -518,6 +519,27 @@ def test_the_call_metrics_reach_the_interaction_result(tmp_path):
     _, _, skipped = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]},
                                    [_traj_step(0, exit_reason="stuck")])
     assert skipped["metrics"] == {}
+
+
+def test_a_reflection_that_raises_keeps_its_call_counts(tmp_path, monkeypatch):
+    """The calls a failed reflection made are exactly the cost worth seeing, next to the failure."""
+    from uni_agent import agent_loop as agent_loop_mod
+
+    class _Dying:
+        def call_metrics(self):
+            return {"reflect_calls": 2.0, "reflect_redraws": 1.0, "reflect_over_budget": 0.0, "reflect_rung": 0.0}
+
+        async def reflect_trajectory(self, **_):
+            raise RuntimeError("the reflector died mid-stage")
+
+    monkeypatch.setattr(agent_loop_mod, "load_reflector", lambda *a, **k: _Dying())
+    logged = []
+    hints, _, result = _maybe_reflect(
+        tmp_path, {"enabled": True}, [_traj_step(0)], logger=types.SimpleNamespace(critical=logged.append)
+    )
+    assert hints == {} and logged
+    assert result["metrics"] == {"reflect_failed": 1.0, "agent/reflect_calls": 2.0, "agent/reflect_redraws": 1.0,
+                                 "agent/reflect_over_budget": 0.0, "agent/reflect_rung": 0.0}
 
 
 def test_the_cap_sentinel_does_not_shadow_the_last_real_turn(tmp_path):
