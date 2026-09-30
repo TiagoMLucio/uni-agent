@@ -32,14 +32,13 @@ def hint_position_metrics(hinted_per_row: list[list[HintedTurn]], extra_fields: 
     traj_steps = defaultdict(list)
     for traj, ef in zip(traj_of_row, extra_fields, strict=True):
         traj_steps[traj].extend(int(span[0]) for span in ef.get("turn_spans") or [])
-    rel, gaps, last_two = [], [], 0
+    rel, last_two = [], 0
     for hinted, traj in zip(hinted_per_row, traj_of_row, strict=True):
         steps = sorted(traj_steps.get(traj) or [0])
         lo, hi = steps[0], steps[-1]
         span_len = max(hi - lo, 1)
         hinted_steps = sorted(hint.step for hint in hinted)
         rel.extend((step - lo) / span_len for step in hinted_steps)
-        gaps.extend(b - a for a, b in zip(hinted_steps, hinted_steps[1:], strict=False))
         last_two += sum(1 for step in hinted_steps if step >= hi - 1)
     if not rel:
         return {}
@@ -49,8 +48,4 @@ def hint_position_metrics(hinted_per_row: list[list[HintedTurn]], extra_fields: 
         "self_distillation/hint_position_median": srt[len(srt) // 2],
         "self_distillation/hint_position_first_half": sum(1 for r in rel if r <= 0.5) / len(rel),
         "self_distillation/hint_in_last_two_turns": last_two / len(rel),
-        "self_distillation/hint_gap_mean": (sum(gaps) / len(gaps)) if gaps else 0.0,
-        "self_distillation/hint_adjacent_fraction": (
-            (sum(1 for g in gaps if g <= 2) / len(gaps)) if gaps else 0.0
-        ),
     }
