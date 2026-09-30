@@ -512,8 +512,9 @@ def test_the_call_metrics_reach_the_interaction_result(tmp_path):
     hints, _, result = _maybe_reflect(tmp_path, {"enabled": True}, [_traj_step(0)])
     assert hints
     assert result["metrics"] == {"agent/reflect_calls": 1.0, "agent/reflect_redraws": 0.0,
-                                 "agent/reflect_over_budget": 0.0, "agent/reflect_rung": 0.0}
-    # a trajectory the reflector never saw reports none of them, as reflect_empty does not
+                                 "agent/reflect_over_budget": 0.0, "agent/reflect_rung": 0.0,
+                                 "reflect_failed": 0.0, "reflect_empty": 0.0}
+    # a trajectory the reflector never saw reports none of them, nor reflect_empty/reflect_failed
     _, _, skipped = _maybe_reflect(tmp_path, {"enabled": True, "skip_exit_reasons": ["stuck"]},
                                    [_traj_step(0, exit_reason="stuck")])
     assert skipped["metrics"] == {}

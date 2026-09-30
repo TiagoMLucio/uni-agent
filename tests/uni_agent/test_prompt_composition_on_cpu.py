@@ -162,17 +162,17 @@ def test_without_a_system_message_the_manifest_still_makes_exactly_one():
 def test_the_reward_flags_are_absent_when_the_reward_did_not_report_them():
     """The regression for the agent-loop half of the extraction fix: defaulting empty_patch to
     False reads a prediction that was never extracted as an agent that changed nothing."""
-    out = reward_metrics({"eval_completed": True}, applied_edits=5.0)
-    assert "empty_patch" not in out and "work_lost" not in out
+    out = reward_metrics({"eval_completed": True}, source_edited=1.0)
+    assert "empty_patch" not in out and "empty_patch_after_source_edit" not in out
     assert out["eval_completed"] == 1.0 and out["patch_apply_failed"] == 0.0
 
 
-def test_work_lost_is_an_empty_patch_that_had_edits():
-    assert reward_metrics({"empty_patch": True}, applied_edits=5.0)["work_lost"] == 1.0
-    assert reward_metrics({"empty_patch": True}, applied_edits=0.0)["work_lost"] == 0.0
-    assert reward_metrics({"empty_patch": False}, applied_edits=5.0)["work_lost"] == 0.0
+def test_empty_patch_after_source_edit_needs_a_source_edit():
+    assert reward_metrics({"empty_patch": True}, source_edited=1.0)["empty_patch_after_source_edit"] == 1.0
+    assert reward_metrics({"empty_patch": True}, source_edited=0.0)["empty_patch_after_source_edit"] == 0.0
+    assert reward_metrics({"empty_patch": False}, source_edited=1.0)["empty_patch_after_source_edit"] == 0.0
 
 
 def test_an_empty_patch_that_was_measured_is_reported_even_at_zero():
-    out = reward_metrics({"empty_patch": False}, applied_edits=0.0)
-    assert out["empty_patch"] == 0.0 and out["work_lost"] == 0.0
+    out = reward_metrics({"empty_patch": False}, source_edited=0.0)
+    assert out["empty_patch"] == 0.0 and out["empty_patch_after_source_edit"] == 0.0

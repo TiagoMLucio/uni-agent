@@ -87,3 +87,28 @@ def test_the_attempts_are_counted_so_a_degrading_site_is_visible():
 def test_the_counters_are_never_conditional():
     """Both keys on every trajectory, so a pooled retry rate is the ratio of two step means."""
     assert setup_metrics(1).keys() == setup_metrics(3).keys()
+
+
+def test_a_sandbox_that_never_came_up_still_reports_its_attempts():
+    """The dummy row of a failed setup carries the counters, or the retry rate only sees survivors."""
+    import types
+
+    from uni_agent.agent_loop import UniAgentLoop
+
+    async def _cache(_messages):
+        return {"prompt_ids": [1, 2, 3]}
+
+    rollout = types.SimpleNamespace(prompt_length=8, response_length=8)
+    loop = types.SimpleNamespace(
+        chat_model=types.SimpleNamespace(set_tools_schemas=lambda _s: None, prepare_rollout_cache=_cache),
+        tools_manager=types.SimpleNamespace(tools_schemas=[]),
+        interaction=types.SimpleNamespace(messages=[]),
+        config=types.SimpleNamespace(actor_rollout_ref=types.SimpleNamespace(rollout=rollout)),
+        tokenizer=types.SimpleNamespace(pad_token_id=0),
+        opening_messages=[],
+        _synth_failed_routed_experts=lambda _n: None,
+    )
+    out = asyncio.run(UniAgentLoop._build_empty_agent_output(loop, "setup_timeout", metrics=setup_metrics(3)))
+    assert out.extra_fields["timings"] == {"agent/setup_attempts": 3.0, "agent/setup_retried": 1.0}
+    assert out.extra_fields["traj_exit_reason"] == "setup_timeout"
+    assert out.response_mask == [0] * len(out.response_mask), "a dummy row trains nothing"

@@ -167,7 +167,6 @@ class AgentChatModel:
             # the interaction layer tells the model, or it misreads the parse error
             "capped": bool(turn_limit and len(token_output.token_ids) >= turn_limit),
         }
-        metrics["capped_turns"] = metrics.get("capped_turns", 0) + int(generation_info["capped"])
         response_ids = token_output.token_ids
         # checked before the append: a generation that crosses the budget is regenerated in the
         # condensed segment, so leaving it here would train the same step twice
@@ -176,6 +175,7 @@ class AgentChatModel:
                 f"prompt_ids length {len(rollout_cache['prompt_ids']) + len(response_ids)} exceeds "
                 f"max_model_len {limit}\nGenerated response:\n{self.tokenizer.decode(response_ids)}"
             )
+        metrics["capped_turns"] = metrics.get("capped_turns", 0) + int(generation_info["capped"])
         rollout_cache["prompt_ids"] += response_ids
         rollout_cache["response_mask"] += [1] * len(response_ids)
         if token_output.log_probs is not None:

@@ -166,10 +166,10 @@ def turn_entropy_records(segments: list[dict], trajectory: list) -> list[dict]:
     return records
 
 
-def reward_metrics(reward_result: dict, applied_edits: float) -> dict[str, float]:
+def reward_metrics(reward_result: dict, source_edited: float) -> dict[str, float]:
     """The reward's own health flags, per trajectory.
 
-    ``empty_patch`` and ``work_lost`` are absent when the reward did not report the flag:
+    ``empty_patch`` and ``empty_patch_after_source_edit`` are absent when the reward did not report the flag:
     defaulting it to False would read a prediction that was never extracted as an agent that
     changed nothing, and the step metrics take an absent key as never measured.
     """
@@ -179,9 +179,9 @@ def reward_metrics(reward_result: dict, applied_edits: float) -> dict[str, float
     }
     if "empty_patch" in reward_result:
         out["empty_patch"] = float(bool(reward_result["empty_patch"]))
-        # edits landed and none of them reached the graded patch: scored as an ordinary
+        # source was edited and none of it reached the graded patch: scored as an ordinary
         # wrong answer, so it biases every number the run reports
-        out["work_lost"] = float(out["empty_patch"] > 0 and applied_edits > 0)
+        out["empty_patch_after_source_edit"] = float(out["empty_patch"] > 0 and source_edited > 0)
     return out
 
 
@@ -332,6 +332,7 @@ class UniAgentLoop(AgentLoopBase):
             setup_timeout = config_dict.get("setup_timeout", 300)
             setup_retries = config_dict.get("setup_retries", 2)
             setup_done = False
+            setup_attempts = 0
             try:
                 with rollout_trace_span("rollout", as_type="chain") as rollout_span:
                     env_setup_t0 = time.perf_counter()
@@ -343,6 +344,7 @@ class UniAgentLoop(AgentLoopBase):
                         # node-wide ~2min freeze killed 7 in-flight rollouts at the same
                         # instant, each scored 0 for something the agent never saw.
                         for attempt in range(setup_retries + 1):
+                            setup_attempts = attempt + 1
                             try:
                                 async with asyncio.timeout(setup_timeout):
                                     await self.env.start()
@@ -381,7 +383,6 @@ class UniAgentLoop(AgentLoopBase):
                                 self.interaction.env = self.env
                                 if self.reward_spec is not None:
                                     self.reward_spec.env = self.env
-                        setup_attempts = attempt + 1
                         if env_span is not None:
                             env_span.update(
                                 output={"status": "ready", "attempts": setup_attempts,
@@ -400,7 +401,6 @@ class UniAgentLoop(AgentLoopBase):
                     interaction_result["metrics"]["env_setup"] = env_setup_s
                     interaction_result["metrics"]["loop_wall"] = interaction_result.get("execution_time", 0.0)
                     behaviour = behaviour_metrics(interaction_result["trajectory"])
-                    applied_edits = behaviour["edit_calls_run"] - behaviour["edit_failures"]
                     interaction_result["metrics"].update({
                         AGENT_METRIC_PREFIX + name: value for name, value in behaviour.items()
                     })
@@ -447,7 +447,7 @@ class UniAgentLoop(AgentLoopBase):
                                 reward_result["eval_execution_time"]
                             )
                         interaction_result["metrics"].update(
-                            reward_metrics(reward_result, applied_edits)
+                            reward_metrics(reward_result, behaviour["source_edited"])
                         )
                     interaction_result["reward_score"] = reward_score
                     rollout_trace_score("reward", float(reward_score), data_type="NUMERIC")
@@ -477,13 +477,16 @@ class UniAgentLoop(AgentLoopBase):
                 self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {e!r}")
                 outcome = {"termination": exit_reason}
                 rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
-                output = [await self._build_empty_agent_output(exit_reason=exit_reason)]
+                # a sandbox that never came up still counts in the setup retry rate
+                metrics = setup_metrics(setup_attempts) if setup_attempts else {}
+                output = [await self._build_empty_agent_output(exit_reason=exit_reason, metrics=metrics)]
             finally:
                 await self.env.close()
             return output
 
     async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
         """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: hint}."""
+        reflector = None
         try:
             if not config_dict.get("reflection"):
                 return {}
@@ -544,6 +547,9 @@ class UniAgentLoop(AgentLoopBase):
 
             if should_break("reflection"):
                 breakpoint()
+            # the health fractions average only over rows that carry a key, so the 0 is written too
+            metrics = interaction_result.setdefault("metrics", {})
+            metrics["reflect_failed"] = 0.0
             reflector = load_reflector(
                 self.chat_model, config, run_id=self.run_id,
                 record_path=self.output_dir / "reflection.jsonl.gz", identity=self.identity)
@@ -555,17 +561,18 @@ class UniAgentLoop(AgentLoopBase):
                 outcome=outcome,
                 agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
             )
-            metrics = interaction_result.setdefault("metrics", {})
             metrics.update({AGENT_METRIC_PREFIX + k: v for k, v in reflector.call_metrics().items()})
-            if not hints:
-                metrics["reflect_empty"] = 1.0
+            metrics["reflect_empty"] = float(not hints)
             return hints
         except Exception as e:  # hints are optional supervision; never kill the rollout over them
             self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
-            interaction_result.setdefault("metrics", {})["reflect_failed"] = 1.0
+            metrics = interaction_result.setdefault("metrics", {})
+            metrics["reflect_failed"] = 1.0
+            if reflector is not None:
+                metrics.update({AGENT_METRIC_PREFIX + k: v for k, v in reflector.call_metrics().items()})
             return {}
 
-    async def _build_empty_agent_output(self, exit_reason: str) -> AgentLoopOutput:
+    async def _build_empty_agent_output(self, exit_reason: str, metrics: dict | None = None) -> AgentLoopOutput:
         self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)
         rollout_cache = await self.chat_model.prepare_rollout_cache(self.interaction.messages)
         prompt_ids = rollout_cache["prompt_ids"]
@@ -587,6 +594,7 @@ class UniAgentLoop(AgentLoopBase):
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
         extra_fields["traj_exit_reason"] = exit_reason
         extra_fields["raw_prompt"] = self.opening_messages
+        extra_fields["timings"] = {k: float(v) for k, v in (metrics or {}).items() if isinstance(v, (int, float))}
         if getattr(self, "emit_feedback", False):
             extra_fields["reward_extra_info"] = {"feedback": None}
         extra_fields["turn_spans"] = []
@@ -863,7 +871,7 @@ class UniAgentLoop(AgentLoopBase):
             segments = [{"rollout_cache": interaction_result["rollout_cache"], "prompt_messages": None}]
         segments = [seg for seg in segments if len(seg["rollout_cache"].get("response_mask", [])) > 0]
         if not segments:
-            return [await self._build_empty_agent_output(exit_reason="no_response")]
+            return [await self._build_empty_agent_output(exit_reason="no_response", metrics=metrics)]
 
         num_segments = len(segments)
         self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
