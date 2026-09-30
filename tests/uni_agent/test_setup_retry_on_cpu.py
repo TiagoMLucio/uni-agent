@@ -6,10 +6,12 @@ every attempt, so retrying is safe and the rollout survives.
 """
 
 import asyncio
+import functools
+import types
 
 import pytest
 
-from uni_agent.agent_loop import setup_metrics
+from uni_agent.agent_loop import UniAgentLoop, setup_metrics
 
 
 class FlakyEnv:
@@ -31,51 +33,67 @@ class FlakyEnv:
         self.ledger.append("close")
 
 
-async def _run_setup(ledger, fail_times, setup_retries, exc=TimeoutError):
-    """The agent loop's setup block, reduced to the retry contract it must honor."""
-    env = FlakyEnv(ledger, fail_times, exc)
-    for attempt in range(setup_retries + 1):
-        try:
-            async with asyncio.timeout(30):
-                await env.start()
-                await env.install_tools([])
-            return attempt + 1
-        except Exception:
-            if attempt == setup_retries:
-                raise
-            try:
-                await env.close()
-            except Exception:
-                pass
-            env = FlakyEnv(ledger, fail_times, exc)  # a fresh sandbox, as the loop does
-    raise AssertionError("unreachable")
+def _loop(ledger, fail_times, exc=TimeoutError):
+    """The attributes UniAgentLoop's setup and dummy-row paths read, over a FlakyEnv."""
+
+    async def cache(_messages):
+        return {"prompt_ids": [1, 2, 3]}
+
+    loop = types.SimpleNamespace(
+        env=FlakyEnv(ledger, fail_times, exc),
+        chat_model=types.SimpleNamespace(set_tools_schemas=lambda _s: None, prepare_rollout_cache=cache),
+        tools_manager=types.SimpleNamespace(tools_schemas=[], tools=[]),
+        skills_manager=None,
+        interaction=types.SimpleNamespace(env=None, messages=[]),
+        reward_spec=None,
+        logger=types.SimpleNamespace(error=lambda _m: None, warning=lambda _m: None, info=lambda _m: None),
+        config=types.SimpleNamespace(actor_rollout_ref=types.SimpleNamespace(
+            rollout=types.SimpleNamespace(prompt_length=8, response_length=8))),
+        tokenizer=types.SimpleNamespace(pad_token_id=0),
+        opening_messages=[],
+        mask_abnormal_exit_traj=False,
+        emit_feedback=False,
+        setup_attempts=0,
+        _synth_failed_routed_experts=lambda _n: None,
+    )
+    loop._init_env = lambda _cfg: FlakyEnv(ledger, fail_times, exc)
+    for name in ("_start_env", "_failed_output", "_build_empty_agent_output", "convert_to_agent_output"):
+        setattr(loop, name, functools.partial(getattr(UniAgentLoop, name), loop))
+    return loop
+
+
+def _run_setup(ledger, fail_times, setup_retries, exc=TimeoutError):
+    """The agent loop's own setup; returns the loop so its attempt count can be read."""
+    loop = _loop(ledger, fail_times, exc)
+    asyncio.run(loop._start_env({"env": {}}, setup_timeout=30, setup_retries=setup_retries))
+    return loop
 
 
 def test_transient_failure_is_retried_with_a_fresh_sandbox():
     ledger = []
-    attempts = asyncio.run(_run_setup(ledger, fail_times=1, setup_retries=2))
-    assert attempts == 2, "should have succeeded on the second attempt"
+    loop = _run_setup(ledger, fail_times=1, setup_retries=2)
+    assert loop.setup_attempts == 2, "should have succeeded on the second attempt"
     # the broken sandbox is torn down and a new one built before retrying
     assert ledger == ["init", "start", "close", "init", "start", "install_tools"], ledger
+    assert loop.interaction.env is loop.env, "the interaction runs on the rebuilt sandbox"
 
 
 def test_healthy_setup_does_not_retry():
     ledger = []
-    assert asyncio.run(_run_setup(ledger, fail_times=0, setup_retries=2)) == 1
+    assert _run_setup(ledger, fail_times=0, setup_retries=2).setup_attempts == 1
     assert ledger.count("start") == 1 and "close" not in ledger
 
 
 def test_persistent_failure_still_raises_after_the_budget():
     ledger = []
     with pytest.raises(TimeoutError):
-        asyncio.run(_run_setup(ledger, fail_times=99, setup_retries=2))
+        _run_setup(ledger, fail_times=99, setup_retries=2)
     assert ledger.count("start") == 3, "one initial attempt plus two retries"
 
 
 def test_retry_covers_any_setup_exception_not_just_timeouts():
     ledger = []
-    assert asyncio.run(_run_setup(ledger, fail_times=1, setup_retries=2, exc=ConnectionError)) == 2
-
+    assert _run_setup(ledger, fail_times=1, setup_retries=2, exc=ConnectionError).setup_attempts == 2
 
 
 def test_the_attempts_are_counted_so_a_degrading_site_is_visible():
@@ -90,25 +108,32 @@ def test_the_counters_are_never_conditional():
 
 
 def test_a_sandbox_that_never_came_up_still_reports_its_attempts():
-    """The dummy row of a failed setup carries the counters, or the retry rate only sees survivors."""
-    import types
-
-    from uni_agent.agent_loop import UniAgentLoop
-
-    async def _cache(_messages):
-        return {"prompt_ids": [1, 2, 3]}
-
-    rollout = types.SimpleNamespace(prompt_length=8, response_length=8)
-    loop = types.SimpleNamespace(
-        chat_model=types.SimpleNamespace(set_tools_schemas=lambda _s: None, prepare_rollout_cache=_cache),
-        tools_manager=types.SimpleNamespace(tools_schemas=[]),
-        interaction=types.SimpleNamespace(messages=[]),
-        config=types.SimpleNamespace(actor_rollout_ref=types.SimpleNamespace(rollout=rollout)),
-        tokenizer=types.SimpleNamespace(pad_token_id=0),
-        opening_messages=[],
-        _synth_failed_routed_experts=lambda _n: None,
-    )
-    out = asyncio.run(UniAgentLoop._build_empty_agent_output(loop, "setup_timeout", metrics=setup_metrics(3)))
+    """The setup gives up after three attempts; its dummy row carries them, or the retry rate
+    only sees the sandboxes that survived."""
+    loop = _loop([], fail_times=99)
+    with pytest.raises(TimeoutError):
+        asyncio.run(loop._start_env({"env": {}}, setup_timeout=30, setup_retries=2))
+    out = asyncio.run(loop._failed_output("setup_timeout"))
     assert out.extra_fields["timings"] == {"agent/setup_attempts": 3.0, "agent/setup_retried": 1.0}
     assert out.extra_fields["traj_exit_reason"] == "setup_timeout"
     assert out.response_mask == [0] * len(out.response_mask), "a dummy row trains nothing"
+
+
+def test_a_failure_before_any_attempt_reports_no_setup():
+    out = asyncio.run(_loop([], fail_times=0)._failed_output("agent_loop_failed"))
+    assert out.extra_fields["timings"] == {}
+
+
+def test_a_trajectory_without_tokens_keeps_its_metrics():
+    """no_response: the loop ran (setup, turns, reward) but no segment kept a token; its row is a
+    dummy, yet what it measured still reaches the step metrics."""
+    metrics = {"loop_wall": 3.0, "agent/setup_attempts": 1.0, "eval_completed": 1.0}
+    result = {
+        "reward_score": 0.0,
+        "trajectory": [types.SimpleNamespace(step_idx=0, exit_reason="token_limit")],
+        "metrics": metrics,
+        "rollout_cache": {"response_mask": []},
+    }
+    (out,) = asyncio.run(_loop([], fail_times=0).convert_to_agent_output(result))
+    assert out.extra_fields["traj_exit_reason"] == "no_response"
+    assert out.extra_fields["timings"] == metrics

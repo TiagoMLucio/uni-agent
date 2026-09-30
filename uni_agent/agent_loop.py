@@ -332,62 +332,19 @@ class UniAgentLoop(AgentLoopBase):
             setup_timeout = config_dict.get("setup_timeout", 300)
             setup_retries = config_dict.get("setup_retries", 2)
             setup_done = False
-            setup_attempts = 0
+            self.setup_attempts = 0
             try:
                 with rollout_trace_span("rollout", as_type="chain") as rollout_span:
                     env_setup_t0 = time.perf_counter()
                     with rollout_trace_span(
                         "env_setup", metadata={"image": image, "timeout_s": setup_timeout}
                     ) as env_span:
-                        # Setup is idempotent (each attempt builds a fresh sandbox), so a
-                        # transient infrastructure stall must not cost the rollout: one
-                        # node-wide ~2min freeze killed 7 in-flight rollouts at the same
-                        # instant, each scored 0 for something the agent never saw.
-                        for attempt in range(setup_retries + 1):
-                            setup_attempts = attempt + 1
-                            try:
-                                async with asyncio.timeout(setup_timeout):
-                                    await self.env.start()
-
-                                    # tools schemas should be visible to the model
-                                    # to generate correct tool call format in response.
-                                    # declare_tools=false suppresses the template's tool
-                                    # block for scaffolds whose system prompt documents
-                                    # the tools inline; declaring them twice would also
-                                    # advertise a call format the model was not trained on.
-                                    self.chat_model.set_tools_schemas(
-                                        self.tools_manager.tools_schemas
-                                        if config_dict.get("declare_tools", True)
-                                        else None
-                                    )
-                                    await self.env.install_tools(self.tools_manager.tools)
-                                    if self.skills_manager is not None:
-                                        await self.env.install_skills(self.skills_manager)
-                                        self.interaction.inject_skills_manifest()
-                                break
-                            except Exception as e:
-                                if attempt == setup_retries:
-                                    raise
-                                self.logger.error(
-                                    f"env setup failed ({type(e).__name__}: {e}); rebuilding the "
-                                    f"sandbox, attempt {attempt + 2}/{setup_retries + 1}"
-                                )
-                                try:
-                                    # bounded: a stalled node can hang teardown too, and that
-                                    # time is outside the per-attempt budget
-                                    async with asyncio.timeout(30):
-                                        await self.env.close()
-                                except Exception as close_err:
-                                    self.logger.warning(f"could not close the broken sandbox: {close_err}")
-                                self.env = self._init_env(config_dict["env"])
-                                self.interaction.env = self.env
-                                if self.reward_spec is not None:
-                                    self.reward_spec.env = self.env
+                        await self._start_env(config_dict, setup_timeout, setup_retries)
                         if env_span is not None:
                             env_span.update(
-                                output={"status": "ready", "attempts": setup_attempts,
+                                output={"status": "ready", "attempts": self.setup_attempts,
                                         "tools_installed": len(self.tools_manager.tools)},
-                                metadata={"retried": setup_attempts > 1},
+                                metadata={"retried": self.setup_attempts > 1},
                             )
 
                     setup_done = True
@@ -404,7 +361,7 @@ class UniAgentLoop(AgentLoopBase):
                     interaction_result["metrics"].update({
                         AGENT_METRIC_PREFIX + name: value for name, value in behaviour.items()
                     })
-                    interaction_result["metrics"].update(setup_metrics(setup_attempts))
+                    interaction_result["metrics"].update(setup_metrics(self.setup_attempts))
                     if rollout_span is not None:
                         trajectory = interaction_result.get("trajectory") or []
                         rollout_span.update(
@@ -477,12 +434,65 @@ class UniAgentLoop(AgentLoopBase):
                 self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {e!r}")
                 outcome = {"termination": exit_reason}
                 rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
-                # a sandbox that never came up still counts in the setup retry rate
-                metrics = setup_metrics(setup_attempts) if setup_attempts else {}
-                output = [await self._build_empty_agent_output(exit_reason=exit_reason, metrics=metrics)]
+                output = [await self._failed_output(exit_reason)]
             finally:
                 await self.env.close()
             return output
+
+    async def _start_env(self, config_dict: dict, setup_timeout: float, setup_retries: int) -> None:
+        """Start the sandbox and install the tools, rebuilding the sandbox after a failed attempt.
+
+        Setup is idempotent (each attempt builds a fresh sandbox), so a transient infrastructure
+        stall must not cost the rollout: one node-wide ~2min freeze killed 7 in-flight rollouts at
+        the same instant, each scored 0 for something the agent never saw. ``self.setup_attempts``
+        counts the attempts so far, which a setup that gives up still reports.
+        """
+        for attempt in range(setup_retries + 1):
+            self.setup_attempts = attempt + 1
+            try:
+                async with asyncio.timeout(setup_timeout):
+                    await self.env.start()
+
+                    # tools schemas should be visible to the model
+                    # to generate correct tool call format in response.
+                    # declare_tools=false suppresses the template's tool
+                    # block for scaffolds whose system prompt documents
+                    # the tools inline; declaring them twice would also
+                    # advertise a call format the model was not trained on.
+                    self.chat_model.set_tools_schemas(
+                        self.tools_manager.tools_schemas
+                        if config_dict.get("declare_tools", True)
+                        else None
+                    )
+                    await self.env.install_tools(self.tools_manager.tools)
+                    if self.skills_manager is not None:
+                        await self.env.install_skills(self.skills_manager)
+                        self.interaction.inject_skills_manifest()
+                return
+            except Exception as e:
+                if attempt == setup_retries:
+                    raise
+                self.logger.error(
+                    f"env setup failed ({type(e).__name__}: {e}); rebuilding the "
+                    f"sandbox, attempt {attempt + 2}/{setup_retries + 1}"
+                )
+                try:
+                    # bounded: a stalled node can hang teardown too, and that
+                    # time is outside the per-attempt budget
+                    async with asyncio.timeout(30):
+                        await self.env.close()
+                except Exception as close_err:
+                    self.logger.warning(f"could not close the broken sandbox: {close_err}")
+                self.env = self._init_env(config_dict["env"])
+                self.interaction.env = self.env
+                if self.reward_spec is not None:
+                    self.reward_spec.env = self.env
+
+    async def _failed_output(self, exit_reason: str) -> AgentLoopOutput:
+        """The dummy row of a trajectory that produced no result; a sandbox that never came up
+        still counts in the setup retry rate."""
+        metrics = setup_metrics(self.setup_attempts) if self.setup_attempts else {}
+        return await self._build_empty_agent_output(exit_reason=exit_reason, metrics=metrics)
 
     async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
         """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: hint}."""
