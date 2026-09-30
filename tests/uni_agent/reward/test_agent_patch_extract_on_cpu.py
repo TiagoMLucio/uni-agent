@@ -24,7 +24,7 @@ class Env:
             raise RuntimeError("container exited")
         return PATCH_EXTRACT_OK
 
-    async def read_file(self, path):
+    async def read_file(self, path, **kwargs):
         return "diff --git a/x.py b/x.py\n+fix\n"
 
     async def write_file(self, path, content):
