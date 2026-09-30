@@ -299,6 +299,52 @@ def test_a_per_turn_call_sees_only_its_own_prefix():
     assert "GOLDPATCH" not in repair_user          # the template never names {gold}
 
 
+SELECT = CallSpec(id="select", parse="turns", system="SELECT {k}", user="{task}\n{turns}")
+CHECK = CallSpec(id="check", parse="hints", system="CHECK", user="{task}\n{prev}")
+GOOD_DRAFT = 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py", "turn4": "run it"}'
+UNUSABLE = "no object here at all"
+
+
+def test_a_later_hints_stage_unusable_after_every_redraw_fails_and_drops_the_draft():
+    """Once hints exist, a stage that never answers usably means the pipeline did not run as decided."""
+    import pytest
+
+    from uni_agent.reflection import ReflectionFailed
+
+    model = _ScriptedModel({"DRAFT": GOOD_DRAFT, "CHECK": UNUSABLE})
+    config = PipelineReflectionConfig(enabled=True, name="pipeline", calls=[DRAFT, CHECK],
+                                      **_given([DRAFT, CHECK]))
+    reflector = PipelineReflector(model, config)
+    with pytest.raises(ReflectionFailed, match="check: no usable hints"):
+        asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
+    assert sum("CHECK" in c["system"] for c in model.seen) == 2, "one draw and its redraw"
+
+
+def test_a_turns_stage_unusable_after_hints_exist_fails():
+    import pytest
+
+    from uni_agent.reflection import ReflectionFailed
+
+    calls = [DRAFT, SELECT, CallSpec(id="final", parse="hints", system="FINAL", user="{task}\n{prev}")]
+    model = _ScriptedModel({"DRAFT": GOOD_DRAFT, "SELECT": UNUSABLE, "FINAL": GOOD_DRAFT})
+    reflector = PipelineReflector(model, PipelineReflectionConfig(enabled=True, name="pipeline", calls=calls,
+                                                                 **_given(calls)))
+    with pytest.raises(ReflectionFailed, match="select: no usable turns"):
+        asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
+
+
+def test_a_first_stage_finding_nothing_is_empty():
+    hints, model = _pipeline({"SELECT": UNUSABLE, "DRAFT": GOOD_DRAFT}, [SELECT, DRAFT])
+    assert hints == {}
+    assert not any("DRAFT" in c["system"] for c in model.seen), "nothing selected, nothing drafted"
+
+
+def test_a_first_hints_stage_finding_nothing_is_empty():
+    """Turns were selected, but the stage that writes the first hints found none: still empty."""
+    hints, _ = _pipeline({"SELECT": 'FINAL_TURNS_JSON: {"turns": [1, 4]}', "DRAFT": UNUSABLE}, [SELECT, DRAFT])
+    assert hints == {}
+
+
 def test_a_later_trace_stage_that_errors_drops_the_earlier_hints():
     import pytest
 

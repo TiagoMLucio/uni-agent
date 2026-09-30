@@ -1,10 +1,10 @@
-"""A reflector reply that parses to nothing is re-drawn, and no stage may lose hints.
+"""A reflector reply that parses to nothing is re-drawn, and a call that cannot run fails.
 
 Contract failures are drawn per sample rather than being properties of the trace: across
 three repeats of one experiment, zero traces failed in all three (Cohen's kappa about 0). So a
 re-draw recovers most of them, while rewording the prompt does not. These tests pin the
 behaviours that follow: re-draw on an unusable reply at the rung it was drawn from, shrink the
-render only when it does not fit, keep the hints an earlier stage earned, read a hint out of an
+render only when it does not fit, fail rather than come up empty when no call could run, read a hint out of an
 object no JSON decoder will take, and count what the whole thing cost.
 """
 

@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from uni_agent.reflection.base import FINAL_MARKER, AbstractReflector, BaseReflectionConfig
+from uni_agent.reflection.base import FINAL_MARKER, AbstractReflector, BaseReflectionConfig, ReflectionFailed
 from uni_agent.reflection.facts import patch_delta, turn_candidates
 from uni_agent.reflection.registry import register_reflector
 from uni_agent.tracing import register_langfuse_op, rollout_trace_op
@@ -169,16 +169,20 @@ class PipelineReflector(AbstractReflector):
                 stage=call.id,
                 accept=usable,
             )
-            # a later stage whose reply parses to nothing leaves the hints an earlier one earned;
-            # a stage that could not run at all raised ReflectionFailed, which drops them all
+            # before any hint, a stage finding nothing is an empty reflection; once hints exist, a
+            # stage still unusable after its redraws means the pipeline did not run as decided
             if call.parse == "turns":
                 fresh = [step for step in self._parse_turns(text) if step in {t["step"] for t in turns}]
                 if not fresh:
+                    if hints:
+                        raise ReflectionFailed(f"{call.id}: no usable turns after every redraw")
                     break
                 selected = fresh
             elif call.parse == "hints":
                 fresh = self._keep_valid(self._parse(text), turns)
                 if not fresh:
+                    if hints:
+                        raise ReflectionFailed(f"{call.id}: no usable hints after every redraw")
                     break
                 hints = fresh
                 selected = sorted(hints)
