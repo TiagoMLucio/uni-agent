@@ -10,7 +10,9 @@ object no JSON decoder will take, and count what the whole thing cost.
 
 import asyncio
 
-from uni_agent.reflection.base import AbstractReflector
+import pytest
+
+from uni_agent.reflection.base import AbstractReflector, ReflectionFailed
 from uni_agent.reflection.pipeline import PipelineReflector
 
 MARKER = "FINAL_HINTS_JSON:"
@@ -140,10 +142,17 @@ def test_an_over_budget_rung_is_rendered_once():
 
 def test_a_prompt_without_reply_room_is_over_budget():
     """A prompt that fits but leaves less than max_output_tokens of room is not sent: the staged
-    reply could not close, and the shrink ladder moves on without paying the prefill."""
-    hints, model, _ = run_ladder(250, 100_000, redraws_per_rung=1)
+    reply could not close, and the shrink ladder moves on without paying the prefill. With no rung
+    left the reflector never saw the trajectory, so the reflection failed rather than came up empty."""
+    good = MARKER + '\n{"turn2": "run the snippet you printed at turn 1 before editing"}'
+    model = SizedModel([good], 262144)
+    r = PipelineReflector(model, config(max_model_len=262144, max_observation_chars=1_000_000,
+                                       max_output_tokens=16384, redraws_per_rung=1))
+    with pytest.raises(ReflectionFailed, match="over budget at every shrink level"):
+        asyncio.run(r.reflect_trajectory(task="t", turns=turns_with_observations(250, 100_000),
+                                         gold="g", feedback="f"))
+    assert r.call_metrics()["reflect_over_budget"] == 5 and r.call_metrics()["reflect_calls"] == 0
     assert model.queries == [], "every rung leaves under 16384 tokens of room"
-    assert hints == {}
     assert len(model.renders) == 5, "one render per rung, none repeated"
     assert all(n < 262144 for n in model.renders[2:]), "the last rungs fit by prompt length alone"
     assert all(n + 16384 > 262144 for n in model.renders[2:])
@@ -214,6 +223,24 @@ def test_prose_alone_is_not_mined_for_hints():
 
 def test_an_explicit_decline_stays_a_decline():
     assert AbstractReflector._parse(MARKER + "\n{}") == {}
+
+
+def test_a_call_that_raises_fails_the_reflection():
+    """An API error, a rate limit or a timeout is not the reflector finding nothing to hint."""
+
+    class _Down(Model):
+        async def query(self, *args, **kwargs):
+            raise ConnectionError("503 from the reflector endpoint")
+
+    r = PipelineReflector(_Down([GOOD]), config())
+    with pytest.raises(ReflectionFailed, match="503"):
+        asyncio.run(r.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+
+
+def test_a_reply_unusable_after_every_redraw_is_empty_not_failed():
+    """The model answered and the parser found nothing: the pipeline ran as designed."""
+    hints, calls = run([BAD], redraws_per_rung=1)
+    assert hints == {} and calls == 2
 
 
 if __name__ == "__main__":

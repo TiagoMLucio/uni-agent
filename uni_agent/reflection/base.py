@@ -31,6 +31,12 @@ OVER_BUDGET = "over budget"
 #: what the reflector cost one trajectory, reported by the agent loop
 CALL_METRICS = ("reflect_calls", "reflect_redraws", "reflect_over_budget", "reflect_rung")
 
+class ReflectionFailed(RuntimeError):
+    """The pipeline could not run as designed: a call raised, or no rung of the ladder fit the
+    budget. Its hints are dropped, an earlier stage's included, since they are not what the
+    pipeline decided."""
+
+
 TURN_TEMPLATE = "### Turn {step}\nASSISTANT:\n{response}\n{tools}"
 # the response is the model's raw output, so it already carries the tool call and its arguments;
 # rendering the parsed action too duplicated whole written files in the prompt
@@ -126,12 +132,14 @@ class AbstractReflector(ABC):
     async def reflect_trajectory(
         self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = "", agent_patch: str = ""
     ) -> dict[int, str]:
-        """Hints keyed by step index; empty on any failure, since hints are optional supervision."""
+        """Hints keyed by step index; empty when the reflector found nothing to hint, and
+        ``ReflectionFailed`` when the pipeline could not run."""
 
     async def _ask(self, system: str, render_user, max_output_tokens: int | None = None,
-                   stage: str = "", step: int | None = None, accept=None) -> str | None:
+                   stage: str = "", step: int | None = None, accept=None) -> str:
         """One call, re-drawn on an unusable reply and shrunk down the ladder on an over-budget
-        render. ``render_user(obs_cap, resp_cap) -> str``.
+        render. ``render_user(obs_cap, resp_cap) -> str``. Raises ``ReflectionFailed`` when a call
+        raises or no rung fits.
 
         ``accept(text) -> bool`` decides whether a reply is usable. A reply that parses to
         nothing is a wasted rollout, and contract failures are drawn per sample rather than
@@ -198,7 +206,7 @@ class AbstractReflector(ABC):
                     self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
                     self._record(stage, step, messages, None, None, obs_cap, resp_cap,
                                  error=repr(exc), draw=draw)
-                    return None
+                    raise ReflectionFailed(f"{stage or 'call'} failed: {exc!r}") from exc
             else:
                 # the ladder is there for a render that does not fit; a reply the parser could not
                 # use is no reason to ask again from a deliberately smaller view of the trajectory
@@ -209,7 +217,7 @@ class AbstractReflector(ABC):
             self.logger.warning("Reflection: no usable reply in %d draws", draws)
             return rejected
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
-        return None
+        raise ReflectionFailed(f"{stage or 'call'}: render over budget at every shrink level")
 
     def call_metrics(self) -> dict[str, float]:
         """What the reflector cost this trajectory, every stage summed: calls, re-draws after an

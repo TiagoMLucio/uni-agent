@@ -15,6 +15,7 @@ from uni_agent.reflection.base import (
     TURN_TEMPLATE,
     AbstractReflector,
     BaseReflectionConfig,
+    ReflectionFailed,
 )
 from uni_agent.reflection.pipeline import CallSpec, PipelineReflectionConfig, PipelineReflector
 from uni_agent.reflection.registry import (
@@ -34,6 +35,7 @@ __all__ = [
     "PipelineReflectionConfig",
     "PipelineReflector",
     "BaseReflectionConfig",
+    "ReflectionFailed",
     "build_reflection_config",
     "load_reflector",
     "register_reflector",

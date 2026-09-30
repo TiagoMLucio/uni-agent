@@ -243,18 +243,34 @@ def test_a_rewrite_is_refused_and_the_draft_stands():
     assert hints == {1: "open parser.py"}
 
 
-def test_a_failed_repair_call_drops_the_hint_rather_than_keeping_it():
+def _failing_after_the_draft(failing_tag, calls):
+    """The draft answers with hints; every call whose system prompt carries ``failing_tag`` raises."""
+
     class _Flaky(_ScriptedModel):
+        failed = 0
+
         async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
-            if "REPAIR" in messages[0]["content"]:
+            if failing_tag in messages[0]["content"]:
+                self.failed += 1
                 raise RuntimeError("boom")
             return await super().query(messages, rollout_cache, sampling_params, max_model_len)
 
-    model = _Flaky({"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}'})
-    reflector = PipelineReflector(model, PipelineReflectionConfig(enabled=True, name="pipeline",
-                                                                 calls=[DRAFT, REPAIR], **_given([DRAFT, REPAIR])))
-    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
-    assert hints == {}
+    model = _Flaky({"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py", "turn4": "run it"}'})
+    config = PipelineReflectionConfig(enabled=True, name="pipeline", calls=calls, **_given(calls))
+    return PipelineReflector(model, config), model
+
+
+def test_a_failed_repair_call_fails_the_reflection_and_drops_the_draft():
+    """The draft's hints are not what the pipeline decided when its check could not run."""
+    import pytest
+
+    from uni_agent.reflection import ReflectionFailed
+
+    reflector, model = _failing_after_the_draft("REPAIR", [DRAFT, REPAIR])
+    with pytest.raises(ReflectionFailed, match="boom"):
+        asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
+    assert model.failed == 2, "both hinted turns were checked"
+    assert reflector.call_metrics()["reflect_calls"] == 1, "only the draft answered"
 
 
 def test_a_stage_that_says_drop_removes_the_hint():
@@ -283,18 +299,15 @@ def test_a_per_turn_call_sees_only_its_own_prefix():
     assert "GOLDPATCH" not in repair_user          # the template never names {gold}
 
 
-def test_a_failing_repair_drops_rather_than_ships_the_draft():
-    class _Flaky(_ScriptedModel):
-        async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
-            if "REPAIR" in messages[0]["content"]:
-                raise RuntimeError("boom")
-            return await super().query(messages, rollout_cache, sampling_params, max_model_len)
+def test_a_later_trace_stage_that_errors_drops_the_earlier_hints():
+    import pytest
 
-    model = _Flaky({"DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py"}'})
-    reflector = PipelineReflector(model, PipelineReflectionConfig(enabled=True, name="pipeline",
-                                                                 calls=[DRAFT, REPAIR], **_given([DRAFT, REPAIR])))
-    hints = asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
-    assert hints == {}
+    from uni_agent.reflection import ReflectionFailed
+
+    check = CallSpec(id="check", parse="hints", system="CHECK", user="{task}\n{prev}")
+    reflector, _ = _failing_after_the_draft("CHECK", [DRAFT, check])
+    with pytest.raises(ReflectionFailed, match="check failed"):
+        asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="g", feedback="f"))
 
 
 def test_a_call_cannot_reference_a_field_it_is_not_given():
@@ -425,12 +438,13 @@ def _traj_step(idx, tools=(), exit_reason="turn_done"):
     )
 
 
-def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.0, resolved=False, logger=None):
+def _maybe_reflect(tmp_path, reflection, trajectory, reply=None, reward_score=0.0, resolved=False, logger=None,
+                   model=None):
     """The real ``UniAgentLoop._maybe_reflect`` over a fake loop; errors fail the test unless a
     ``logger`` takes them."""
     from uni_agent.agent_loop import UniAgentLoop
 
-    model = _Model()
+    model = model or _Model()
     if reply is not None:
         model.reply = reply
 
@@ -521,6 +535,29 @@ def test_the_call_metrics_reach_the_interaction_result(tmp_path):
     assert skipped["metrics"] == {}
 
 
+class _Down(_Model):
+    async def query(self, messages, rollout_cache, sampling_params, max_model_len=None):
+        raise ConnectionError("503 from the reflector endpoint")
+
+
+OUTCOMES = {"hint": (0.0, 0.0), "empty": (0.0, 1.0), "failed": (1.0, 0.0)}
+
+
+def _outcome(tmp_path, outcome):
+    replies = {"hint": '{"turn0": "run the failing test"}', "empty": "no object here at all"}
+    return _maybe_reflect(tmp_path, {"enabled": True}, [_traj_step(0)], reply=replies.get(outcome),
+                          model=_Down() if outcome == "failed" else None,
+                          logger=types.SimpleNamespace(critical=lambda _m: None))
+
+
+def test_every_reflected_trajectory_is_exactly_one_outcome(tmp_path):
+    """hinted + empty + failed = every reflected trajectory: both flags on each, never both 1."""
+    for outcome, flags in OUTCOMES.items():
+        hints, _, result = _outcome(tmp_path, outcome)
+        assert (result["metrics"]["reflect_failed"], result["metrics"]["reflect_empty"]) == flags, outcome
+        assert bool(hints) == (outcome == "hint"), outcome
+
+
 def test_a_reflection_that_raises_keeps_its_call_counts(tmp_path, monkeypatch):
     """The calls a failed reflection made are exactly the cost worth seeing, next to the failure."""
     from uni_agent import agent_loop as agent_loop_mod
@@ -538,7 +575,8 @@ def test_a_reflection_that_raises_keeps_its_call_counts(tmp_path, monkeypatch):
         tmp_path, {"enabled": True}, [_traj_step(0)], logger=types.SimpleNamespace(critical=logged.append)
     )
     assert hints == {} and logged
-    assert result["metrics"] == {"reflect_failed": 1.0, "agent/reflect_calls": 2.0, "agent/reflect_redraws": 1.0,
+    assert result["metrics"] == {"reflect_failed": 1.0, "reflect_empty": 0.0,
+                                 "agent/reflect_calls": 2.0, "agent/reflect_redraws": 1.0,
                                  "agent/reflect_over_budget": 0.0, "agent/reflect_rung": 0.0}
 
 

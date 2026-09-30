@@ -169,10 +169,8 @@ class PipelineReflector(AbstractReflector):
                 stage=call.id,
                 accept=usable,
             )
-            # a later stage that comes back empty leaves the hints an earlier one already
-            # earned, rather than discarding them: no stage may make the result worse
-            if text is None:
-                break
+            # a later stage whose reply parses to nothing leaves the hints an earlier one earned;
+            # a stage that could not run at all raised ReflectionFailed, which drops them all
             if call.parse == "turns":
                 fresh = [step for step in self._parse_turns(text) if step in {t["step"] for t in turns}]
                 if not fresh:
@@ -197,18 +195,18 @@ class PipelineReflector(AbstractReflector):
                 call.max_output_tokens,
                 stage=call.id,
                 step=step,
-            ) for step in selected)
+            ) for step in selected),
+            # every call finishes before one failure fails the stage, so none is left running
+            return_exceptions=True,
         )
+        failure = next((reply for reply in replies if isinstance(reply, BaseException)), None)
+        if failure is not None:
+            raise failure
         if call.parse != "hints":
             return hints
         out, tally = dict(hints), Counter()
         for step, reply in zip(selected, replies, strict=True):
-            # a failed call leaves nothing to judge the hint by, so it goes; a rewrite leaves the
-            # drafted hint standing, which is the worst case this stage can produce
-            if reply is None:
-                out.pop(step, None)
-                tally["failed"] += 1
-                continue
+            # a rewrite leaves the drafted hint standing, which is the worst case this stage can produce
             text, outcome = self._adopt(reply, hints.get(step, ""), call.edit)
             tally[outcome] += 1
             if text:

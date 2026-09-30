@@ -576,8 +576,9 @@ class UniAgentLoop(AgentLoopBase):
             return hints
         except Exception as e:  # hints are optional supervision; never kill the rollout over them
             self.logger.critical(f"Reflection failed; continuing without hints: {e!r}")
+            # hinted, empty and failed are exclusive and cover every reflected trajectory
             metrics = interaction_result.setdefault("metrics", {})
-            metrics["reflect_failed"] = 1.0
+            metrics["reflect_failed"], metrics["reflect_empty"] = 1.0, 0.0
             if reflector is not None:
                 metrics.update({AGENT_METRIC_PREFIX + k: v for k, v in reflector.call_metrics().items()})
             return {}
