@@ -322,7 +322,7 @@ class AgentEnv:
     async def _settle(self) -> str:
         """Give the shell a prompt of its own, and return what it said at it.
 
-        A program that ignores SIGINT is escalated to ``kill -9 %1``, and bash announces
+        A program that ignores SIGINT is escalated to ``kill -9 %+``, and bash announces
         a job's fate at its NEXT prompt, not the one it is already at. Without spending a
         prompt here, "[1]+ Killed ..." lands on top of whatever the model runs next and
         reads as that command's output.

@@ -324,7 +324,7 @@ def test_the_kill_note_states_the_real_remaining_allowance(budget, expected):
 
 
 def test_a_deferred_job_notice_lands_on_the_interrupt_not_the_next_command():
-    # a program that ignores SIGINT gets escalated to `kill -9 %1`, and bash announces
+    # a program that ignores SIGINT gets escalated to `kill -9 %+`, and bash announces
     # the job's fate at its NEXT prompt: "[1]+ Killed ..." used to surface on top of
     # whatever the model ran afterwards and read as that command's output
     env = _env()

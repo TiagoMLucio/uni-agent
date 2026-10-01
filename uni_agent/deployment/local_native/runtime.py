@@ -217,7 +217,7 @@ class BashSession(Session):
             self.shell.sendcontrol("z")
             self.shell.expect(expect_strings, timeout=action.timeout)
             output += self.shell.before
-            self.shell.sendline("kill -9 %1")
+            self.shell.sendline("kill -9 %+")
             expect_index = self.shell.expect(expect_strings, timeout=action.timeout)  # type: ignore
             matched_expect_string = expect_strings[expect_index]
             output += self.shell.before
