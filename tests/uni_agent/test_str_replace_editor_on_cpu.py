@@ -380,6 +380,14 @@ def test_create_on_existing_file_does_not_overwrite(tmp_path):
     assert f.read_text() == before, "the file must be untouched"
 
 
+def test_create_on_a_path_ending_in_slash_is_refused(tmp_path):
+    """Path() drops a trailing slash, which would write a file named `newdir`."""
+    out = run_create(f"{tmp_path}/newdir/", "x = 1\n")
+    assert "ends with `/`" in out
+    assert "created successfully" not in out
+    assert not (tmp_path / "newdir").exists()
+
+
 def test_view_of_a_missing_path_stops(tmp_path):
     out = run_edit(tmp_path / "nope.py", "x")
     assert "does not exist" in out

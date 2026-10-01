@@ -621,6 +621,9 @@ class EditTool:
         insert_line: int = None,
     ):
         path = Path(path_str)
+        if command == "create" and path_str.endswith("/"):
+            safe_print(f"The path `{path_str}` ends with `/`. The `create` command requires a file path.")
+            sys.exit()
         self.validate_path(command, path)
 
         if command == "view":
