@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import yaml
 
-from uni_agent.async_logging import add_file_handler, get_logger
+from uni_agent.async_logging import add_file_handler, cleanup_handlers, get_logger
 from uni_agent.interaction import (
     AgentChatModel,
     AgentEnv,
@@ -437,6 +437,11 @@ class UniAgentLoop(AgentLoopBase):
                 output = [await self._failed_output(exit_reason)]
             finally:
                 await self.env.close()
+                # off the event loop: removing the sink blocks until its writer thread drains into run.log
+                try:
+                    await asyncio.to_thread(cleanup_handlers, self.run_id)
+                except Exception as e:
+                    self.logger.warning(f"could not remove the run log sink: {e!r}")
             return output
 
     async def _start_env(self, config_dict: dict, setup_timeout: float, setup_retries: int) -> None:
