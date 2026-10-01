@@ -4,6 +4,7 @@ Rows are condensation segments and ``traj_of_row`` names the trajectory each row
 """
 
 from collections import defaultdict
+from statistics import median
 
 from uni_agent.sdpo.hints import HintedTurn
 
@@ -32,17 +33,19 @@ def hint_position_metrics(hinted_per_row: list[list[HintedTurn]], extra_fields: 
     traj_steps = defaultdict(list)
     for traj, ef in zip(traj_of_row, extra_fields, strict=True):
         traj_steps[traj].extend(int(span[0]) for span in ef.get("turn_spans") or [])
-    rel = []
+    rel, turn = [], []
     for hinted, traj in zip(hinted_per_row, traj_of_row, strict=True):
         steps = sorted(traj_steps.get(traj) or [0])
         lo, hi = steps[0], steps[-1]
         span_len = max(hi - lo, 1)
         rel.extend((hint.step - lo) / span_len for hint in hinted)
+        turn.extend(hint.step - lo + 1 for hint in hinted)
     if not rel:
         return {}
-    srt = sorted(rel)
     return {
         "self_distillation/hint_position_mean": sum(rel) / len(rel),
-        "self_distillation/hint_position_median": srt[len(srt) // 2],
-        "self_distillation/hint_position_first_half": sum(1 for r in rel if r <= 0.5) / len(rel),
+        "self_distillation/hint_position_median": float(median(rel)),
+        # the turn number itself (1 = first turn): how deep into the context the hint lands
+        "self_distillation/hint_turn_mean": sum(turn) / len(turn),
+        "self_distillation/hint_turn_median": float(median(turn)),
     }
