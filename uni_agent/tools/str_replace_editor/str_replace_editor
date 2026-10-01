@@ -1110,6 +1110,14 @@ def main():
 
     args = parser.parse_args()
 
+    enabled = os.getenv("STR_REPLACE_COMMANDS")
+    if enabled and args.command not in enabled.split(","):
+        safe_print(
+            f"Invalid action: command '{args.command}' is not enabled for function 'str_replace_editor'.\n"
+            f"Allowed commands for function 'str_replace_editor': {enabled.split(',')}."
+        )
+        sys.exit()
+
     file_history = load_history()
     editor = EditTool(file_history)
 

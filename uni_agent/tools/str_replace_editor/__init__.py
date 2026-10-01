@@ -1,6 +1,7 @@
 # ruff: noqa: E501
 """Str-replace editor tool definition."""
 
+import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -51,8 +52,25 @@ class StrReplaceEditorArguments(BaseModel):
     )
 
 
+#: the arguments each command reads besides `command` and `path`
+COMMAND_ARGUMENTS = {
+    "view": ("view_range",),
+    "create": ("file_text",),
+    "str_replace": ("old_str", "new_str"),
+    "insert": ("insert_line", "new_str"),
+    "undo_edit": (),
+}
+
+
+def _without_mentions(parts: list[str], names: list[str]) -> list[str]:
+    return [part for part in parts if not any(f"`{name}`" in part for name in names)]
+
+
 @register_tool("str_replace_editor")
 class StrReplaceEditorTool(AbstractTool):
+    commands = tuple(COMMAND_ARGUMENTS)
+    commands_env = "STR_REPLACE_COMMANDS"
+
     @property
     def name(self) -> str:
         return "str_replace_editor"
@@ -66,6 +84,24 @@ class StrReplaceEditorTool(AbstractTool):
             description=DESCRIPTION,
             arguments_model=StrReplaceEditorArguments,
         )
+
+    def narrow_schema(self, schema: dict, commands: list[str]) -> dict:
+        """The arguments no enabled command reads are dropped, and so is every description line,
+        or argument sentence, naming a command or argument gone."""
+        function = schema["function"]
+        properties = function["parameters"]["properties"]
+        kept = {"command", "path"}.union(*(COMMAND_ARGUMENTS[command] for command in commands))
+        gone = [name for name in [*COMMAND_ARGUMENTS, *properties] if name not in commands and name not in kept]
+        function["description"] = "\n".join(_without_mentions(function["description"].split("\n"), gone)).strip()
+        for name in [name for name in properties if name not in kept]:
+            del properties[name]
+        for prop in properties.values():
+            prop["description"] = " ".join(_without_mentions(re.split(r"(?<=\.) (?=[A-Z])", prop["description"]), gone))
+        properties["command"]["enum"] = list(commands)
+        properties["command"]["description"] = (
+            f"The commands to run. Allowed options are: {', '.join(f'`{command}`' for command in commands)}."
+        )
+        return schema
 
     def get_install_command(self) -> str:
         return "python -m pip install 'tree-sitter==0.21.3' || true && python -m pip install 'tree-sitter-languages' || true"

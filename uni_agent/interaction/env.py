@@ -4,7 +4,7 @@ from pathlib import Path, PurePath
 from typing import Literal
 
 import aiohttp
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from swerex.exceptions import (
     BashIncorrectSyntaxError,
     CommandTimeoutError,
@@ -26,6 +26,7 @@ from uni_agent.async_logging import get_logger
 from uni_agent.deployment import DeployConfig
 from uni_agent.skills.manager import SkillsManager
 from uni_agent.tools.base import AbstractTool
+from uni_agent.tools.registry import TOOL_REGISTRY
 from uni_agent.utils import auto_await
 
 # A program awaiting input never prints the shell's PS1, so interactive sends must also
@@ -144,6 +145,13 @@ class AgentEnvConfig(BaseModel):
     )
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("env_variables")
+    @classmethod
+    def _no_tool_commands(cls, env_variables: dict[str, str] | None) -> dict[str, str] | None:
+        if taken := sorted({tool.commands_env for tool in TOOL_REGISTRY.values()}.intersection(env_variables or {})):
+            raise ValueError(f"{taken} come from the tools config's `commands`, not env_variables")
+        return env_variables
+
 
 class AgentEnv:
     def __init__(
@@ -211,6 +219,8 @@ class AgentEnv:
         await self.communicate(f"export PATH={shlex.quote(install_dir.as_posix())}:$PATH", check="raise")
         for tool in tools:
             tool_name = tool.name
+            if tool.commands_env and tool.enabled_commands is not None:
+                await self.set_env_variables({tool.commands_env: ",".join(tool.enabled_commands)})
             if tool.copy_to_remote:
                 local_tool_path = tool.local_path
                 assert local_tool_path is not None and local_tool_path.is_file(), (

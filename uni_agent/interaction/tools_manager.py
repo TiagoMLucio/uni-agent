@@ -78,20 +78,38 @@ class ToolsManagerConfig(BaseModel):
 class ToolsManager:
     """Builds tool instances and OpenAI tool schemas from ToolsConfig."""
 
+    #: tool name -> the commands its config enables; a tool absent here takes any
+    enabled_commands: dict[str, list[str]] = {}
+
     def __init__(self, tools_manager_config: ToolsManagerConfig):
         self.tools_manager_config = tools_manager_config
         self.tools = [tc.get_tool() for tc in tools_manager_config.tools]
         self.tools_schemas = [
             self._schema(tool, tc) for tool, tc in zip(self.tools, tools_manager_config.tools, strict=True)
         ]
+        self.enabled_commands = {
+            tool.name: tool.enabled_commands for tool in self.tools if tool.enabled_commands is not None
+        }
         self._tool_parser = get_tool_parser(tools_manager_config.parser)
 
     @staticmethod
     def _schema(tool, tool_config: ToolConfig) -> dict:
         schema = tool.get_tool_schema()
+        if tool_config.commands is not None:
+            schema = tool.narrow_schema(schema, tool_config.commands)
         if tool_config.description is not None:
             schema["function"]["description"] = tool_config.description
         return schema
+
+    def _check_commands(self, tool_calls: list[OpenAIFunctionToolCall]) -> None:
+        for tool_call in tool_calls:
+            name = tool_call.function.name
+            command = tool_call.function.arguments.get("command")
+            if name in self.enabled_commands and command not in self.enabled_commands[name]:
+                raise FunctionCallFormatError(
+                    f"Invalid action: command '{command}' is not enabled for function '{name}'.\n"
+                    f"Allowed commands for function '{name}': {self.enabled_commands[name]}."
+                )
 
     def format_args_example(self, args: dict) -> str:
         """A literal tool-call arguments example in the configured call notation.
@@ -113,11 +131,12 @@ class ToolsManager:
         """Parse tool calls from raw text. Returns ``(content, tool_calls)``;
         ``tool_calls`` is ``[]`` when the text contains no tool-call
         marker (callers decide -- single-shot raises, chat_mode treats
-        as turn-end). Markers that ARE present but malformed raise
-        :class:`FunctionCallFormatError`.
+        as turn-end). Markers that ARE present but malformed, or a call to
+        a command the config does not enable, raise :class:`FunctionCallFormatError`.
         """
         tools = [OpenAIFunctionToolSchema(**schema) for schema in self.tools_schemas]
         content, tool_calls = self._tool_parser.extract_tool_calls(model_output, tools)
+        self._check_commands(tool_calls)
         return content, tool_calls
 
     async def parse_structured_action(
@@ -126,8 +145,8 @@ class ToolsManager:
         tool_calls_data: list[dict],
     ) -> tuple[str, list[OpenAIFunctionToolCall]]:
         """Parse OpenAI-style structured tool calls. May return an empty list
-        (callers decide); unknown names / invalid JSON args raise
-        :class:`FunctionCallFormatError`.
+        (callers decide); unknown names / invalid JSON args / a command the
+        config does not enable raise :class:`FunctionCallFormatError`.
         """
         tool_calls = []
         valid_names = {schema["function"]["name"] for schema in self.tools_schemas}
@@ -156,6 +175,7 @@ class ToolsManager:
                     function=function_call,
                 )
             )
+        self._check_commands(tool_calls)
         return content, tool_calls
 
     def get_tool_bash_command(self, tool_call: OpenAIFunctionToolCall) -> str:

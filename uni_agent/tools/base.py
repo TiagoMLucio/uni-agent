@@ -75,6 +75,15 @@ class AbstractTool(ABC):
     installed or checked.
     """
 
+    commands: tuple[str, ...] = ()
+    """Values of the tool's ``command`` argument that ``ToolConfig.commands`` may narrow to a subset."""
+
+    commands_env: str | None = None
+    """Session variable ``install_tools`` exports :attr:`enabled_commands` in, for the program to refuse the rest."""
+
+    enabled_commands: list[str] | None = None
+    """``ToolConfig.commands``, set by ``ToolConfig.get_tool``; None enables every command."""
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -95,6 +104,10 @@ class AbstractTool(ABC):
         OpenAI tool schema: { \"type\": \"function\", \"function\": { ... } }.
         """
         ...
+
+    def narrow_schema(self, schema: dict, commands: list[str]) -> dict:
+        """``schema`` offering only ``commands``, a subset of :attr:`commands`."""
+        raise NotImplementedError(f"tool {self.name} has no commands to narrow")
 
     def build_tool_schema(self, description: str, arguments_model: type[BaseModel]) -> dict:
         """Build an OpenAI-compatible tool schema from a Pydantic arguments model."""
