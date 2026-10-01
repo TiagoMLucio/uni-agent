@@ -733,12 +733,15 @@ class EditTool:
                 sys.exit()
 
         file_content = self.read_file(path)
+        note = ""
         if view_range:
             if len(view_range) != 2 or not all(isinstance(i, int) for i in view_range):
                 safe_print("Invalid `view_range`. It should be a list of two integers.")
                 sys.exit()
 
             file_lines = file_content.split("\n")
+            if file_content.endswith("\n"):
+                file_lines.pop()
             n_lines_file = len(file_lines)
             init_line, final_line = view_range
             if init_line < 1 or init_line > n_lines_file:
@@ -748,11 +751,11 @@ class EditTool:
                 )
                 sys.exit()
             if final_line > n_lines_file:
-                safe_print(
-                    f"Invalid `view_range`: {view_range}. "
-                    f"Its second element `{final_line}` should be smaller than the number of lines in the file: `{n_lines_file}`"
+                note = (
+                    f"<NOTE>The file ends at line {n_lines_file}, so `view_range` {view_range} "
+                    f"was clamped to {[init_line, n_lines_file]}.</NOTE>\n"
                 )
-                sys.exit()
+                final_line = n_lines_file
             if final_line != -1 and final_line < init_line:
                 safe_print(
                     f"Invalid `view_range`: {view_range}. "
@@ -790,9 +793,11 @@ class EditTool:
                     return
             # Else just show
             init_line = 1
+            if file_content.endswith("\n"):
+                file_content = file_content[:-1]
 
         # init_line is 1-based
-        safe_print(self._make_output(file_content, str(path), init_line=init_line))
+        safe_print(note + self._make_output(file_content, str(path), init_line=init_line))
 
     def create(self, path: Path, file_text: str):
         if not path.parent.exists():

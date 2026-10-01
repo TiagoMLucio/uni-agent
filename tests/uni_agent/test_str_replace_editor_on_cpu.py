@@ -488,3 +488,51 @@ def test_strip_fallback_still_applies_a_pure_slip(tmp_path):
     out = run_edit(f, "        def g(self):\n            return 1", "        def g(self):\n            return 2")
     assert "has been edited" in out
     assert f.read_text() == "class A:\n       def g(self):\n            return 2\n"
+
+
+def run_view(path: Path, view_range: str = "") -> str:
+    args = ["--view_range", view_range] if view_range else []
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "view", "--path", str(path), *args],
+        capture_output=True, text=True, timeout=30,
+    ).stdout
+
+
+def test_view_range_past_the_end_is_clamped_with_a_note(tmp_path):
+    f = write(tmp_path, "a\nb\nc\n")
+    out = run_view(f, "[2, 10]")
+    assert "Invalid" not in out
+    assert out.startswith("<NOTE>The file ends at line 3") and "clamped to [2, 3]" in out
+    assert "     2\tb" in out and "     3\tc" in out and "     4\t" not in out
+
+
+def test_view_range_in_range_has_no_note(tmp_path):
+    f = write(tmp_path, "a\nb\nc")
+    out = run_view(f, "[1, 3]")
+    assert "<NOTE>" not in out
+    assert "     3\tc" in out
+
+
+def test_view_range_trailing_newline_is_not_a_line(tmp_path):
+    f = write(tmp_path, "a\nb\nc\n")
+    out = run_view(f, "[1, -1]")
+    assert "<NOTE>" not in out and "     3\tc" in out and "     4\t" not in out
+    out = run_view(f, "[3, 3]")
+    assert "<NOTE>" not in out and "     3\tc" in out
+
+
+def test_view_range_start_past_the_end_still_errors(tmp_path):
+    f = write(tmp_path, "a\nb\nc\n")
+    out = run_view(f, "[4, 10]")
+    assert "Invalid `view_range`" in out and "[1, 3]" in out
+    assert "cat -n" not in out
+
+
+def test_full_view_trailing_newline_is_not_a_line(tmp_path):
+    f = write(tmp_path, "a\nb\nc\n")
+    assert run_view(f) == f"Here's the result of running `cat -n` on {f}:\n     1\ta\n     2\tb\n     3\tc\n\n"
+
+
+def test_full_view_without_a_final_newline_is_unchanged(tmp_path):
+    f = write(tmp_path, "a\nb\nc")
+    assert run_view(f) == f"Here's the result of running `cat -n` on {f}:\n     1\ta\n     2\tb\n     3\tc\n\n"
