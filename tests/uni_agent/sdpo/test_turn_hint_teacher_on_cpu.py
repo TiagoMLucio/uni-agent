@@ -224,7 +224,6 @@ def test_turn_hint_teacher_trajectory_metrics():
         "self_distillation/hint_position_mean": (0.0 + 0.5 + 1.0 + 0.0) / 4,
         "self_distillation/hint_position_median": 0.5,
         "self_distillation/hint_position_first_half": 3 / 4,
-        "self_distillation/hint_in_last_two_turns": 3 / 4,
     })
 
 
@@ -408,7 +407,6 @@ def test_trainer_turn_hints_batch_fields_and_metrics(monkeypatch):
         "self_distillation/hint_position_mean": 0.5,
         "self_distillation/hint_position_median": 1.0,
         "self_distillation/hint_position_first_half": 0.5,
-        "self_distillation/hint_in_last_two_turns": 1.0,
     }
     # the one trajectory with timings sets every mean, max and quantile
     total = TIMINGS["loop_wall"] + TIMINGS["env_setup"] + TIMINGS["reward_eval"] + TIMINGS["reflect"]
