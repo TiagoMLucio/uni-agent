@@ -593,3 +593,53 @@ def test_yield_note_quotes_a_literal_cancel_call():
     result = _run(AgentInteraction._execute_tool_call(it, tc))
     assert result.status == "yielded"
     assert '{"command": "C-c", "is_input": true}' in result.observation
+
+
+def test_an_empty_command_that_times_out_still_holds_the_session():
+    # an empty command that times out leaves "" attached, which still holds the session
+    import types as _t
+
+    from uni_agent.interaction.interaction import AgentInteraction
+
+    env = _env()
+    noop = lambda *a, **k: None  # noqa: E731
+    it = AgentInteraction.__new__(AgentInteraction)
+    it.env, it.logger = env, _t.SimpleNamespace(info=noop, error=noop, debug=noop)
+    it.action_timeout, it.yield_timeout = 30, 5
+    it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.max_observation_length = 100_000
+    actions: list = []
+    it.tools_manager = _t.SimpleNamespace(
+        get_tool_action=lambda _tc: actions.pop(0),
+        format_args_example=lambda args: str(args),
+    )
+    tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
+
+    def call(command: str, is_input: bool):
+        actions.append(_t.SimpleNamespace(command=command, is_input=is_input, timeout=None))
+        return _run(AgentInteraction._execute_tool_call(it, tc))
+
+    env.deployment.runtime.script = [_timeout()]
+    first = call("", False)
+    assert first.status == "yielded"
+    assert env.attached_command == ""
+    assert env.attached_seconds > 0
+    assert "used before it is cancelled" in first.observation
+
+    refused = call("ls", False)
+    assert refused.status == "syntax_error"
+    assert "is NOT executed" in refused.observation
+    assert "ls" not in env.deployment.runtime.sent
+
+    accrued = env.attached_seconds
+    env.deployment.runtime.script = [_timeout()]
+    poll = call("", True)
+    assert poll.status == "yielded"
+    assert env.attached_seconds > accrued
+
+    env.attached_seconds = it.attached_kill_timeout
+    env.deployment.runtime.script = [_timeout()]
+    killed = call("", True)
+    assert killed.status == "timeout"
+    assert it.timeout_budget == 0
+    assert env.attached_command is None

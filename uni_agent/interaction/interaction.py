@@ -522,7 +522,7 @@ class AgentInteraction:
         action_timeout = max(1, min(action_timeout, math.ceil(left)))
 
         attached = getattr(self.env, "attached_command", None)
-        if attached and not action.is_input:
+        if attached is not None and not action.is_input:
             cancel_example = self.tools_manager.format_args_example({"command": "C-c", "is_input": True})
             observation = (
                 f'Your command "{_clip(action.command)}" is NOT executed. The previous command '
@@ -538,7 +538,7 @@ class AgentInteraction:
                 tool_call_id=tool_call.id, name=tool_call.function.name, action=action.command,
                 observation=observation, status="syntax_error", execution_time=0.0,
             )
-        if action.is_input and not attached:
+        if action.is_input and attached is None:
             rerun_example = self.tools_manager.format_args_example(
                 {"command": action.command, "is_input": False}
             )
@@ -580,7 +580,7 @@ class AgentInteraction:
             status = "skipped"
             self.logger.error(observation)
         elapsed = time.perf_counter() - tool_t0
-        if getattr(self.env, "attached_command", None):
+        if getattr(self.env, "attached_command", None) is not None:
             self.env.attached_seconds += elapsed
             if self.env.attached_seconds >= self.attached_kill_timeout:
                 observation, status = await self._kill_attached(observation)
