@@ -96,8 +96,9 @@ class HostRuntime(AbstractRuntime):
             start_new_session=True,
         )
         # `set -m` enables job control; PS1/PS2/PROMPT_COMMAND are zeroed so
-        # nothing accidentally injects bytes between commands.
-        setup = "set -m\nexport PS1='' PS2='' PROMPT_COMMAND=''\n"
+        # nothing accidentally injects bytes between commands. Untrapped, a
+        # foreground job dying of SIGINT makes this (non-interactive) bash exit too.
+        setup = "set -m\ntrap : INT\nexport PS1='' PS2='' PROMPT_COMMAND=''\n"
         self._process.stdin.write(setup.encode())
         await self._process.stdin.drain()
         marker = f"__UNIAGENT_READY_{uuid.uuid4().hex[:12]}__"
