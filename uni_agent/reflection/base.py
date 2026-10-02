@@ -176,6 +176,25 @@ class AbstractReflector(ABC):
                         # agent's budget while a reflector prompt is the whole trajectory at once, so its
                         # prefill is what sets the peak activation the rollout engine has to fit
                         prompt_tokens = len(cache.get("prompt_ids") or ())
+                        # Account for the entire prompt with the serving tokenizer. Reduce only
+                        # complete structured feedback records, with explicit omission counts.
+                        if limit and prompt_tokens + max_tokens > limit:
+                            from uni_agent.reward.diagnostic_feedback import feedback_span, fit_message_feedback
+
+                            rendered = messages[-1].get("content", "")
+                            span = feedback_span(rendered)
+                            if span:
+                                size = span[1] - span[0]
+                                while prompt_tokens + max_tokens > limit and size > 1024:
+                                    size = max(1024, size * 3 // 4)
+                                    fitted = fit_message_feedback(messages, size)
+                                    if fitted == messages:
+                                        break  # mandatory index requires trajectory shrink instead
+                                    messages = fitted
+                                    cache = await self.model.prepare_rollout_cache(
+                                        messages, include_tools=False, chat_template_kwargs=cfg.chat_template_kwargs
+                                    )
+                                    prompt_tokens = len(cache.get("prompt_ids") or ())
                         # a prompt that fits but leaves less than the reply's room is over budget too:
                         # the staged reply cannot close, and the same prefill would be paid again
                         if limit and prompt_tokens + max_tokens > limit:
@@ -410,5 +429,3 @@ class AbstractReflector(ABC):
             if digits and isinstance(value, str) and value.strip():
                 hints[int(digits)] = value.strip()
         return hints
-
-

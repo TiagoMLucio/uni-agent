@@ -240,6 +240,8 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         output = ""
         eval_env = self.env
         sibling = None
+        capture_path = None
+        diagnostics = None
         try:
             if result.get("eval_error"):
                 raise RuntimeError(result["eval_error"])
@@ -249,6 +251,20 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     sibling = await self._start_sibling_env(env_config)
                     eval_env = sibling
 
+                if self.feedback.enabled and self.feedback.format == "diagnostic" and "pytest" in test_command:
+                    from uni_agent.reward.feedback_capture import install_capture
+
+                    try:
+                        capture_path, observer_lines = await install_capture(
+                            eval_env, {"student_patch": patch or "", "reference_patch": instance.get("patch", ""),
+                                       "reference_is_bug": True, "restored_test_files": test_files,
+                                       "dropped_student_files": drop_files}, self.feedback.value_chars,
+                        )
+                        script_lines = ["#!/bin/bash", "set -uo pipefail", *observer_lines, *eval_script_list]
+                        eval_script = "\n".join(script_lines) + "\n"
+                    except Exception as exc:
+                        diagnostics = {"events": [], "complete": False,
+                                       "errors": [f"Test observer could not be installed: {type(exc).__name__}: {exc}"]}
                 eval_script_container = Path(f"/tmp/eval_script_{uuid.uuid4()}.sh")
                 await eval_env.write_file(eval_script_container, eval_script)
                 if env_span is not None:
@@ -291,6 +307,10 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             result["eval_completed"] = False
             result["eval_error"] = f"{type(e).__name__}: {e}"
         finally:
+            if capture_path is not None:
+                from uni_agent.reward.feedback_capture import read_capture
+
+                diagnostics = await read_capture(eval_env, capture_path)
             if sibling is not None:
                 try:
                     await sibling.close()
@@ -310,6 +330,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
                     patch=patch,
                     instance_id=instance_id,
                     seed=_feedback_seed(instance_id, kwargs.get("interaction_result")),
+                    diagnostics=diagnostics,
                 )
                 if feedback_span is not None:
                     feedback_span.update(output=trace_clip(extra_info["feedback"], TRACE_FEEDBACK_CHARS))

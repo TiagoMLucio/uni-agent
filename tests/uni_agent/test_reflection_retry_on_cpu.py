@@ -243,6 +243,36 @@ def test_a_reply_unusable_after_every_redraw_is_empty_not_failed():
     assert hints == {} and calls == 2
 
 
+def test_diagnostic_feedback_fits_whole_prompt_and_preserves_complete_case_records():
+    from uni_agent.reward.diagnostic_feedback import render_diagnostic
+
+    events = [{"nodeid": f"test_{i}", "phase": "call", "outcome": "failed",
+               "text": "E ValueError: " + str(i) + "x" * 1800} for i in range(12)]
+    result = {"eval_completed": True, "eval_report": {"test_status": {
+        "FAIL_TO_PASS": {"failure": [e["nodeid"] for e in events], "success": []},
+        "PASS_TO_PASS": {"failure": [], "success": []},
+    }}}
+    feedback = render_diagnostic(result, {"events": events, "complete": True})
+    class BudgetModel(SizedModel):
+        async def prepare_rollout_cache(self, messages, **kwargs):
+            self.messages = messages
+            return await super().prepare_rollout_cache(messages, **kwargs)
+
+    model = BudgetModel([GOOD], 3500)
+    r = PipelineReflector(model, PipelineReflector.Config(
+        name="pipeline", max_model_len=3500, max_output_tokens=256, shrink_ladder=[],
+        calls=[{"id": "test", "per": "trace", "parse": "hints", "system": "emit hints",
+                "user": "{task}\n{turns}\n{feedback}"}],
+    ))
+    hints = asyncio.run(r.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback=feedback))
+    assert hints == {1: "look at the parser in foo.py before editing it"}
+    assert len(model.queries) == 1 and model.queries[0][0] + 256 <= 3500
+    shown = model.messages[-1]["content"]
+    assert all(f"test_{i} (target test)" in shown for i in range(12))
+    assert "details omitted" in shown
+    assert "[Diagnostic test feedback ends]" in shown
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
