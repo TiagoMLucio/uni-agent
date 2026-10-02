@@ -191,6 +191,23 @@ def _new_sources():
     return out
 
 
+def _lift_truncation(config):
+    """Before pytest 8, verbosity 2 also appends `<- defining file` to imported tests' progress lines,
+    which the official parser then misses; lift only the truncation, for this evaluation's tests."""
+    try:
+        from _pytest.assertion import truncate
+    except ImportError:
+        truncate = None
+    should_truncate = getattr(truncate, "_should_truncate_item", None)
+    if should_truncate is None:
+        _emit(
+            capture_error="Pytest's assertion truncation could not be lifted; "
+            "some assertion details may be shortened."
+        )
+        return
+    truncate._should_truncate_item = lambda item: item.config is not config and should_truncate(item)
+
+
 def pytest_configure(config):
     global _ROOT, _FILE, _VALUE_CHARS, _ACTIVE_CONFIG
     config_root = Path(str(getattr(config, "rootpath", getattr(config, "rootdir", Path.cwd())))).resolve()
@@ -215,7 +232,7 @@ def pytest_configure(config):
             config.getini("verbosity_assertions")
             config._inicache["verbosity_assertions"] = 2
         except ValueError:
-            config.option.verbose = max(2, config.option.verbose)
+            _lift_truncation(config)
         config.option.tbstyle = "long"
     else:
         _emit(

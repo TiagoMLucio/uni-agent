@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,68 @@ def test_nested_pytest_runs_keep_their_configuration_and_do_not_mix_reports(capt
     parent = [e for e in captured["events"] if e["nodeid"] == "test_cases.py::test_nested" and e["phase"] == "call"]
     assert parent[0]["outcome"] == "passed"
     assert not any("test_inner.py" in e["nodeid"] for e in captured["events"])
+
+
+def test_old_pytest_keeps_the_progress_lines_the_official_parser_reads(tmp_path):
+    (tmp_path / "shared_cases.py").write_text("def test_imported():\n    pass\n")
+    (tmp_path / "test_cases.py").write_text("from shared_cases import test_imported\n")
+    # pytest before 8: no assertion-only verbosity
+    (tmp_path / "old_pytest.py").write_text(
+        "import pytest\n\n"
+        "@pytest.hookimpl(tryfirst=True)\n"
+        "def pytest_configure(config):\n"
+        "    config._parser._inidict.pop('verbosity_assertions', None)\n"
+        "    config._inicache.pop('verbosity_assertions', None)\n"
+    )
+    plugin = Path(__file__).resolve().parents[3] / "uni_agent/reward/pytest_feedback_capture.py"
+    (tmp_path / "capture_plugin.py").write_text(plugin.read_text())
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(tmp_path),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "UNI_AGENT_FEEDBACK_PATH": str(tmp_path / "events.jsonl"),
+        "UNI_AGENT_FEEDBACK_ROOT": str(tmp_path),
+    }
+    env.pop("PYTEST_ADDOPTS", None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-v", "--color=no", "-p", "old_pytest", "-p", "capture_plugin",
+         "-p", "no:cacheprovider", "test_cases.py"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "test_cases.py::test_imported PASSED" in proc.stdout
+
+
+def test_old_pytest_lifts_truncation_for_the_evaluation_only(tmp_path, monkeypatch):
+    from _pytest.assertion import truncate
+
+    from uni_agent.reward import pytest_feedback_capture as plugin
+
+    class Config:
+        rootpath = tmp_path
+
+        def __init__(self):
+            self.option = types.SimpleNamespace(verbose=1, tbstyle="auto")
+
+        def getini(self, name):
+            raise ValueError(name)
+
+    monkeypatch.setattr(truncate, "_should_truncate_item", lambda item: True, raising=False)
+    for name in ("_ACTIVE_CONFIG", "_ROOT", "_FILE", "_VALUE_CHARS"):
+        monkeypatch.setattr(plugin, name, getattr(plugin, name))
+    monkeypatch.setattr(plugin, "_ACTIVE_CONFIG", None)
+    monkeypatch.setenv("UNI_AGENT_FEEDBACK_ROOT", str(tmp_path))
+    monkeypatch.delenv("UNI_AGENT_FEEDBACK_PATH", raising=False)
+    monkeypatch.delenv("UNI_AGENT_FEEDBACK_CONTEXT", raising=False)
+    config = Config()
+    plugin.pytest_configure(config)
+    assert config.option.verbose == 1 and config.option.tbstyle == "long"
+    assert not truncate._should_truncate_item(types.SimpleNamespace(config=config))
+    assert truncate._should_truncate_item(types.SimpleNamespace(config=Config()))
 
 
 def test_junit_preserves_duplicate_phase_records_complex_ids_and_captures():
