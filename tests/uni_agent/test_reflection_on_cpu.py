@@ -166,7 +166,7 @@ def test_shrink_ladder_is_configurable_and_starts_uncapped():
     cfg = _config(enabled=True, max_observation_chars=50, shrink_ladder=[(10, None)])
     assert cfg.shrink_ladder == [(10, None)]
     # floors: tool outputs first, then the responses
-    assert _config().shrink_ladder == [(10_000, None), (10_000, 3_800)]
+    assert _config().shrink_ladder == [(3_800, None), (3_800, 3_800)]
 
 
 def test_an_unknown_key_is_rejected():

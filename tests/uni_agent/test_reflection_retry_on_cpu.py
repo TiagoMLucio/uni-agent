@@ -160,7 +160,7 @@ def test_a_prompt_without_reply_room_is_over_budget():
     r = PipelineReflector(model, config(max_model_len=262144, max_observation_chars=1_000_000,
                                        max_output_tokens=16384, redraws_per_rung=1))
     with pytest.raises(ReflectionFailed, match="over budget at every shrink level"):
-        asyncio.run(r.reflect_trajectory(task="t", turns=turns_with_observations(100, 100_000),
+        asyncio.run(r.reflect_trajectory(task="t", turns=turns_with_observations(250, 100_000),
                                          gold="g", feedback="f"))
     assert r.call_metrics()["reflect_over_budget"] == 3 and r.call_metrics()["reflect_calls"] == 0
     assert model.queries == [], "every step leaves under 16384 tokens of room"

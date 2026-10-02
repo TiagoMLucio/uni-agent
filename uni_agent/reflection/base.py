@@ -103,7 +103,7 @@ class BaseReflectionConfig(BaseModel):
     # largest go first. Tool outputs give way before the agent's responses, which hold the
     # decisions the hints are about. Over the overflows measured, cutting the largest outputs
     # alone fit every one, at 70k-600k chars, without hiding a sighting of the defect.
-    shrink_ladder: list[tuple[int | None, int | None]] = [(10_000, None), (10_000, 3_800)]
+    shrink_ladder: list[tuple[int | None, int | None]] = [(3_800, None), (3_800, 3_800)]
     #: extra draws on the same rung when a reply is unusable, before the render shrinks
     redraws_per_rung: int = Field(default=1, ge=0)
 
