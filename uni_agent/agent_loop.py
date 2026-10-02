@@ -370,7 +370,7 @@ class UniAgentLoop(AgentLoopBase):
                 )
                 interaction_result["metrics"]["reflect"] = time.perf_counter() - reflect_t0
                 self._record_trace_outcome(interaction_result)
-                self._save_interaction_result(interaction_result)
+                await self._dump_interaction_result(interaction_result)
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
                 exit_reason = "setup_timeout" if not setup_done and isinstance(e, TimeoutError) else "agent_loop_failed"
@@ -730,6 +730,14 @@ class UniAgentLoop(AgentLoopBase):
         # the diff goes in the output only: metadata stays scalar so it remains filterable
         output = dict(outcome, patch=trace_clip(patch, TRACE_PATCH_CHARS)) if patch else outcome
         rollout_trace_update_trace(output=output, metadata={"outcome": outcome})
+
+    async def _dump_interaction_result(self, interaction_result: dict) -> None:
+        """Best effort, off the event loop: a slow or failing write on the shared filesystem
+        must neither stall the other rollouts nor turn a scored one into a failed row."""
+        try:
+            await asyncio.to_thread(self._save_interaction_result, interaction_result)
+        except Exception as e:
+            self.logger.error(f"Rollout dump not written to {self.output_dir}: {e!r}")
 
     def _save_interaction_result(self, interaction_result: dict):
         self.output_dir.mkdir(parents=True, exist_ok=True)
