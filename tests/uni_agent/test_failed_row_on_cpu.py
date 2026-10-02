@@ -92,6 +92,9 @@ def test_a_config_that_will_not_build_is_a_build_failed_row(tmp_path, monkeypatc
     assert row.extra_fields["traj_exit_reason"] == "build_failed"
     assert row.prompt_ids == [7] and row.response_ids == [7]
     _assert_masked(row)
+    # and it still says why the rollout failed, not only that its row could not be built
+    assert row.extra_fields["failed_exit_reason"] == "agent_loop_failed"
+    assert "Unknown top-level agent config key(s): envv" in row.extra_fields["failure"]
 
 
 def test_a_prompt_the_row_cannot_fill_is_a_masked_row(tmp_path, monkeypatch):
@@ -145,3 +148,27 @@ def test_the_floor_row_keeps_the_columns_every_row_carries(emit_feedback):
     assert row.extra_fields["timings"] == {"agent/setup_attempts": 2.0, "agent/setup_retried": 1.0}
     assert row.extra_fields["turn_spans"] == [] and row.extra_fields["turn_hints"] == []
     assert ("reward_extra_info" in row.extra_fields) is emit_feedback
+
+
+def test_the_floor_row_keeps_the_reason_it_replaced(monkeypatch):
+    traced = []
+    monkeypatch.setattr(agent_loop_module, "rollout_trace_update_trace", lambda **kw: traced.append(kw))
+    loop = UniAgentLoop.__new__(UniAgentLoop)
+    loop.tokenizer = types.SimpleNamespace(pad_token_id=7, eos_token_id=9)
+    loop.logger = types.SimpleNamespace(critical=lambda _m: None)
+    loop.setup_attempts = 3
+
+    async def broken(**_kwargs):
+        raise RuntimeError("the chat template would not render")
+
+    loop._build_empty_agent_output = broken
+    row = asyncio.run(loop._failed_output("setup_timeout", TimeoutError("env.start took 90s")))
+    assert row.extra_fields["traj_exit_reason"] == "build_failed"
+    assert row.extra_fields["failed_exit_reason"] == "setup_timeout"
+    assert row.extra_fields["failure"] == repr(TimeoutError("env.start took 90s"))
+    # the trace's last word is the row that shipped, with the cause beside it
+    assert traced[-1]["output"] == {
+        "termination": "build_failed",
+        "failed_exit_reason": "setup_timeout",
+        "failure": repr(TimeoutError("env.start took 90s")),
+    }

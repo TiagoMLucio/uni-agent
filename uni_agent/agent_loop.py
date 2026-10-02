@@ -527,12 +527,20 @@ class UniAgentLoop(AgentLoopBase):
             return await self._build_empty_agent_output(exit_reason=exit_reason, metrics=metrics)
         except Exception as e:
             self.logger.critical(f"Could not build the dummy row for {exit_reason}; shipping build_failed: {e!r}")
-            return self._minimal_failed_output(metrics)
+            cause = {"failed_exit_reason": exit_reason, "failure": repr(error) if error is not None else None}
+            outcome = {"termination": "build_failed", **cause}
+            rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
+            return self._minimal_failed_output(metrics, cause)
 
-    def _minimal_failed_output(self, metrics: dict) -> AgentLoopOutput:
-        """One masked dummy token for prompt and response, built from nothing a rollout sets."""
+    def _minimal_failed_output(self, metrics: dict, cause: dict | None = None) -> AgentLoopOutput:
+        """One masked dummy token for prompt and response, built from nothing a rollout sets.
+
+        ``cause`` is why the rollout failed in the first place, which ``build_failed`` would
+        otherwise overwrite everywhere but the worker log.
+        """
         token_id = _dummy_token_id(self.tokenizer)
         extra_fields = {
+            **(cause or {}),
             "traj_exit_reason": "build_failed",
             "timings": dict(metrics),
             "turn_spans": [],
