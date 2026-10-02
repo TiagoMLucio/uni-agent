@@ -10,6 +10,7 @@ REFLECTOR_REGISTRY: dict[str, type[AbstractReflector]] = {}
 
 REFLECTOR_MODULES: dict[str, str] = {
     "pipeline": "uni_agent.reflection.pipeline",
+    "openai": "uni_agent.reflection.api",
 }
 
 

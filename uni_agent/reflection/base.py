@@ -264,7 +264,8 @@ class AbstractReflector(ABC):
         from (0 is the full view, and under overflow-only shrinking only overflow raises it)."""
         return {key: float(self._counts[key]) for key in CALL_METRICS}
 
-    async def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error="", draw=0):
+    async def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error="", draw=0,
+                      extra=None):
         """Tally one call, and append it to the rollout's reflection log if the loop asked for one.
 
         What each stage was shown and answered is not recoverable from anything else the
@@ -296,6 +297,7 @@ class AbstractReflector(ABC):
                     "user": messages[1]["content"],
                     "output": text,
                     "error": error,
+                    **(extra or {}),
                 }
                 await asyncio.to_thread(self._append_record, self._record_path, row)
             except Exception as exc:

@@ -1,0 +1,205 @@
+"""The hosted reflector: its best turns in the model's order, token use counted, the render measured with
+the policy's tokenizer and cut down the shared ladder, the feedback never cut, and hints citing names the
+agent never saw logged, not dropped."""
+
+import asyncio
+import json
+import sys
+import types
+
+from uni_agent.reflection.api import ApiReflector, unseen_names
+
+TURNS = [
+    {"step": 0, "response": "Let me look.\n<tool_call>\n<function=execute_bash>\n<parameter=command>\ncat a.py\n"
+                            "</parameter>\n</function>\n</tool_call>", "tools": [{"observation": "def parse_row(x): ..."}]},
+    {"step": 1, "response": "parse_row looks fine.", "tools": [{"observation": "ok"}]},
+    {"step": 2, "response": "Done.", "tools": []},
+]
+TASK = "preamble <issue_description>\nrows are dropped\n</issue_description> postscript"
+
+
+class Policy:
+    """The policy's client as the reflector measures with it: a token per four characters."""
+
+    def __init__(self, max_model_len=None):
+        self.max_model_len = max_model_len
+
+    async def prepare_rollout_cache(self, messages, include_tools=False, chat_template_kwargs=None):
+        return {"prompt_ids": [0] * (sum(len(m["content"]) for m in messages) // 4)}
+
+
+def answer(*top):
+    return json.dumps({"problems": [{"id": "P1", "where": "a.py", "why": "w", "timeline": []}], "turns": [],
+                       "top": [{"turn": t, "problem": "P1", "hint": h, "why": "y"} for t, h in top]})
+
+
+class BadRequestError(Exception):
+    pass
+
+
+class RateLimitError(Exception):
+    pass
+
+
+seen_clients = []
+
+
+def fake_openai(replies, seen):
+    class Responses:
+        async def create(self, **kwargs):
+            seen.append(kwargs)
+            reply = replies[min(len(seen) - 1, len(replies) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            usage = types.SimpleNamespace(
+                input_tokens=100, output_tokens=40,
+                input_tokens_details=types.SimpleNamespace(cached_tokens=10),
+                output_tokens_details=types.SimpleNamespace(reasoning_tokens=30))
+            return types.SimpleNamespace(output_text=reply, usage=usage, status="completed")
+
+    class Completions:
+        async def create(self, **kwargs):
+            seen.append(kwargs)
+            reply = replies[min(len(seen) - 1, len(replies) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            usage = types.SimpleNamespace(prompt_tokens=200, completion_tokens=80, prompt_tokens_details=None,
+                                          completion_tokens_details=None)
+            choice = types.SimpleNamespace(message=types.SimpleNamespace(content=reply), finish_reason="stop")
+            return types.SimpleNamespace(choices=[choice], usage=usage)
+
+    class AsyncOpenAI:
+        def __init__(self, **kwargs):
+            seen_clients.append(kwargs)
+            self.responses = Responses()
+            self.chat = types.SimpleNamespace(completions=Completions())
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    return types.SimpleNamespace(AsyncOpenAI=AsyncOpenAI, BadRequestError=BadRequestError, RateLimitError=RateLimitError)
+
+
+def reflect(monkeypatch, replies, turns=TURNS, feedback="1 failed", agent_patch="diff --git a/a.py b/a.py\n+y",
+            policy=None, **over):
+    seen = []
+    monkeypatch.setitem(sys.modules, "openai", fake_openai(replies, seen))
+    cfg = ApiReflector.Config(
+        name="openai", model="gpt-6-luna", enabled=True,
+        calls=[{"id": "luna", "system": "sys", "parse": "hints",
+                "user": "{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}],
+        **over)
+    r = ApiReflector(policy or Policy(), cfg)
+    hints = asyncio.run(r.reflect_trajectory(task=TASK, turns=turns, gold="diff --git a/a.py b/a.py\n+x",
+                                             feedback=feedback, agent_patch=agent_patch))
+    return hints, seen, r
+
+
+def test_best_turn_first_and_render(monkeypatch):
+    hints, seen, r = reflect(monkeypatch, [answer((2, "later"), (1, "check `parse_row`"))], max_selected_turns=1)
+    assert hints == {2: "later"}
+    user = seen[0]["input"]
+    assert user.startswith("rows are dropped|0-2|")
+    assert '<turn n="1">\n<tool_output>\ndef parse_row(x): ...\n</tool_output>' in user
+    assert "<agent_called>\nbash\n$ cat a.py\n</agent_called>" in user
+    assert seen[0]["model"] == "gpt-6-luna" and seen[0]["reasoning"] == {"effort": "high"}
+    metrics = r.call_metrics()
+    assert metrics["reflect_input_tokens"] == 100 and metrics["reflect_reasoning_tokens"] == 30
+
+
+def test_attempt_patch_lists_created_files(monkeypatch):
+    patch = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+             "diff --git a/reproduce.py b/reproduce.py\nnew file mode 100644\n--- /dev/null\n+++ b/reproduce.py\n"
+             "@@ -0,0 +1,2 @@\n+import a\n+print(a)\n")
+    _, seen, _ = reflect(monkeypatch, [answer((1, "ok"))], agent_patch=patch)
+    user = seen[0]["input"]
+    assert "+++ b/a.py" in user and "Files the attempt created, not shown:\n- reproduce.py (2 lines)" in user
+    assert "print(a)" not in user
+    _, seen, _ = reflect(monkeypatch, [answer((1, "ok"))], agent_patch="")
+    assert "(empty: no change was extracted from the attempt)" in seen[0]["input"]
+
+
+def test_overflow_cuts_the_largest_outputs_and_never_the_feedback(monkeypatch):
+    turns = [{**TURNS[0], "tools": [{"observation": "head " + "o" * 40_000 + " tail"}]}, *TURNS[1:]]
+    feedback = "".join(f"test_{i} failed: ValueError {i}\n" for i in range(300))
+    hints, seen, r = reflect(monkeypatch, [answer((1, "ok"))], turns=turns, feedback=feedback,
+                             policy=Policy(max_model_len=10_000), max_output_tokens=2_000,
+                             max_observation_chars=100_000)
+    assert hints == {1: "ok"} and len(seen) == 1
+    user = seen[0]["input"]
+    assert feedback.strip() in user and "chars elided" in user and "head " in user and " tail" in user
+    assert len(user) // 4 + 2_000 <= 10_000 and len(user) // 4 + 2_000 > 9_000
+    assert r.call_metrics()["reflect_over_budget"] == 1 and r.call_metrics()["reflect_rung"] == 1
+
+
+def test_feedback_alone_over_budget_skips_without_a_call(monkeypatch):
+    hints, seen, r = reflect(monkeypatch, [answer((1, "ok"))], feedback="f" * 50_000,
+                             policy=Policy(max_model_len=10_000), max_output_tokens=2_000)
+    assert hints == {} and seen == []
+    assert r.call_metrics()["reflect_over_budget"] == 2
+
+
+def test_context_error_moves_to_the_next_step(monkeypatch):
+    replies = [BadRequestError("context_length_exceeded"), answer((1, "ok"))]
+    hints, seen, r = reflect(monkeypatch, replies, max_observation_chars=10**6)
+    assert hints == {1: "ok"} and len(seen) == 2
+    assert r.call_metrics()["reflect_over_budget"] == 1
+
+
+def test_response_cut_keeps_the_agents_words():
+    cfg = ApiReflector.Config(name="openai", model="gpt-6-luna",
+                              calls=[{"id": "luna", "system": "sys", "parse": "hints", "user": "{turns}"}])
+    response = ("<think>" + "t" * 5_000 + "</think>I will write the module.\n<tool_call>\n"
+                "<function=str_replace_editor>\n<parameter=command>\ncreate\n</parameter>\n<parameter=path>\n"
+                "/testbed/a.py\n</parameter>\n<parameter=file_text>\n" + "y" * 10_000 + "\n</parameter>\n"
+                "</function>\n</tool_call>")
+    out = ApiReflector(Policy(), cfg)._render_attempt([{"step": 0, "response": response, "tools": []}], None, 3_800)
+    assert "I will write the module." in out and "t" * 100 not in out
+    assert "str_replace_editor create /testbed/a.py\n<file_text>" in out and "chars elided" in out
+    assert len(out) < 3_800
+
+
+def test_chat_completions_endpoint(monkeypatch):
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "k")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "ok"))], base_url="https://api.deepinfra.com/v1/openai",
+                             api_key_env="DEEPINFRA_API_KEY", sampling={"temperature": 1.0, "top_p": 0.95})
+    assert hints == {1: "ok"}
+    assert seen_clients[-1]["base_url"] == "https://api.deepinfra.com/v1/openai" and seen_clients[-1]["api_key"] == "k"
+    req = seen[0]
+    assert req["messages"][0] == {"role": "system", "content": "sys"} and req["response_format"] == {"type": "json_object"}
+    assert req["extra_body"] == {"reasoning_effort": "high"} and req["temperature"] == 1.0 and req["top_p"] == 0.95
+    assert r.call_metrics()["reflect_input_tokens"] == 200 and r.call_metrics()["reflect_output_tokens"] == 80
+
+
+def test_invalid_turns_skipped_and_unusable_redrawn(monkeypatch):
+    hints, seen, _ = reflect(monkeypatch, ["not json", answer((9, "no such turn"), (1, "ok"))], max_selected_turns=1)
+    assert hints == {1: "ok"} and len(seen) == 2
+
+
+def test_rate_limit_waited_out(monkeypatch):
+    from uni_agent.reflection import api
+    monkeypatch.setattr(api.random, "uniform", lambda a, b: 0.0)
+    replies = [RateLimitError("Rate limit reached ... Please try again in 10ms."), answer((1, "ok"))]
+    hints, seen, r = reflect(monkeypatch, replies)
+    assert hints == {1: "ok"} and len(seen) == 2
+    assert r.call_metrics()["reflect_rate_limited"] == 1 and r.call_metrics()["reflect_calls"] == 1
+
+
+def test_other_errors_give_no_hints(monkeypatch):
+    hints, seen, r = reflect(monkeypatch, [RuntimeError("401")])
+    assert hints == {} and len(seen) == 1
+
+
+def test_leaks_logged_not_dropped(monkeypatch):
+    hints, _, r = reflect(monkeypatch, [answer((1, "raise `SystemExit` in parse_row"))])
+    assert hints == {1: "raise `SystemExit` in parse_row"}
+    assert r.call_metrics()["reflect_leaky_hints"] == 1
+
+
+def test_unseen_names():
+    seen = "class DotEnv:\n    def get(self): ...\nparse_row"
+    assert unseen_names("use `DotEnv.get()` in parse_row", seen) == []
+    assert unseen_names("raise `SystemExit` from `load_config`", seen) == ["SystemExit", "load_config"]
