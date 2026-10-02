@@ -440,6 +440,61 @@ def test_a_pipeline_records_each_stage_separately(tmp_path):
     assert rows[0]["user"].startswith("t\nG\n") and rows[1]["output"] == "FINAL_HINTS_JSON:\nDELETE"
 
 
+def test_the_record_is_written_off_the_event_loop(tmp_path, monkeypatch):
+    """A stalled write on the shared filesystem would otherwise hold every rollout of the worker."""
+    import threading
+
+    from uni_agent.reflection.base import AbstractReflector
+
+    writers = []
+    append = AbstractReflector._append_record
+
+    def recording_append(path, row):
+        writers.append(threading.current_thread() is threading.main_thread())
+        append(path, row)
+
+    monkeypatch.setattr(AbstractReflector, "_append_record", staticmethod(recording_append))
+    path = tmp_path / "reflection.jsonl.gz"
+    reflector = PipelineReflector(_Model(), _config(enabled=True), record_path=path)
+    asyncio.run(reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f"))
+    assert writers == [False]
+    assert len(list(gzip.open(path, "rt"))) == 1
+
+
+def test_concurrent_per_turn_records_are_whole_lines(tmp_path, monkeypatch):
+    """A per-turn stage's calls run at once; their appends are serialised, never interleaved."""
+    import time
+
+    from uni_agent.reflection.base import AbstractReflector
+
+    append = AbstractReflector._append_record
+    in_flight, overlaps = [], []
+
+    def slow_append(path, row):
+        in_flight.append(row["step"])
+        overlaps.append(len(in_flight))
+        # long enough that an unserialised second append would land inside this one
+        time.sleep(0.05)
+        append(path, row)
+        in_flight.remove(row["step"])
+
+    monkeypatch.setattr(AbstractReflector, "_append_record", staticmethod(slow_append))
+    path = tmp_path / "reflection.jsonl.gz"
+    model = _ScriptedModel({
+        "DRAFT": 'FINAL_HINTS_JSON:\n{"turn1": "open parser.py", "turn4": "run the repro"}',
+        "REPAIR": "FINAL_HINTS_JSON:\nDELETE",
+    })
+    reflector = PipelineReflector(
+        model, PipelineReflectionConfig(enabled=True, name="pipeline", calls=[DRAFT, REPAIR],
+                                        **_given([DRAFT, REPAIR])),
+        record_path=path)
+    asyncio.run(reflector.reflect_trajectory(task="t", turns=PIPE_TURNS, gold="G", feedback="f"))
+    rows = [json.loads(line) for line in gzip.open(path, "rt")]
+    assert [r["stage"] for r in rows] == ["draft", "repair", "repair"]
+    assert sorted(r["step"] for r in rows[1:]) == [1, 4]
+    assert max(overlaps) == 1, "two appends to the same gzip file ran at once"
+
+
 def test_the_shrink_ladder_still_retries_through_the_trace_span(tmp_path):
     """The ladder depends on MaxTokenExceededError escaping the span wrapping each call."""
     path = tmp_path / "reflection.jsonl.gz"

@@ -7,6 +7,7 @@ hint per selected turn. Hints condition the distillation teacher and are never a
 target. Guidance only: the prompt forbids revealing the fix itself.
 """
 
+import asyncio
 import gzip
 import json
 import re
@@ -123,6 +124,8 @@ class AbstractReflector(ABC):
         self.config = config
         self.logger = get_logger("reflection", run_id=run_id)
         self._record_path = Path(record_path) if record_path else None
+        # a pipeline stage's per-turn calls run concurrently and append to the same file
+        self._record_lock = asyncio.Lock()
         self.identity = {k: v for k, v in (identity or {}).items()
                          if k in ("uid", "instance_id", "run_id")}
         # the agent loop builds one reflector per rollout, so these count the trajectory in flight
@@ -189,7 +192,7 @@ class AbstractReflector(ABC):
                         )
                     self.logger.info(f"Reflection call ok: prompt_tokens={prompt_tokens} "
                                      f"obs_cap={obs_cap} resp_cap={resp_cap} out={len(text or '')}c")
-                    self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, draw=draw)
+                    await self._record(stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, draw=draw)
                     if accept is None or accept(text):
                         self._counts["reflect_rung"] = max(self._counts["reflect_rung"], rung)
                         return text
@@ -198,14 +201,14 @@ class AbstractReflector(ABC):
                                      f"obs_cap={obs_cap})")
                 except MaxTokenExceededError as exc:
                     self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
-                    self._record(stage, step, messages, None, None, obs_cap, resp_cap,
-                                 error=OVER_BUDGET, draw=draw)
+                    await self._record(stage, step, messages, None, None, obs_cap, resp_cap,
+                                       error=OVER_BUDGET, draw=draw)
                     # deterministic at this rung: the redraws would render the same prompt
                     break
                 except Exception as exc:
                     self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
-                    self._record(stage, step, messages, None, None, obs_cap, resp_cap,
-                                 error=repr(exc), draw=draw)
+                    await self._record(stage, step, messages, None, None, obs_cap, resp_cap,
+                                       error=repr(exc), draw=draw)
                     raise ReflectionFailed(f"{stage or 'call'} failed: {exc!r}") from exc
             else:
                 # the ladder is there for a render that does not fit; a reply the parser could not
@@ -225,12 +228,13 @@ class AbstractReflector(ABC):
         from (0 is the full view, and under overflow-only shrinking only overflow raises it)."""
         return {key: float(self._counts[key]) for key in CALL_METRICS}
 
-    def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error="", draw=0):
+    async def _record(self, stage, step, messages, text, prompt_tokens, obs_cap, resp_cap, error="", draw=0):
         """Tally one call, and append it to the rollout's reflection log if the loop asked for one.
 
         What each stage was shown and answered is not recoverable from anything else the
         rollout writes, so it is captured here or not at all. Never raises: a reflector
-        that dies over its own bookkeeping would cost the rollout its supervision.
+        that dies over its own bookkeeping would cost the rollout its supervision. The write
+        runs off the event loop, where a stall on the shared filesystem would hold every rollout.
         """
         if error == OVER_BUDGET:
             self._counts["reflect_over_budget"] += 1
@@ -240,25 +244,33 @@ class AbstractReflector(ABC):
                 self._counts["reflect_redraws"] += 1
         if self._record_path is None:
             return
-        try:
-            row = {
-                **self.identity,
-                "stage": stage,
-                "step": step,
-                "obs_cap": obs_cap,
-                "resp_cap": resp_cap,
-                "prompt_tokens": prompt_tokens,
-                "system": messages[0]["content"],
-                "user": messages[1]["content"],
-                "output": text,
-                "error": error,
-            }
-            self._record_path.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(self._record_path, "at", encoding="utf-8") as fh:
-                fh.write(json.dumps(row) + "\n")
-        except Exception as exc:
-            self.logger.warning(f"Reflection record not written: {exc!r}")
-            self._record_path = None
+        async with self._record_lock:
+            # an earlier write may have failed while this one waited
+            if self._record_path is None:
+                return
+            try:
+                row = {
+                    **self.identity,
+                    "stage": stage,
+                    "step": step,
+                    "obs_cap": obs_cap,
+                    "resp_cap": resp_cap,
+                    "prompt_tokens": prompt_tokens,
+                    "system": messages[0]["content"],
+                    "user": messages[1]["content"],
+                    "output": text,
+                    "error": error,
+                }
+                await asyncio.to_thread(self._append_record, self._record_path, row)
+            except Exception as exc:
+                self.logger.warning(f"Reflection record not written: {exc!r}")
+                self._record_path = None
+
+    @staticmethod
+    def _append_record(path: Path, row: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(path, "at", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
 
     def _keep_valid(self, hints: dict[int, str], turns: list[dict]) -> dict[int, str]:
         """Hints for real turns only, capped at the configured budget, earliest first."""
