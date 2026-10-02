@@ -1125,13 +1125,14 @@ def render_diagnostic(result: dict, data: dict, *, max_chars=80000, neighbors=10
             return True
         return False
 
-    # Every test in full when it fits (with source windows, else without).
-    if take({i: True for i in order}) or take({i: False for i in order}):
+    # Every test in full when it fits.
+    if take({i: True for i in order}):
         return text
-    # Else one full record per distinct failure, or as many as fit: startup and collection errors
-    # first, then the smallest. Every other test then gets a short record while they fit, the rest
-    # are named; with no full record fitting, that leaves short records only.
-    if not take({i: True for i in representatives}):
+    # Else one record per distinct failure, full or else without source windows; else as many full
+    # records as fit, startup and collection errors first, then the smallest. Every other test then
+    # gets a short record while they fit, the rest are named; with no full record fitting, that
+    # leaves as many short records as fit.
+    if not (take({i: True for i in representatives}) or take({i: False for i in representatives})):
         def full_size(i):
             return len(_render_entry(entries[i], data, True, neighbors, {"values": {}, "frames": {}, "sources": set()}))
 
