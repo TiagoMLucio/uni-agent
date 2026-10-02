@@ -130,32 +130,42 @@ def run_ladder(n_turns, obs_chars, max_model_len=262144, replies=None, **over):
     return hints, model, r
 
 
-def test_an_over_budget_rung_is_rendered_once():
-    """Rungs 0 and 1 overflow, rung 2 fits: three renders however many redraws a rung allows,
-    since an over-budget render is deterministic and the redraws would repeat it."""
+def test_an_over_budget_view_is_rendered_once():
+    """The whole view overflows and the output step fits: the same renders however many redraws
+    a view allows, since an over-budget render is deterministic and the redraws would repeat it."""
+    seen = set()
     for redraws in (0, 1, 3):
-        hints, model, _ = run_ladder(230, 100_000, redraws_per_rung=redraws)
+        hints, model, _ = run_ladder(60, 100_000, redraws_per_rung=redraws)
         assert hints == {2: "run the snippet you printed at turn 1 before editing"}
-        assert len(model.renders) == 3, (redraws, model.renders)
         assert len(model.queries) == 1 and model.queries[0][1] == 16384
+        seen.add(tuple(model.renders))
+    assert len(seen) == 1, seen
+
+
+def test_the_output_cut_is_the_largest_that_fits():
+    """Only outputs longer than the cut lose their middle, so the cut is searched, not stepped:
+    the prompt sent fills the room left for the reply to within a few percent."""
+    hints, model, _ = run_ladder(60, 100_000)
+    assert hints
+    sent = model.queries[0][0]
+    assert sent + 16384 <= 262144 and sent + 16384 > 262144 * 0.95, sent
 
 
 def test_a_prompt_without_reply_room_is_over_budget():
     """A prompt that fits but leaves less than max_output_tokens of room is not sent: the staged
-    reply could not close, and the shrink ladder moves on without paying the prefill. With no rung
+    reply could not close, and the shrink ladder moves on without paying the prefill. With no step
     left the reflector never saw the trajectory, so the reflection failed rather than came up empty."""
     good = MARKER + '\n{"turn2": "run the snippet you printed at turn 1 before editing"}'
     model = SizedModel([good], 262144)
     r = PipelineReflector(model, config(max_model_len=262144, max_observation_chars=1_000_000,
                                        max_output_tokens=16384, redraws_per_rung=1))
     with pytest.raises(ReflectionFailed, match="over budget at every shrink level"):
-        asyncio.run(r.reflect_trajectory(task="t", turns=turns_with_observations(250, 100_000),
+        asyncio.run(r.reflect_trajectory(task="t", turns=turns_with_observations(100, 100_000),
                                          gold="g", feedback="f"))
-    assert r.call_metrics()["reflect_over_budget"] == 5 and r.call_metrics()["reflect_calls"] == 0
-    assert model.queries == [], "every rung leaves under 16384 tokens of room"
-    assert len(model.renders) == 5, "one render per rung, none repeated"
-    assert all(n < 262144 for n in model.renders[2:]), "the last rungs fit by prompt length alone"
-    assert all(n + 16384 > 262144 for n in model.renders[2:])
+    assert r.call_metrics()["reflect_over_budget"] == 3 and r.call_metrics()["reflect_calls"] == 0
+    assert model.queries == [], "every step leaves under 16384 tokens of room"
+    assert len(model.renders) == 3, "one render per step, none repeated"
+    assert all(262144 - 16384 < n < 262144 for n in model.renders[1:]), "the steps fit by prompt length alone"
 
 
 GOOD = MARKER + '\n{"turn1": "look at the parser in foo.py before editing it"}'
@@ -168,19 +178,16 @@ def test_a_rejected_reply_never_buys_a_smaller_view():
     hints, model, _ = reflect([BAD], turns=turns_with_observations(3, 20_000),
                               max_observation_chars=50_000, redraws_per_rung=1)
     assert hints == {}
-    assert model.calls == 2 and len(model.rendered) == 2, (model.calls, len(model.rendered))
-    assert model.rendered[0] == model.rendered[1], "the re-draw saw the same view"
-    assert "chars elided" not in model.rendered[0], "rung 0 renders the observations uncapped"
+    assert model.calls == 2 and len(model.rendered) == 1, (model.calls, len(model.rendered))
+    assert "chars elided" not in model.rendered[0], "the whole view renders the observations uncapped"
 
 
-def test_an_over_budget_rung_advances_where_a_rejected_reply_does_not():
-    """Rung 0 does not fit and costs a rung; the two draws that follow are the rung that fits,
-    and the rungs below it are never rendered."""
+def test_an_over_budget_view_advances_where_a_rejected_reply_does_not():
+    """The whole view does not fit; both draws are the output step's view, and the response step
+    after it is never rendered."""
     hints, model, _ = run_ladder(20, 100_000, replies=[BAD], redraws_per_rung=1)
     assert hints == {}
-    assert len(model.renders) == 3, model.renders
-    assert model.renders[1] == model.renders[2], "both draws at the rung that fit"
-    assert len(model.queries) == 2, model.queries
+    assert len(model.queries) == 2 and model.queries[0] == model.queries[1], model.queries
 
 
 def test_the_metrics_count_a_call_answered_first_time():
@@ -243,34 +250,53 @@ def test_a_reply_unusable_after_every_redraw_is_empty_not_failed():
     assert hints == {} and calls == 2
 
 
-def test_diagnostic_feedback_fits_whole_prompt_and_preserves_complete_case_records():
-    from uni_agent.reward.diagnostic_feedback import render_diagnostic
+class SeeingModel(SizedModel):
+    """A SizedModel that also keeps what it was last asked to answer."""
 
-    events = [{"nodeid": f"test_{i}", "phase": "call", "outcome": "failed",
-               "text": "E ValueError: " + str(i) + "x" * 1800} for i in range(12)]
-    result = {"eval_completed": True, "eval_report": {"test_status": {
-        "FAIL_TO_PASS": {"failure": [e["nodeid"] for e in events], "success": []},
-        "PASS_TO_PASS": {"failure": [], "success": []},
-    }}}
-    feedback = render_diagnostic(result, {"events": events, "complete": True})
-    class BudgetModel(SizedModel):
-        async def prepare_rollout_cache(self, messages, **kwargs):
-            self.messages = messages
-            return await super().prepare_rollout_cache(messages, **kwargs)
+    async def query(self, messages, rollout_cache, **kwargs):
+        self.sent = messages[-1]["content"]
+        return await super().query(messages, rollout_cache, **kwargs)
 
-    model = BudgetModel([GOOD], 3500)
+
+def reflect_sized(turns, max_model_len, feedback="f", **over):
+    model = SeeingModel([GOOD], max_model_len)
     r = PipelineReflector(model, PipelineReflector.Config(
-        name="pipeline", max_model_len=3500, max_output_tokens=256, shrink_ladder=[],
+        name="pipeline", max_model_len=max_model_len, max_output_tokens=1000, max_observation_chars=100_000,
         calls=[{"id": "test", "per": "trace", "parse": "hints", "system": "emit hints",
-                "user": "{task}\n{turns}\n{feedback}"}],
+                "user": "{task}\n{turns}\n{feedback}"}], **over,
     ))
-    hints = asyncio.run(r.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback=feedback))
-    assert hints == {1: "look at the parser in foo.py before editing it"}
-    assert len(model.queries) == 1 and model.queries[0][0] + 256 <= 3500
-    shown = model.messages[-1]["content"]
-    assert all(f"test_{i} (target test)" in shown for i in range(12))
-    assert "details omitted" in shown
-    assert "[Diagnostic test feedback ends]" in shown
+    hints = asyncio.run(r.reflect_trajectory(task="t", turns=turns, gold="g", feedback=feedback))
+    return hints, model, r
+
+
+def test_the_largest_outputs_give_way_first():
+    """One runaway output and ten file views: only the runaway loses its middle."""
+    views = [f"view {i} " + "v" * 8_000 for i in range(10)]
+    turns = [{"step": 1, "response": "run it", "tools": [{"name": "execute_bash", "observation": "r" * 90_000}]}]
+    turns += [{"step": i + 2, "response": "look", "tools": [{"name": "str_replace_editor", "observation": v}]}
+              for i, v in enumerate(views)]
+    hints, model, r = reflect_sized(turns, 40_000)
+    assert hints and r.call_metrics()["reflect_rung"] == 1
+    assert all(v in model.sent for v in views), "a file view was cut"
+    assert model.sent.count("chars elided") == 1
+
+
+def test_responses_give_way_after_outputs_and_the_call_text_before_the_words():
+    words = "The parser drops the last token because the loop stops one short, so " * 20
+    call = "<tool_call>\n<function=str_replace_editor>\n<parameter=command>\ncreate\n</parameter>\n" \
+           "<parameter=file_text>\n" + "x = 1\n" * 15_000 + "\n</parameter>\n</function>\n</tool_call>"
+    turns = [{"step": 1, "response": words + call, "tools": [{"name": "str_replace_editor", "observation": "ok"}]}]
+    hints, model, r = reflect_sized(turns, 12_000)
+    assert hints and r.call_metrics()["reflect_rung"] == 2
+    assert words in model.sent, "the agent's own words were cut"
+    assert "chars elided" in model.sent
+
+
+def test_feedback_is_never_cut_by_the_reflector():
+    feedback = "[Diagnostic test feedback begins]\n" + "E AssertionError: case\n" * 2_000 + "[Diagnostic test feedback ends]"
+    turns = [{"step": 1, "response": "run it", "tools": [{"name": "execute_bash", "observation": "r" * 90_000}]}]
+    hints, model, _ = reflect_sized(turns, 30_000, feedback=feedback)
+    assert hints and feedback in model.sent
 
 
 if __name__ == "__main__":

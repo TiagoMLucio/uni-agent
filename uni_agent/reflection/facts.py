@@ -50,6 +50,72 @@ def turn_candidates(turns: list[dict]) -> str:
     return "\n".join(notes[:35]) or "(nothing mechanical stands out)"
 
 
+#: build and install output, and dependencies copied into the tree: never the agent's own code
+_ARTIFACT_DIR = re.compile(r"(^|/)(\.eggs|build|dist|\.tox|\.?venv|site-packages|_vendor|[^/]+\.egg-info)/")
+_COPY_NAME = re.compile(
+    r"(\.(orig|bak|backup|old|rej|save)$)|([._-](backup|orig|old|copy|restored|bak|original|fixed|new|temp|tmp|buggy|broken)\.\w+$)",
+    re.I,
+)
+_TEST_DIR = re.compile(r"(^|/)(tests?|testing)/")
+
+
+def _file_blocks(diff: str):
+    """(path, block, created, deleted) for every file a unified diff touches."""
+    for block in re.split(r"(?m)^(?=diff --git )", diff or ""):
+        if not block.startswith("diff --git "):
+            continue
+        header = re.match(r'diff --git "?a/(.+?)"? "?b/', block)
+        path = header.group(1) if header else block.split("\n", 1)[0][len("diff --git "):]
+        yield (path, block.rstrip("\n"), bool(re.search(r"(?m)^new file mode", block)),
+               bool(re.search(r"(?m)^deleted file mode", block)))
+
+
+def _changed_lines(block: str) -> int:
+    return sum(1 for line in block.split("\n") if line[:1] in "+-" and not line.startswith(("+++", "---")))
+
+
+def created_source(path: str) -> bool:
+    """A file the agent created that reads as part of the package rather than a script, a test,
+    a note, a copy of another file or build output."""
+    return ("/" in path and path.endswith((".py", ".pyx", ".pyi")) and is_source_path(path)
+            and not _TEST_DIR.search(path) and not _ARTIFACT_DIR.search(path) and not _COPY_NAME.search(path))
+
+
+def patch_view(agent_patch: str, reference: str = "") -> str:
+    """The attempt's patch as the reflector reads it: every change to an existing file whole, and of
+    the files it created only those that are package source or that the reference creates too.
+
+    Over 6,361 SWE-smith attempts, 99.5% of the files agents created were written by a command the
+    trajectory already shows (scripts, tests, notes, backups), none was imported by a passing fix,
+    and middle-cutting the raw patch hid every source change in 20% of reflections. The others are
+    listed by name and size; a directory holding many collapses to one line.
+    """
+    created_also = {path for path, _, created, _ in _file_blocks(reference) if created}
+    shown, listed, deleted = [], [], []
+    for path, block, created, gone in _file_blocks(agent_patch):
+        if gone:
+            deleted.append(f"{path} ({_changed_lines(block)} lines)")
+        elif created and path not in created_also and not created_source(path):
+            listed.append((path, _changed_lines(block)))
+        else:
+            shown.append(block)
+    parts = ["\n".join(shown) if shown else "(no change to an existing file)"]
+    if listed:
+        by_dir: dict[str, list[tuple[str, int]]] = {}
+        for path, lines in listed:
+            by_dir.setdefault(path.split("/", 1)[0] + "/" if "/" in path else "", []).append((path, lines))
+        rows = []
+        for top, files in by_dir.items():
+            if top and len(files) > 5:
+                rows.append(f"- {top} ({len(files)} files, {sum(n for _, n in files)} lines)")
+            else:
+                rows += [f"- {path} ({lines} lines)" for path, lines in files]
+        parts.append("Files the attempt created, not shown:\n" + "\n".join(rows))
+    if deleted:
+        parts.append("Files the attempt deleted:\n" + "\n".join(f"- {d}" for d in deleted))
+    return "\n\n".join(parts)
+
+
 def patch_delta(gold: str, agent_patch: str) -> str:
     """The two patches reduced to the changes they disagree on, stated as replacements.
 

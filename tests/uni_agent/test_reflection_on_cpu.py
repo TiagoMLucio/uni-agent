@@ -68,21 +68,29 @@ def test_gold_under_the_cap_is_untouched():
     assert "diff --git a/x b/x" in user and "elided" not in user
 
 
-def test_default_cap():
-    assert _config().max_patch_chars == 16000
+def test_patches_are_uncapped_by_default():
+    assert _config().max_patch_chars is None
 
 
-def test_agent_patch_is_included_and_capped():
+def _attempt_prompt(agent_patch, **cfg):
     model = _Model()
-    reflector = PipelineReflector(model, _config(enabled=True, max_patch_chars=100))
+    reflector = PipelineReflector(model, _config(enabled=True, **cfg))
     asyncio.run(
-        reflector.reflect_trajectory(
-            task="t", turns=TURNS, gold="g", feedback="f", outcome="o", agent_patch="q" * 400 + "z" * 400
-        )
+        reflector.reflect_trajectory(task="t", turns=TURNS, gold="g", feedback="f", outcome="o", agent_patch=agent_patch)
     )
-    user = model.messages[-1]["content"]
-    assert "Patch the attempt produced:" in user
-    assert user.count("q") == 50 and user.count("z") == 50
+    return model.messages[-1]["content"]
+
+
+def test_agent_patch_is_included_whole_and_capped_only_when_asked():
+    patch = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-" + "q" * 400 + "\n+" + "z" * 400 + "\n"
+    user = _attempt_prompt(patch)
+    assert "Patch the attempt produced:" in user and user.count("q") == 400 and user.count("z") == 400
+    capped = _attempt_prompt(patch, max_patch_chars=100)
+    assert "chars elided" in capped and capped.count("z") < 100
+
+
+def test_an_empty_attempt_says_so():
+    assert "(empty: no change was extracted from the attempt)" in _attempt_prompt("")
 
 
 def test_switching_an_input_off_needs_a_prompt_that_does_not_name_it():
@@ -157,9 +165,8 @@ def test_output_budget_is_configurable():
 def test_shrink_ladder_is_configurable_and_starts_uncapped():
     cfg = _config(enabled=True, max_observation_chars=50, shrink_ladder=[(10, None)])
     assert cfg.shrink_ladder == [(10, None)]
-    # token-denominated rungs, char-approximated at ~3.8 chars/token
-    assert _config().shrink_ladder[0] == (7600, None)
-    assert len(_config().shrink_ladder) == 4
+    # floors: tool outputs first, then the responses
+    assert _config().shrink_ladder == [(10_000, None), (10_000, 3_800)]
 
 
 def test_an_unknown_key_is_rejected():
@@ -517,9 +524,10 @@ def test_the_shrink_ladder_still_retries_through_the_trace_span(tmp_path):
     assert hints == {0: "run the failing test"}, "the second rung's hints were lost"
     assert model.calls == 2, "the ladder did not retry after the overflow"
     rows = [json.loads(l) for l in gzip.open(path, "rt")]
-    # both attempts are on record: the rung that overflowed and the one that answered
+    # both attempts are on record: the whole view that overflowed and the step that answered
+    # (the observation step renders the same view here, max_observation_chars being below its floor)
     assert [r["error"] for r in rows] == ["over budget", ""]
-    assert [r["obs_cap"] for r in rows] == [1000, 7600]
+    assert [(r["obs_cap"], r["resp_cap"]) for r in rows] == [(1000, None), (1000, 3800)]
 
 
 # --- _maybe_reflect filters: skip_exit_reasons ----------------------------------------------

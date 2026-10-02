@@ -16,7 +16,7 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from uni_agent.reflection.base import FINAL_MARKER, AbstractReflector, BaseReflectionConfig, ReflectionFailed
-from uni_agent.reflection.facts import patch_delta, turn_candidates
+from uni_agent.reflection.facts import patch_delta, patch_view, turn_candidates
 from uni_agent.reflection.registry import register_reflector
 from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
@@ -126,11 +126,12 @@ class PipelineReflector(AbstractReflector):
         cfg = self.config
         k = str(cfg.max_selected_turns)
         gold = self._clip(gold, cfg.max_patch_chars) if gold else gold
-        agent_patch = self._clip(agent_patch, cfg.max_patch_chars) if agent_patch else agent_patch
+        attempt = (self._clip(patch_view(agent_patch, gold), cfg.max_patch_chars) if agent_patch
+                   else "(empty: no change was extracted from the attempt)")
         base: dict[str, Any] = {
             "task": task,
             "outcome": outcome or "(not available)",
-            "agent_patch": agent_patch if cfg.include_agent_patch and agent_patch else "(not available)",
+            "agent_patch": attempt if cfg.include_agent_patch else "(not available)",
             "gold": gold if cfg.include_gold and gold else "(not available)",
             "feedback": feedback if cfg.include_exec_feedback and feedback else "(not available)",
             "candidates": turn_candidates(turns),

@@ -31,6 +31,8 @@ FINAL_MARKER = "FINAL_HINTS_JSON:"
 OVER_BUDGET = "over budget"
 #: what the reflector cost one trajectory, reported by the agent loop
 CALL_METRICS = ("reflect_calls", "reflect_redraws", "reflect_over_budget", "reflect_rung")
+#: where the search for a response cut starts from above; no single response comes near it
+_RESPONSE_SEARCH_TOP = 1_000_000
 
 class ReflectionFailed(RuntimeError):
     """The pipeline could not run as designed: a call raised, or no rung of the ladder fit the
@@ -89,23 +91,19 @@ class BaseReflectionConfig(BaseModel):
     max_model_len: int | None = None
     max_observation_chars: int = 1000
     max_diagnosis_chars: int = 4000
-    # the shrink ladder only trims turns, so an outsized patch overflows at every level and
-    # drops the rollout's hints entirely. Over SWE-smith 16k spares 99.2% of tasks.
-    max_patch_chars: int = 16000
+    # None reads both patches whole: the attempt's comes as facts.patch_view, which lists the files
+    # it created instead of showing them. A cap middle-cuts both patches.
+    max_patch_chars: int | None = None
     # Room for the reflector's own reply, reasoning included: a reply cut before its JSON closes
     # parses to nothing and the rollout loses every hint without an error.
     max_output_tokens: int = 16384
-    # Retries when the render overflows the serving context, as (observation cap, response cap);
-    # None means uncapped. The first attempt always uses max_observation_chars, so these are what
-    # it falls back to. Deriving them from that field instead made the first rungs no-ops
-    # whenever it was set high.
-    # Rungs are token budgets approximated in chars at ~3.8 chars/token: observations shrink
-    # first (2k -> 1k tokens), then the agent's own responses (2k -> 1k), since the responses
-    # are what the hints are about. Responses drive the worst case (4k tok/turn x 50 turns vs
-    # a measured 77k-token observation ceiling), so only the last rung provably fits 131k.
-    shrink_ladder: list[tuple[int | None, int | None]] = [
-        (7600, None), (3800, None), (3800, 7600), (3800, 3800),
-    ]
+    # Steps tried in order when the whole render overflows the serving context, as floors
+    # (observations, responses); None leaves that part uncut. A step uses the largest cut at or
+    # above its floors that fits, so only items longer than the cut lose their middle and the
+    # largest go first. Tool outputs give way before the agent's responses, which hold the
+    # decisions the hints are about. Over the overflows measured, cutting the largest outputs
+    # alone fit every one, at 70k-600k chars, without hiding a sighting of the defect.
+    shrink_ladder: list[tuple[int | None, int | None]] = [(10_000, None), (10_000, 3_800)]
     #: extra draws on the same rung when a reply is unusable, before the render shrinks
     redraws_per_rung: int = Field(default=1, ge=0)
 
@@ -151,56 +149,18 @@ class AbstractReflector(ABC):
         the prompt does not.
         """
         cfg = self.config
-        rungs = [(cfg.max_observation_chars, None), *cfg.shrink_ladder]
         draws = 1 + cfg.redraws_per_rung if accept is not None else 1
         max_tokens = max_output_tokens or cfg.max_output_tokens
-        # the same ceiling query() enforces: the config's, else the client's own
-        limit = cfg.max_model_len or getattr(self.model, "max_model_len", None)
+        # every call reaches Langfuse as an identical model_call, so a pipeline's stages are
+        # indistinguishable there without a span naming the one they belong to
+        label = "reflect:{}".format(stage or "call") + ("" if step is None else f"@turn{step}")
         rejected = None
-        for rung, (obs_cap, resp_cap) in enumerate(rungs):
+        async for rung, obs_cap, resp_cap, messages, cache, prompt_tokens in self._renders(
+            system, render_user, max_tokens, stage, step
+        ):
             for draw in range(draws):
-                messages = [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": render_user(obs_cap, resp_cap)},
-                ]
-                # every call reaches Langfuse as an identical model_call, so a pipeline's stages are
-                # indistinguishable there without a span naming the one they belong to
-                label = "reflect:{}".format(stage or "call") + ("" if step is None else f"@turn{step}")
                 try:
                     with rollout_trace_span(label, metadata={"obs_cap": obs_cap, "resp_cap": resp_cap}):
-                        # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
-                        cache = await self.model.prepare_rollout_cache(
-                            messages, include_tools=False, chat_template_kwargs=cfg.chat_template_kwargs
-                        )
-                        # the engine is sized for this call, not for a rollout: rollouts condense to the
-                        # agent's budget while a reflector prompt is the whole trajectory at once, so its
-                        # prefill is what sets the peak activation the rollout engine has to fit
-                        prompt_tokens = len(cache.get("prompt_ids") or ())
-                        # Account for the entire prompt with the serving tokenizer. Reduce only
-                        # complete structured feedback records, with explicit omission counts.
-                        if limit and prompt_tokens + max_tokens > limit:
-                            from uni_agent.reward.diagnostic_feedback import feedback_span, fit_message_feedback
-
-                            rendered = messages[-1].get("content", "")
-                            span = feedback_span(rendered)
-                            if span:
-                                size = span[1] - span[0]
-                                while prompt_tokens + max_tokens > limit and size > 1024:
-                                    size = max(1024, size * 3 // 4)
-                                    fitted = fit_message_feedback(messages, size)
-                                    if fitted == messages:
-                                        break  # mandatory index requires trajectory shrink instead
-                                    messages = fitted
-                                    cache = await self.model.prepare_rollout_cache(
-                                        messages, include_tools=False, chat_template_kwargs=cfg.chat_template_kwargs
-                                    )
-                                    prompt_tokens = len(cache.get("prompt_ids") or ())
-                        # a prompt that fits but leaves less than the reply's room is over budget too:
-                        # the staged reply cannot close, and the same prefill would be paid again
-                        if limit and prompt_tokens + max_tokens > limit:
-                            raise MaxTokenExceededError(
-                                f"prompt_tokens {prompt_tokens} + max_tokens {max_tokens} exceeds max_model_len {limit}"
-                            )
                         sampling_params = {
                             **(getattr(self.model, "sampling_params", None) or {}),
                             "max_tokens": max_tokens,
@@ -219,10 +179,11 @@ class AbstractReflector(ABC):
                     self.logger.info(f"Reflection reply unusable (draw {draw + 1}/{draws}, "
                                      f"obs_cap={obs_cap})")
                 except MaxTokenExceededError as exc:
+                    # the client's own ceiling, when none was known to measure against
                     self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
                     await self._record(stage, step, messages, None, None, obs_cap, resp_cap,
                                        error=OVER_BUDGET, draw=draw)
-                    # deterministic at this rung: the redraws would render the same prompt
+                    # deterministic at this cut: the redraws would render the same prompt
                     break
                 except Exception as exc:
                     self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
@@ -240,6 +201,62 @@ class AbstractReflector(ABC):
             return rejected
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
         raise ReflectionFailed(f"{stage or 'call'}: render over budget at every shrink level")
+
+    async def _tokenized(self, system: str, render_user, obs_cap: int | None, resp_cap: int | None):
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": render_user(obs_cap, resp_cap)}]
+        # omit tool schemas: they bias the model toward a tool call instead of the requested JSON
+        cache = await self.model.prepare_rollout_cache(
+            messages, include_tools=False, chat_template_kwargs=self.config.chat_template_kwargs
+        )
+        # the engine is sized for this call, not for a rollout: rollouts condense to the agent's
+        # budget while a reflector prompt is the whole trajectory at once, so its prefill is what
+        # sets the peak activation the rollout engine has to fit
+        return messages, cache, len(cache.get("prompt_ids") or ())
+
+    async def _renders(self, system: str, render_user, max_tokens: int, stage: str, step: int | None):
+        """The renders worth sending, in order: (rung, obs_cap, resp_cap, messages, cache, prompt_tokens).
+
+        Rung 0 is the whole view; each ladder step follows only if everything before it overflowed,
+        at the largest cut at or above its floors that fits. A step that overflows even at its floors
+        is recorded once and skipped. Without a known ceiling nothing can be measured, so a step is
+        tried at its floors and the client's own MaxTokenExceededError moves on to the next.
+        """
+        cfg = self.config
+        # the same ceiling query() enforces: the config's, else the client's own
+        limit = cfg.max_model_len or getattr(self.model, "max_model_len", None)
+        top = cfg.max_observation_chars
+
+        def fits(n: int) -> bool:
+            # a prompt that fits but leaves less than the reply's room is over budget too: the
+            # staged reply cannot close, and the same prefill would be paid again
+            return not limit or n + max_tokens <= limit
+
+        tried = set()
+        for rung, (obs_floor, resp_floor) in enumerate([(top, None), *cfg.shrink_ladder]):
+            caps = (top if obs_floor is None else min(obs_floor, top), resp_floor)
+            if caps in tried:
+                continue
+            tried.add(caps)
+            messages, cache, n = await self._tokenized(system, render_user, *caps)
+            if not fits(n):
+                self.logger.info(f"Reflection render over budget (obs_cap={caps[0]}, resp_cap={caps[1]}): "
+                                 f"prompt_tokens {n} + max_tokens {max_tokens} exceeds max_model_len {limit}")
+                await self._record(stage, step, messages, None, None, *caps, error=OVER_BUDGET)
+                continue
+            if limit and rung:
+                # the largest cut that still fits: the part this step cuts is the responses once
+                # it names a response floor, the observations otherwise
+                part = 1 if resp_floor is not None else 0
+                lo, hi = caps[part], top if part == 0 else _RESPONSE_SEARCH_TOP
+                while hi - lo > max(256, lo // 20):
+                    mid = (lo + hi) // 2
+                    probe = (mid, None) if part == 0 else (caps[0], mid)
+                    rendered = await self._tokenized(system, render_user, *probe)
+                    if fits(rendered[2]):
+                        lo, caps, (messages, cache, n) = mid, probe, rendered
+                    else:
+                        hi = mid
+            yield rung, *caps, messages, cache, n
 
     def call_metrics(self) -> dict[str, float]:
         """What the reflector cost this trajectory, every stage summed: calls, re-draws after an
@@ -357,9 +374,35 @@ class AbstractReflector(ABC):
         )
 
     def _clip_response(self, text: str, cap: int | None) -> str:
-        if cap is None:
+        """Cut a response to ``cap``: the call's long arguments (a created file's text, an edit's
+        strings) lose their middle first, longest first; the agent's own words go last."""
+        if cap is None or len(text) <= cap:
             return text
-        return self._clip(text, cap)
+        marker = next((m for m in ("<tool_call>", neutralised_atomic("<tool_call>")) if m in text), None)
+        if marker is None:
+            return self._clip(text, cap)
+        words, call = text.split(marker, 1)
+        args = list(re.finditer(r"(<parameter=\w+>\n?)(.*?)(\n?</parameter>)", call, re.S))
+
+        def cut(level: int) -> str:
+            # every argument longer than ``level`` keeps its two ends, the shorter ones stay whole
+            pieces, last = [], 0
+            for m in args:
+                pieces += [call[last:m.start(2)], self._clip(m[2], level)]
+                last = m.end(2)
+            return "".join(pieces) + call[last:]
+
+        if args:
+            room = cap - len(words) - len(marker)
+            lo, hi = 200, max(len(m[2]) for m in args)
+            while hi - lo > 50 and len(cut(lo)) <= room:
+                mid = (lo + hi) // 2
+                lo, hi = (mid, hi) if len(cut(mid)) <= room else (lo, mid)
+            call = cut(lo)
+        if len(words) + len(marker) + len(call) > cap:
+            words = self._clip(words, max(cap - len(marker) - len(call), 200))
+        text = words + marker + call
+        return text if len(text) <= cap else self._clip(text, cap)
 
     def _clip(self, text: str, cap: int | None) -> str:
         """Middle-out truncation: a failing turn's signal is often at the observation's tail
