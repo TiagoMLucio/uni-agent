@@ -218,6 +218,15 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 register_langfuse_op("UniAgentLoop.run", no_io=True, as_type="agent", root=True, name="agent_loop")
 
 
+def _dummy_token_id(tokenizer) -> int:
+    token_id = getattr(tokenizer, "pad_token_id", None)
+    if token_id is None:
+        token_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(token_id, list):
+        token_id = token_id[0] if token_id else 0
+    return 0 if token_id is None else token_id
+
+
 def _termination(trajectory) -> str:
     """Terminal status of a trajectory: the last step's abnormal exit_reason, else finished/max_turns."""
     last = trajectory[-1] if trajectory else None
@@ -244,100 +253,34 @@ class UniAgentLoop(AgentLoopBase):
         if should_break("agent_run"):
             breakpoint()
 
-        config_dict = self._init_config(sampling_params, **kwargs)
-        self.mask_abnormal_exit_traj = config_dict.get("mask_abnormal_exit_traj", False)
-        # When the reward spec emits feedback, keep a consistent ``reward_extra_info``
-        # column (with a ``feedback`` key) on every output so downstream batching
-        # sees uniform keys.
-        self.emit_feedback = bool(((config_dict.get("reward") or {}).get("feedback") or {}).get("enabled", False))
-        global_concurrent = config_dict.get("concurrency", 512)
-        num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
-        worker_concurrent = max(global_concurrent // num_workers, 1)
-        if UniAgentLoop._semaphore is None:
-            UniAgentLoop._semaphore = asyncio.Semaphore(worker_concurrent)
-
         self.run_id = str(uuid.uuid4())
         self.logger = get_logger("agent-loop", run_id=self.run_id)
-        # init chat model, tools manager and environment
-        self.chat_model = self._init_chat_model(config_dict["model"])
-        self.tools_manager = self._init_tools_manager(
-            tools_config_list=config_dict["tools"],
-            parser=config_dict.get("tool_parser", "qwen3_coder"),
-        )
-        self.skills_manager = self._init_skills_manager(config_dict.get("skills"))
-        self.condenser, condense_policy = self._init_condense(config_dict.get("condense"))
-        self.env = self._init_env(config_dict["env"])
-        self.output_dir = Path(config_dict["log_dir"]) / self.run_id
-        messages = opening_messages(
-            config_dict.get("prompts"), kwargs.get("raw_prompt"), kwargs.get("extra_info")
-        )
-        self.opening_messages = messages
-        self.interaction = AgentInteraction(
-            run_id=self.run_id,
-            env=self.env,
-            model=self.chat_model,
-            tools_manager=self.tools_manager,
-            messages=messages,
-            skills_manager=self.skills_manager,
-            condenser=self.condenser,
-            **condense_policy,
-            **config_dict["interaction"],
-        )
-        if config_dict["reward"] is not None:
-            reward_config = {
-                **config_dict["reward"],
-                "run_id": self.run_id,
-                "env": self.env,
-            }
-            self.reward_spec = load_reward_spec(reward_config)
-        else:
-            self.reward_spec = None
-
-        # trace identity up front: survives even if the final outcome update is lost on kill
-        task_text = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
-        reward_meta = (config_dict.get("reward") or {}).get("metadata") or {}
-        image = ((config_dict.get("env") or {}).get("deployment") or {}).get("image")
-        identity = {
-            "run_id": self.run_id,
-            "uid": kwargs.get("uid"),
-            "data_source": kwargs.get("data_source"),
-            "instance_id": reward_meta.get("instance_id"),
-            "image": image,
-            "model": self.config.actor_rollout_ref.model.path,
-        }
-        self.identity = identity
-        rollout_trace_update_trace(
-            input=task_text or None, metadata={k: v for k, v in identity.items() if v is not None}
-        )
-        rollout_trace_update_span(
-            input={
-                "model": self.config.actor_rollout_ref.model.path,
-                "image": image,
-                "max_turns": (config_dict.get("interaction") or {}).get("max_turns"),
-                "tools": [t.get("name") for t in config_dict.get("tools") or [] if isinstance(t, dict)],
-            }
-        )
+        self.setup_attempts = 0
+        try:
+            config_dict = self._init_rollout(sampling_params, **kwargs)
+        except Exception as e:
+            # no sandbox exists yet, so a bad row costs its own masked row, not the step
+            return [await self._failed_output("agent_loop_failed", e)]
 
         async with self._semaphore:
-            add_file_handler(self.output_dir / "run.log", self.run_id)
-
-            self.logger.info(f"model name: {self.config.actor_rollout_ref.model.path}")
-            self.logger.info(f"sampling_params: {sampling_params}")
-            self.logger.info(f"environment config: {config_dict['env']}")
-            self.logger.info(f"tools config: {config_dict['tools']}")
-            self.logger.info(f"interaction config: {config_dict['interaction']}")
-            self.logger.info(f"mask_abnormal_exit_traj: {self.mask_abnormal_exit_traj}")
-            self.logger.info(f"output_dir: {self.output_dir}")
-            # cap the setup phase: one wedged env.start would stall the whole gathered step
-            setup_timeout = config_dict.get("setup_timeout", 300)
-            setup_retries = config_dict.get("setup_retries", 2)
             setup_done = False
-            self.setup_attempts = 0
             try:
+                add_file_handler(self.output_dir / "run.log", self.run_id)
+
+                self.logger.info(f"model name: {self.config.actor_rollout_ref.model.path}")
+                self.logger.info(f"sampling_params: {sampling_params}")
+                self.logger.info(f"environment config: {config_dict['env']}")
+                self.logger.info(f"tools config: {config_dict['tools']}")
+                self.logger.info(f"interaction config: {config_dict['interaction']}")
+                self.logger.info(f"mask_abnormal_exit_traj: {self.mask_abnormal_exit_traj}")
+                self.logger.info(f"output_dir: {self.output_dir}")
+                # cap the setup phase: one wedged env.start would stall the whole gathered step
+                setup_timeout = config_dict.get("setup_timeout", 300)
+                setup_retries = config_dict.get("setup_retries", 2)
                 with rollout_trace_span("rollout", as_type="chain") as rollout_span:
                     env_setup_t0 = time.perf_counter()
                     with rollout_trace_span(
-                        "env_setup", metadata={"image": image, "timeout_s": setup_timeout}
+                        "env_setup", metadata={"image": self.identity["image"], "timeout_s": setup_timeout}
                     ) as env_span:
                         await self._start_env(config_dict, setup_timeout, setup_retries)
                         if env_span is not None:
@@ -431,10 +374,7 @@ class UniAgentLoop(AgentLoopBase):
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
                 exit_reason = "setup_timeout" if not setup_done and isinstance(e, TimeoutError) else "agent_loop_failed"
-                self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {e!r}")
-                outcome = {"termination": exit_reason}
-                rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
-                output = [await self._failed_output(exit_reason)]
+                output = [await self._failed_output(exit_reason, e)]
             finally:
                 await self.env.close()
                 # off the event loop: removing the sink blocks until its writer thread drains into run.log
@@ -443,6 +383,81 @@ class UniAgentLoop(AgentLoopBase):
                 except Exception as e:
                     self.logger.warning(f"could not remove the run log sink: {e!r}")
             return output
+
+    def _init_rollout(self, sampling_params: dict[str, Any], **kwargs) -> dict:
+        """Everything a rollout builds from its row before it holds a slot; returns the effective config."""
+        config_dict = self._init_config(sampling_params, **kwargs)
+        self.mask_abnormal_exit_traj = config_dict.get("mask_abnormal_exit_traj", False)
+        # When the reward spec emits feedback, keep a consistent ``reward_extra_info``
+        # column (with a ``feedback`` key) on every output so downstream batching
+        # sees uniform keys.
+        self.emit_feedback = bool(((config_dict.get("reward") or {}).get("feedback") or {}).get("enabled", False))
+        global_concurrent = config_dict.get("concurrency", 512)
+        num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
+        worker_concurrent = max(global_concurrent // num_workers, 1)
+        if UniAgentLoop._semaphore is None:
+            UniAgentLoop._semaphore = asyncio.Semaphore(worker_concurrent)
+
+        # init chat model, tools manager and environment
+        self.chat_model = self._init_chat_model(config_dict["model"])
+        self.tools_manager = self._init_tools_manager(
+            tools_config_list=config_dict["tools"],
+            parser=config_dict.get("tool_parser", "qwen3_coder"),
+        )
+        self.skills_manager = self._init_skills_manager(config_dict.get("skills"))
+        self.condenser, condense_policy = self._init_condense(config_dict.get("condense"))
+        self.env = self._init_env(config_dict["env"])
+        self.output_dir = Path(config_dict["log_dir"]) / self.run_id
+        messages = opening_messages(
+            config_dict.get("prompts"), kwargs.get("raw_prompt"), kwargs.get("extra_info")
+        )
+        self.opening_messages = messages
+        self.interaction = AgentInteraction(
+            run_id=self.run_id,
+            env=self.env,
+            model=self.chat_model,
+            tools_manager=self.tools_manager,
+            messages=messages,
+            skills_manager=self.skills_manager,
+            condenser=self.condenser,
+            **condense_policy,
+            **config_dict["interaction"],
+        )
+        if config_dict["reward"] is not None:
+            reward_config = {
+                **config_dict["reward"],
+                "run_id": self.run_id,
+                "env": self.env,
+            }
+            self.reward_spec = load_reward_spec(reward_config)
+        else:
+            self.reward_spec = None
+
+        # trace identity up front: survives even if the final outcome update is lost on kill
+        task_text = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+        reward_meta = (config_dict.get("reward") or {}).get("metadata") or {}
+        image = ((config_dict.get("env") or {}).get("deployment") or {}).get("image")
+        identity = {
+            "run_id": self.run_id,
+            "uid": kwargs.get("uid"),
+            "data_source": kwargs.get("data_source"),
+            "instance_id": reward_meta.get("instance_id"),
+            "image": image,
+            "model": self.config.actor_rollout_ref.model.path,
+        }
+        self.identity = identity
+        rollout_trace_update_trace(
+            input=task_text or None, metadata={k: v for k, v in identity.items() if v is not None}
+        )
+        rollout_trace_update_span(
+            input={
+                "model": self.config.actor_rollout_ref.model.path,
+                "image": image,
+                "max_turns": (config_dict.get("interaction") or {}).get("max_turns"),
+                "tools": [t.get("name") for t in config_dict.get("tools") or [] if isinstance(t, dict)],
+            }
+        )
+        return config_dict
 
     async def _start_env(self, config_dict: dict, setup_timeout: float, setup_retries: int) -> None:
         """Start the sandbox and install the tools, rebuilding the sandbox after a failed attempt.
@@ -493,11 +508,49 @@ class UniAgentLoop(AgentLoopBase):
                 if self.reward_spec is not None:
                     self.reward_spec.env = self.env
 
-    async def _failed_output(self, exit_reason: str) -> AgentLoopOutput:
+    async def _failed_output(self, exit_reason: str, error: Exception | None = None) -> AgentLoopOutput:
         """The dummy row of a trajectory that produced no result; a sandbox that never came up
-        still counts in the setup retry rate."""
+        still counts in the setup retry rate.
+
+        Building that row renders the conversation, so it can fail too: a 1-token masked row
+        (``build_failed``) is the floor, since an exception here would cost the whole step.
+        """
+        if error is not None:
+            self.logger.critical(f"Agent loop failed before producing interaction result [{exit_reason}]: {error!r}")
+            outcome = {"termination": exit_reason}
+            rollout_trace_update_trace(output=outcome, metadata={"outcome": outcome})
         metrics = setup_metrics(self.setup_attempts) if self.setup_attempts else {}
-        return await self._build_empty_agent_output(exit_reason=exit_reason, metrics=metrics)
+        try:
+            return await self._build_empty_agent_output(exit_reason=exit_reason, metrics=metrics)
+        except Exception as e:
+            self.logger.critical(f"Could not build the dummy row for {exit_reason}; shipping build_failed: {e!r}")
+            return self._minimal_failed_output(metrics)
+
+    def _minimal_failed_output(self, metrics: dict) -> AgentLoopOutput:
+        """One masked dummy token for prompt and response, built from nothing a rollout sets."""
+        token_id = _dummy_token_id(self.tokenizer)
+        extra_fields = {
+            "traj_exit_reason": "build_failed",
+            "timings": dict(metrics),
+            "turn_spans": [],
+            "turn_hints": [],
+            "global_steps": 0,
+            "min_global_steps": 0,
+            "max_global_steps": 0,
+        }
+        if getattr(self, "emit_feedback", False):
+            extra_fields["reward_extra_info"] = {"feedback": None}
+        return AgentLoopOutput(
+            prompt_ids=[token_id],
+            response_ids=[token_id],
+            response_mask=[0],
+            response_logprobs=[0.0],
+            multi_modal_data={},
+            reward_score=0,
+            num_turns=0,
+            metrics={},
+            extra_fields=extra_fields,
+        )
 
     async def _maybe_reflect(self, interaction_result: dict, config_dict: dict, validate: bool) -> dict[int, str]:
         """Run whole-trajectory hindsight reflection when enabled; returns {step_idx: hint}."""
@@ -596,13 +649,7 @@ class UniAgentLoop(AgentLoopBase):
         if len(prompt_ids) > max_prompt_length:
             prompt_ids = prompt_ids[:max_prompt_length]
 
-        dummy_token_id = getattr(self.tokenizer, "pad_token_id", None)
-        if dummy_token_id is None:
-            dummy_token_id = getattr(self.tokenizer, "eos_token_id", None)
-        if isinstance(dummy_token_id, list):
-            dummy_token_id = dummy_token_id[0] if dummy_token_id else 0
-        if dummy_token_id is None:
-            dummy_token_id = 0
+        dummy_token_id = _dummy_token_id(self.tokenizer)
 
         max_response_length = self.config.actor_rollout_ref.rollout.response_length
         dummy_response_length = min(512, max_response_length)
