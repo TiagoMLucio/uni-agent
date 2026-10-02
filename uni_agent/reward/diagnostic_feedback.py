@@ -1125,26 +1125,21 @@ def render_diagnostic(result: dict, data: dict, *, max_chars=80000, neighbors=10
             return True
         return False
 
-    # Every test in full when it fits (with source windows, else without); else one full record per
-    # distinct failure, then the tests that fail the same way as short records while they fit, the
-    # rest by name.
+    # Every test in full when it fits (with source windows, else without).
     if take({i: True for i in order}) or take({i: False for i in order}):
         return text
-    if take({i: True for i in representatives}) or take({i: "summary" for i in representatives}):
-        for i in representatives:
-            if chosen[i] == "summary":
-                take({**chosen, i: True})
-        for i in rest:
-            take({**chosen, i: "summary"})
-        return text
-    # Keep short failure evidence before expanding context/locals/captured output.
+    # Else one full record per distinct failure, or as many as fit: startup and collection errors
+    # first, then the smallest. Every other test then gets a short record while they fit, the rest
+    # are named; with no full record fitting, that leaves short records only.
+    if not take({i: True for i in representatives}):
+        def full_size(i):
+            return len(_render_entry(entries[i], data, True, neighbors, {"values": {}, "frames": {}, "sources": set()}))
+
+        for i in sorted(representatives, key=lambda i: (priority(i), full_size(i))):
+            take({**chosen, i: True})
     for i in order:
-        take({**chosen, i: "summary"})
-    # Expanded records still include edited-source windows with ten neighbors.
-    for detailed in (False, True):
-        for i in order:
-            if i in chosen:
-                take({**chosen, i: detailed})
+        if i not in chosen:
+            take({**chosen, i: "summary"})
     return text
 
 
