@@ -214,6 +214,37 @@ def derived_episode_timeout(
     return max_turns * (generation_timeout(max_tokens) + action_timeout + attached_kill_timeout)
 
 
+def row_config(base_config: dict, tools_kwargs: dict | None, validate: bool = False) -> dict:
+    """One row's effective config, before the model block: the row's ``tools_kwargs`` deep-merged
+    over the agent yaml, then ``validation_overrides`` over both on a validation rollout."""
+    tools_kwargs = tools_kwargs or {}
+    if "model" in tools_kwargs:
+        raise ValueError(
+            "tools_kwargs.model is reserved; the model config is always "
+            "derived from the rollout config and cannot be overridden "
+            "per-sample. Remove `model` from your dataset's tools_kwargs."
+        )
+    config_dict = _deep_merge(base_config, tools_kwargs)
+    # Validation rollouts deep-merge `validation_overrides` (from the agent YAML)
+    # over the effective config: val limits live explicitly next to the train
+    # knobs instead of silently sharing them. Applied after the per-sample merge
+    # so a dataset row can never lose its env/reward identity to an override.
+    if validate and isinstance(config_dict.get("validation_overrides"), dict):
+        config_dict = _deep_merge(config_dict, config_dict["validation_overrides"])
+
+    unknown = sorted(set(config_dict) - AGENT_CONFIG_KEYS)
+    if unknown:
+        hints = [
+            f"{key} (did you mean {m[0]}?)" if (m := difflib.get_close_matches(key, AGENT_CONFIG_KEYS, 1)) else key
+            for key in unknown
+        ]
+        raise ValueError(
+            f"Unknown top-level agent config key(s): {', '.join(hints)}. "
+            f"Known keys: {', '.join(sorted(AGENT_CONFIG_KEYS))}"
+        )
+    return config_dict
+
+
 def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge ``overrides`` on top of ``base``, returning a new dict.
 
@@ -859,32 +890,7 @@ class UniAgentLoop(AgentLoopBase):
         assert agent_loop_config_path is not None, "agent_loop_config_path is None"
         resolved_path = resolve_config_path(agent_loop_config_path)
         base_config = yaml.safe_load(Path(resolved_path).read_text())[0]
-
-        tools_kwargs = kwargs.get("tools_kwargs") or {}
-        if "model" in tools_kwargs:
-            raise ValueError(
-                "tools_kwargs.model is reserved; the model config is always "
-                "derived from the rollout config and cannot be overridden "
-                "per-sample. Remove `model` from your dataset's tools_kwargs."
-            )
-        config_dict = _deep_merge(base_config, tools_kwargs)
-        # Validation rollouts deep-merge `validation_overrides` (from the agent YAML)
-        # over the effective config: val limits live explicitly next to the train
-        # knobs instead of silently sharing them. Applied after the per-sample merge
-        # so a dataset row can never lose its env/reward identity to an override.
-        if kwargs.get("validate") and isinstance(config_dict.get("validation_overrides"), dict):
-            config_dict = _deep_merge(config_dict, config_dict["validation_overrides"])
-
-        unknown = sorted(set(config_dict) - AGENT_CONFIG_KEYS)
-        if unknown:
-            hints = [
-                f"{key} (did you mean {m[0]}?)" if (m := difflib.get_close_matches(key, AGENT_CONFIG_KEYS, 1)) else key
-                for key in unknown
-            ]
-            raise ValueError(
-                f"Unknown top-level agent config key(s): {', '.join(hints)}. "
-                f"Known keys: {', '.join(sorted(AGENT_CONFIG_KEYS))}"
-            )
+        config_dict = row_config(base_config, kwargs.get("tools_kwargs"), validate=bool(kwargs.get("validate")))
 
         rollout_config = self.config.actor_rollout_ref.rollout
         engine_len = (
