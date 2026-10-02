@@ -89,6 +89,9 @@ class AgentChatModel:
 
         # encode tool response
         tool_response_ids = await self._get_new_message_ids(new_messages)
+        if self._ends_unclosed_turn(rollout_cache):
+            # a turn cut before its stop token: close it the way the full render does
+            tool_response_ids = [self.tokenizer.eos_token_id] + tool_response_ids
 
         # append tool response to prompt
         rollout_cache["prompt_ids"] += tool_response_ids
@@ -225,6 +228,14 @@ class AgentChatModel:
             ),
         )
         return self.message_boundary_tokens + normalize_token_ids(tokenized_prompt)
+
+    def _ends_unclosed_turn(self, rollout_cache: dict[str, Any]) -> bool:
+        """The buffer ends in a generated token that is not a stop token."""
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is None or not rollout_cache["response_mask"] or rollout_cache["response_mask"][-1] != 1:
+            return False
+        # Qwen also stops on its pad token, <|endoftext|>
+        return rollout_cache["prompt_ids"][-1] not in {eos_id, getattr(self.tokenizer, "pad_token_id", None)}
 
     @cached_property
     def message_boundary_tokens(self) -> list[int]:
