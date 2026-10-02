@@ -75,6 +75,9 @@ AGENT_CONFIG_KEYS = frozenset(
 #: uses as `old_log_probs` for its IS ratio, so it cannot be recomputed after the fact.
 SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn_spans")
 
+#: Token counts the chat model sums per trajectory; they ship as their own extra fields, not as timings.
+TOKEN_COUNTERS = frozenset({"num_cached_tokens", "num_prompt_tokens"})
+
 
 def opening_messages(prompts: dict | None, raw_prompt, extra_info: dict | None) -> list[dict[str, str]]:
     """What the rollout opens with: composed from the config's ``prompts`` block when there is
@@ -929,7 +932,12 @@ class UniAgentLoop(AgentLoopBase):
             "raw_prompt": self.opening_messages,
             # AgentLoopMetrics is a fixed schema the sync trainer never surfaces, so the
             # per-trajectory timings ride along here instead
-            "timings": {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
+            "timings": {
+                k: float(v) for k, v in metrics.items() if isinstance(v, (int, float)) and k not in TOKEN_COUNTERS
+            },
+            # summed by the chat model over the rollout's own generate calls; -1 is not reported
+            "num_cached_tokens": int(metrics.get("num_cached_tokens", -1)),
+            "num_prompt_tokens": int(metrics.get("num_prompt_tokens", 0)),
         }
         if self.emit_feedback:
             reward_extra_info = interaction_result.get("reward_extra_info") or {}

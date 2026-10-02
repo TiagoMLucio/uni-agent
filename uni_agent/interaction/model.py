@@ -152,6 +152,12 @@ class AgentChatModel:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
         else:
             metrics["num_preempted"] += token_output.num_preempted if token_output.num_preempted is not None else 0
+        # prefix-cache hits: one turn the engine did not report makes the trajectory's sum unknown (-1)
+        cached = getattr(token_output, "num_cached_tokens", None)
+        cached = -1 if cached is None else int(cached)
+        total = metrics.get("num_cached_tokens", 0)
+        metrics["num_cached_tokens"] = -1 if cached < 0 or total < 0 else total + cached
+        metrics["num_prompt_tokens"] = metrics.get("num_prompt_tokens", 0) + len(prompt_ids)
         if turn_limit and len(token_output.token_ids) > turn_limit:
             # Should be impossible (the server clamps to the requested max_tokens), yet
             # observed once, immediately after a condensation retry (5137 > 4096).
