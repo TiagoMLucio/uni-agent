@@ -1,3 +1,4 @@
+import asyncio
 import re
 import shlex
 from pathlib import Path, PurePath
@@ -28,6 +29,11 @@ from uni_agent.skills.manager import SkillsManager
 from uni_agent.tools.base import AbstractTool
 from uni_agent.tools.registry import TOOL_REGISTRY
 from uni_agent.utils import auto_await
+
+#: A teardown still running after this releases its caller and finishes in the background.
+CLOSE_TIMEOUT_S = 120.0
+# stops left running past CLOSE_TIMEOUT_S or past a cancel: the loop holds tasks only weakly
+_BACKGROUND_STOPS: set[asyncio.Task] = set()
 
 # A program awaiting input never prints the shell's PS1, so interactive sends must also
 # expect the program's own prompt or they wait out the full timeout and return nothing.
@@ -285,14 +291,31 @@ class AgentEnv:
 
     @auto_await
     async def close(self) -> None:
-        """Shutdown SWE-ReX deployment etc."""
+        """Shutdown SWE-ReX deployment etc.
+
+        Shielded: a caller cancelled mid-teardown gets its cancel at once while the stop runs on,
+        so a cancelled rollout never leaks its sandbox. Bounded: a stalled node cannot hold the
+        caller past ``CLOSE_TIMEOUT_S``.
+        """
         self.logger.info("Beginning environment shutdown...")
+        stop = asyncio.ensure_future(self._stop())
+        _BACKGROUND_STOPS.add(stop)
+        stop.add_done_callback(_BACKGROUND_STOPS.discard)
+        try:
+            stopped = await asyncio.wait_for(asyncio.shield(stop), CLOSE_TIMEOUT_S)
+        except TimeoutError:
+            self.logger.error(f"Environment shutdown still running after {CLOSE_TIMEOUT_S:g}s; left to finish")
+            return
+        if stopped:
+            self.logger.info("Environment shutdown completed")
+
+    async def _stop(self) -> bool:
         try:
             await self.deployment.stop()
+            return True
         except Exception as e:
             self.logger.error(f"Failed to stop environment deployment: {e}")
-            return
-        self.logger.info("Environment shutdown completed")
+            return False
 
     @staticmethod
     def _format_observation(raw: str, max_observation_length: int, empty_message: str) -> str:

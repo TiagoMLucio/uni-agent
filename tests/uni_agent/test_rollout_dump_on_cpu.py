@@ -28,6 +28,8 @@ class _Env:
 
 
 class _Interaction:
+    # the bounds the episode backstop is derived from
+    max_turns, action_timeout, attached_kill_timeout, episode_timeout = 1, 1, 1, None
     def __init__(self, **_kwargs):
         pass
 
@@ -54,7 +56,7 @@ def _loop(tmp_path, monkeypatch):
         pass
 
     loop._init_config = lambda *_args, **_kwargs: config
-    loop._init_chat_model = lambda _cfg: None
+    loop._init_chat_model = lambda _cfg: types.SimpleNamespace(max_completion_tokens=8, max_model_len=64)
     loop._init_tools_manager = lambda **_kwargs: types.SimpleNamespace(tools=[])
     loop._init_skills_manager = lambda _cfg: None
     loop._init_condense = lambda _cfg: (None, {})

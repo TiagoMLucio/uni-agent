@@ -393,26 +393,37 @@ class LocalDeployment(AbstractDeployment):
         """Directory inside the container where tool scripts are installed."""
         return Path("/usr/local/bin")
 
+    def _kill_server_tree(self) -> None:
+        if not self._server_process:
+            return
+        try:
+            # without a pid namespace the sandbox's processes outlive the apptainer client it
+            # was started with (and keep its mounts), so the whole tree goes
+            for pid in [*_process_tree(self._server_process.pid), self._server_process.pid]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        except Exception as exc:
+            self.logger.error(f"Failed to stop local Apptainer process: {exc}")
+
     async def stop(self):
         if self._stopped:
             return
 
-        if self._runtime:
-            try:
-                await self._runtime.close()
-            except Exception as exc:
-                self.logger.error(f"Failed to close local runtime within timeout: {exc}")
-            self._runtime = None
+        try:
+            if self._runtime:
+                try:
+                    await self._runtime.close()
+                except Exception as exc:
+                    self.logger.error(f"Failed to close local runtime within timeout: {exc}")
+                self._runtime = None
+        finally:
+            # synchronous, so a stop cancelled while the runtime closes still takes the sandbox down
+            self._kill_server_tree()
 
         if self._server_process:
             try:
-                # without a pid namespace the sandbox's processes outlive the apptainer client it
-                # was started with (and keep its mounts), so the whole tree goes
-                for pid in [*_process_tree(self._server_process.pid), self._server_process.pid]:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
                 await asyncio.to_thread(self._server_process.wait, 10)
             except Exception as exc:
                 self.logger.error(f"Failed to stop local Apptainer process: {exc}")

@@ -22,7 +22,7 @@ from .env import (
     AgentEnv,
     TerminalNotAliveError,
 )
-from .model import AgentChatModel, MaxTokenExceededError
+from .model import AgentChatModel, GenerationTimeoutError, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
 from .tool_schemas import OpenAIFunctionToolCall
 from .tools_manager import GIT_REFUSAL_PREFIX, ToolsManager, destructive_git_subcommand
@@ -130,6 +130,7 @@ class AgentInteraction:
         attached_kill_timeout: float = 45.0,
         timeout_budget: int = 3,
         max_turns: int = 50,
+        episode_timeout: float | None = None,
         skills_manager: SkillsManager | None = None,
         chat_mode: bool = False,
         stuck_threshold: int = 0,
@@ -156,6 +157,9 @@ class AgentInteraction:
         trajectory *segment*, the message history is condensed, the buffer is
         re-seated from it, and generation retries. ``None`` keeps the legacy
         behavior (overflow ends the rollout with ``token_limit``).
+        :param episode_timeout: seconds the whole turn loop may take; past it the rollout ships a
+        masked row with ``exit_reason="episode_timeout"``. ``None`` derives the bound from the
+        per-call limits (every turn at its generate, action and kill-wall bounds).
         :param condense_max_retries: max condense+retry attempts per overflow.
         :param max_observation_length: chars kept of one tool observation, split head and tail.
         :param observation_role: role carrying tool output. ``"tool"`` (default) is
@@ -173,6 +177,13 @@ class AgentInteraction:
         self.attached_kill_timeout = attached_kill_timeout
         self.timeout_budget = timeout_budget
         self.max_turns = max_turns
+        if episode_timeout is not None and (
+            isinstance(episode_timeout, bool) or not isinstance(episode_timeout, (int, float)) or episode_timeout <= 0
+        ):
+            raise ValueError(
+                f"interaction.episode_timeout must be a positive number of seconds, got {episode_timeout!r}"
+            )
+        self.episode_timeout = episode_timeout
         self.chat_mode = chat_mode
         self.stuck_threshold = stuck_threshold
         self.condenser = condenser
@@ -236,7 +247,8 @@ class AgentInteraction:
         * **Step**: ``step_output.exit_reason`` + ``done``:
 
           - terminal (``done=True``): ``finished``, ``turn_done``,
-            ``token_limit``, ``terminal_dead``, ``timeout_budget_exhausted``.
+            ``token_limit``, ``terminal_dead``, ``timeout_budget_exhausted``,
+            ``generation_timeout``.
           - non-terminal (``done=False``): ``completed``,
             ``completed_with_tool_errors``, ``format_error``.
           - set by :meth:`run`: ``max_step_limit``, ``stuck``, ``unknown_error``.
@@ -264,6 +276,12 @@ class AgentInteraction:
                     rollout_cache=self.rollout_cache,
                 )
                 break
+            except GenerationTimeoutError as e:
+                # the engine, not the policy, ended the turn: nothing was appended, so the buffer stays consistent
+                self.logger.error(f"[step{step_idx}] {e}")
+                step_output.exit_reason = "generation_timeout"
+                step_output.done = True
+                return step_output
             except MaxTokenExceededError as e:
                 _msg = (
                     f"[step{step_idx}] MaxTokenExceededError: "

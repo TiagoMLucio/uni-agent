@@ -21,6 +21,7 @@ from uni_agent.interaction import (
     ToolsManagerConfig,
 )
 from uni_agent.interaction.behaviour import behaviour_metrics
+from uni_agent.interaction.model import generation_timeout
 from uni_agent.reflection import build_reflection_config, load_reflector
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
@@ -77,6 +78,13 @@ SEGMENT_GRID_FIELDS = ("prompt_ids", "response_mask", "response_logprobs", "turn
 
 #: Token counts the chat model sums per trajectory; they ship as their own extra fields, not as timings.
 TOKEN_COUNTERS = frozenset({"num_cached_tokens", "num_prompt_tokens"})
+
+#: Exits where the engine, not the policy, ended the trajectory: kept and scored, but masked.
+ENGINE_EXITS = frozenset({"generation_timeout"})
+
+
+class EpisodeTimeoutError(Exception):
+    """The turn loop outlived the episode's wall-clock backstop."""
 
 
 def opening_messages(prompts: dict | None, raw_prompt, extra_info: dict | None) -> list[dict[str, str]]:
@@ -198,6 +206,14 @@ def setup_metrics(attempts: int) -> dict[str, float]:
     }
 
 
+def derived_episode_timeout(
+    max_turns: int, max_tokens: int, action_timeout: float, attached_kill_timeout: float
+) -> float:
+    """The backstop when ``interaction.episode_timeout`` is unset: every turn at the bounds its own
+    calls already have, a generate of ``max_tokens`` and a command held to the kill wall."""
+    return max_turns * (generation_timeout(max_tokens) + action_timeout + attached_kill_timeout)
+
+
 def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge ``overrides`` on top of ``base``, returning a new dict.
 
@@ -295,7 +311,7 @@ class UniAgentLoop(AgentLoopBase):
 
                     setup_done = True
                     env_setup_s = time.perf_counter() - env_setup_t0
-                    interaction_result = await self.interaction.run()
+                    interaction_result = await self._run_interaction()
                     interaction_result["metrics"] = dict(
                         interaction_result.get("rollout_cache", {}).get("metrics", {})
                     )
@@ -376,16 +392,40 @@ class UniAgentLoop(AgentLoopBase):
                 await self._dump_interaction_result(interaction_result)
                 output = await self.convert_to_agent_output(interaction_result)
             except Exception as e:
-                exit_reason = "setup_timeout" if not setup_done and isinstance(e, TimeoutError) else "agent_loop_failed"
+                if isinstance(e, EpisodeTimeoutError):
+                    exit_reason = "episode_timeout"
+                elif not setup_done and isinstance(e, TimeoutError):
+                    exit_reason = "setup_timeout"
+                else:
+                    exit_reason = "agent_loop_failed"
                 output = [await self._failed_output(exit_reason, e)]
             finally:
-                await self.env.close()
-                # off the event loop: removing the sink blocks until its writer thread drains into run.log
                 try:
-                    await asyncio.to_thread(cleanup_handlers, self.run_id)
-                except Exception as e:
-                    self.logger.warning(f"could not remove the run log sink: {e!r}")
+                    await self.env.close()
+                finally:
+                    # off the event loop: removing the sink blocks until its writer thread drains into run.log
+                    try:
+                        await asyncio.to_thread(cleanup_handlers, self.run_id)
+                    except Exception as e:
+                        self.logger.warning(f"could not remove the run log sink: {e!r}")
             return output
+
+    async def _run_interaction(self) -> dict:
+        """The turn loop under the episode's wall-clock backstop."""
+        interaction, model = self.interaction, self.chat_model
+        budget = interaction.episode_timeout or derived_episode_timeout(
+            interaction.max_turns,
+            model.max_completion_tokens or model.max_model_len,
+            interaction.action_timeout,
+            interaction.attached_kill_timeout,
+        )
+        try:
+            async with asyncio.timeout(budget) as deadline:
+                return await interaction.run()
+        except TimeoutError as e:
+            if not deadline.expired():
+                raise
+            raise EpisodeTimeoutError(f"the turn loop outlived its {budget:.0f}s backstop") from e
 
     def _init_rollout(self, sampling_params: dict[str, Any], **kwargs) -> dict:
         """Everything a rollout builds from its row before it holds a slot; returns the effective config."""
@@ -594,7 +634,8 @@ class UniAgentLoop(AgentLoopBase):
             for step in trajectory:
                 steps.setdefault(step.step_idx, step)
             termination = _termination(trajectory)
-            if termination in config.skip_exit_reasons:
+            # the row is masked, and the reflector would wait on the same engine
+            if termination in config.skip_exit_reasons or termination in ENGINE_EXITS:
                 return {}
             resolved = bool(interaction_result.get("resolved"))
             outcome = (
@@ -929,7 +970,7 @@ class UniAgentLoop(AgentLoopBase):
         metrics = interaction_result.get("metrics", {})
         # an eval that never ran scores resolved=False, which is indistinguishable from a real failure
         eval_incomplete = metrics.get("eval_completed", 1.0) < 1.0
-        should_mask_traj = eval_incomplete or (
+        should_mask_traj = eval_incomplete or traj_exit_reason in ENGINE_EXITS or (
             self.mask_abnormal_exit_traj and traj_exit_reason != "finished"
         )
 

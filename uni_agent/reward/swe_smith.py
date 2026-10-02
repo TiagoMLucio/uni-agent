@@ -350,7 +350,12 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             run_id=f"{self.run_id}-eval",
             env_config=AgentEnvConfig(**{**env_config, "post_setup_cmd": None, "privileged_setup_cmd": None}),
         )
-        await sibling.start()
+        try:
+            await sibling.start()
+        except BaseException:
+            # the caller never holds a sibling that did not start, so nothing else would stop it
+            await sibling.close()
+            raise
         self.logger.info("Started isolated sibling eval environment")
         return sibling
 

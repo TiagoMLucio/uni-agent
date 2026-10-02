@@ -12,6 +12,21 @@ class MaxTokenExceededError(Exception):
     pass
 
 
+class GenerationTimeoutError(Exception):
+    """A generate call outlived the bound its own token budget sets: its engine is presumed lost."""
+
+
+#: A generate call never legitimately takes longer than this: room for queueing and a long prefill,
+#: plus every token it may produce at a decode rate far below what a loaded live engine sustains.
+GENERATION_TIMEOUT_BASE_S = 600.0
+GENERATION_TIMEOUT_S_PER_TOKEN = 0.1
+
+
+def generation_timeout(max_tokens: int) -> float:
+    """Seconds one generate call of at most ``max_tokens`` tokens may take."""
+    return GENERATION_TIMEOUT_BASE_S + GENERATION_TIMEOUT_S_PER_TOKEN * max_tokens
+
+
 class AgentChatModel:
     client: Any
     """AsyncLLM server manager"""
@@ -142,12 +157,25 @@ class AgentChatModel:
             turn_limit = min(ceiling, room)
             sampling_params = {**sampling_params, "max_tokens": turn_limit}
 
+        # what the engine may produce: the cap, else the caller's own budget, else the whole window
+        budget = int(turn_limit or sampling_params.get("max_tokens") or max(1, limit - len(prompt_ids)))
+        timeout_s = generation_timeout(budget)
         with simple_timer("generate_sequences", metrics):
-            token_output = await self.client.generate(
-                request_id=request_id,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-            )
+            try:
+                async with asyncio.timeout(timeout_s) as deadline:
+                    token_output = await self.client.generate(
+                        request_id=request_id,
+                        prompt_ids=prompt_ids,
+                        sampling_params=sampling_params,
+                    )
+            except TimeoutError as e:
+                if not deadline.expired():
+                    raise
+                # the engine keeps decoding the abandoned request: the client holds no handle to abort it
+                raise GenerationTimeoutError(
+                    f"generate returned nothing in {timeout_s:.0f}s (max_tokens={budget}, "
+                    f"prompt={len(prompt_ids)}, request_id={request_id})"
+                ) from e
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
         else:
