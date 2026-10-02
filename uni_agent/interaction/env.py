@@ -83,6 +83,23 @@ def as_single_line(command: str, path: str = MULTILINE_COMMAND_PATH) -> tuple[st
     return content, f"bash -n {path} && source {path}"
 
 
+def clip_output(raw: str, max_observation_length: int) -> str:
+    """Session output without colour codes or carriage returns, cut to ``max_observation_length``.
+
+    Both ends are kept: a test run's verdict is its last lines, and head-only truncation
+    deletes exactly that.
+    """
+    cleaned = re.sub(r"\x1b\[[0-9;]*m|\r", "", raw or "").strip()
+    if len(cleaned) <= max_observation_length:
+        return cleaned
+    head = max_observation_length // 2
+    tail = max_observation_length - head
+    elided = len(cleaned) - max_observation_length
+    return (
+        f"{cleaned[:head]}\n<response clipped: {elided} characters elided from the middle>\n{cleaned[-tail:]}"
+    )
+
+
 # Every path that frees the session says so: without it the model is left thinking it
 # still holds one, and spends its next turn on an is_input that can only be refused.
 FREED_NOTE = "\n<NOTE>The program is no longer running: the session is free, so run a new command.</NOTE>"
@@ -330,15 +347,8 @@ class AgentEnv:
         if cleaned == "":
             return empty_message
         if len(cleaned) > max_observation_length:
-            # keep both ends: a test run's verdict is its last lines, and head-only
-            # truncation deletes exactly that
-            head = max_observation_length // 2
-            tail = max_observation_length - head
-            elided = len(cleaned) - max_observation_length
             return (
-                f"Observation:\n{cleaned[:head]}\n"
-                f"<response clipped: {elided} characters elided from the middle>\n"
-                f"{cleaned[-tail:]}\n"
+                f"Observation:\n{clip_output(cleaned, max_observation_length)}\n"
                 f"<NOTE>Observation exceeded {max_observation_length} characters. "
                 "Run a command that produces less output, or pipe through head/tail/grep or redirect to a "
                 "file. Do not use interactive pagers.</NOTE>"

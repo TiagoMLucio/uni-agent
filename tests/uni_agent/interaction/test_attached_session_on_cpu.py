@@ -323,6 +323,43 @@ def test_the_kill_note_states_the_real_remaining_allowance(budget, expected):
     assert expected in r.observation, r.observation
 
 
+def test_a_killed_programs_last_words_obey_the_observation_cap():
+    # a prompt loop printed 5.8M chars before the wall killed it; appended raw, the next turn
+    # was 1.7M tokens, the episode ended on token_limit and the reflector could not read it
+    import types as _t
+
+    from uni_agent.interaction.interaction import AgentInteraction
+
+    loop = "file [test.txt]: \r\nError: 'test.txt': No such file or directory\r\n" * 100_000
+
+    class _Env:
+        attached_command, attached_seconds, attached_at_prompt = "python integration_test.py", 99.0, False
+
+        async def send_input(self, command, action_timeout, max_observation_length=None):
+            raise ActionTimeoutError("partial")
+
+        async def kill_attached(self):
+            return loop + "[1]+  Killed                  python integration_test.py"
+
+    noop = lambda *a, **k: None  # noqa: E731
+    it = AgentInteraction.__new__(AgentInteraction)
+    it.env, it.logger = _Env(), _t.SimpleNamespace(info=noop, error=noop, debug=noop)
+    it.action_timeout, it.yield_timeout = 30, 5
+    it.attached_kill_timeout, it.timeout_budget = 45.0, 1
+    it.max_observation_length = 2_000
+    it.tools_manager = _t.SimpleNamespace(
+        get_tool_action=lambda _tc: _t.SimpleNamespace(command="C-d", is_input=True, timeout=1),
+        format_args_example=lambda args: str(args),
+    )
+    tc = _t.SimpleNamespace(id="c", function=_t.SimpleNamespace(name="execute_bash"))
+    r = _run(AgentInteraction._execute_tool_call(it, tc))
+    assert r.status == "timeout"
+    assert len(r.observation) < 2_000 + 600, len(r.observation)
+    assert "characters elided from the middle" in r.observation
+    assert "Killed" in r.observation and "was cancelled" in r.observation
+    assert "\r" not in r.observation
+
+
 def test_a_deferred_job_notice_lands_on_the_interrupt_not_the_next_command():
     # a program that ignores SIGINT gets escalated to `kill -9 %+`, and bash announces
     # the job's fate at its NEXT prompt: "[1]+ Killed ..." used to surface on top of

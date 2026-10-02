@@ -21,6 +21,7 @@ from .env import (
     ActionTimeoutError,
     AgentEnv,
     TerminalNotAliveError,
+    clip_output,
 )
 from .model import AgentChatModel, GenerationTimeoutError, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
@@ -624,7 +625,8 @@ class AgentInteraction:
     async def _kill_attached(self, observation: str) -> tuple[str, ToolStatus]:
         """Cancel a command that has held the session past its limit."""
         killed, spent = self.env.attached_command, self.env.attached_seconds
-        last_words = await self.env.kill_attached()
+        # everything the program printed since the last read, so as uncapped as the program
+        last_words = clip_output(await self.env.kill_attached(), self.max_observation_length)
         self.timeout_budget -= 1
         self.logger.error(
             f"Killed attached command {killed!r} after {spent:.1f}s of run time "
