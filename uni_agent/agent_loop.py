@@ -944,6 +944,12 @@ class UniAgentLoop(AgentLoopBase):
         if not segments:
             return [await self._build_empty_agent_output(exit_reason="no_response", metrics=metrics)]
 
+        # the whole rollout's surprisal over every segment, so a row can be read without its siblings;
+        # absent, like the per-turn records, on a run that did not ask for log-probs
+        if records := turn_entropy_records(segments, trajectory):
+            shared_extra["sampled_neg_logprob_sum"] = float(sum(r["entropy"] * r["tokens"] for r in records))
+            shared_extra["sampled_token_count"] = int(sum(r["tokens"] for r in records))
+
         num_segments = len(segments)
         self.logger.info(f"num_segments: {num_segments}, num_turns: {num_turns}, reward_score: {reward_score}")
         turn_hints = interaction_result.get("turn_hints") or {}

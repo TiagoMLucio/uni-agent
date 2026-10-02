@@ -170,3 +170,52 @@ def test_a_dump_from_a_run_without_logprobs_has_no_entropy_key(tmp_path):
     })
 
     assert "turn_entropy" not in json.loads((loop.output_dir / "interaction_result.json").read_text())
+
+
+def _rows(segments, trajectory):
+    """The real ``convert_to_agent_output`` over the attributes it reads."""
+    import asyncio
+    import functools
+
+    from uni_agent.agent_loop import UniAgentLoop
+
+    loop = SimpleNamespace(
+        logger=SimpleNamespace(info=lambda _m: None, warning=lambda _m: None),
+        config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(prompt_length=64, response_length=64))),
+        opening_messages=[],
+        mask_abnormal_exit_traj=False,
+        emit_feedback=False,
+    )
+    loop._segment_to_output = functools.partial(UniAgentLoop._segment_to_output, loop)
+    result = {"trajectory": trajectory, "segments": segments, "rollout_cache": segments[-1]["rollout_cache"]}
+    return asyncio.run(UniAgentLoop.convert_to_agent_output(loop, result))
+
+
+def _row_segment(spans, logprobs, mask):
+    seg = _segment(spans, logprobs, mask)
+    seg["rollout_cache"]["prompt_ids"] = [0] * 2 + [5] * len(mask)
+    seg["prompt_messages"] = None
+    return seg
+
+
+def test_every_row_carries_the_whole_rollouts_surprisal_over_its_segments():
+    """Sum and count span both condensation segments, so one row answers for the rollout."""
+    first = _row_segment([[1, 0, 2]], [-1.0, -3.0, 0.0], [1, 1, 0])
+    second = _row_segment([[2, 0, 1]], [-2.0], [1])
+    trajectory = [SimpleNamespace(step_idx=1, tool_results=[], exit_reason="completed"),
+                  SimpleNamespace(step_idx=2, tool_results=[], exit_reason="finished")]
+    rows = _rows([first, second], trajectory)
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row.extra_fields["sampled_neg_logprob_sum"] == pytest.approx(6.0), "1 + 3 + 2, no padding"
+        assert row.extra_fields["sampled_token_count"] == 3
+        assert isinstance(row.extra_fields["sampled_token_count"], int)
+
+
+def test_a_rollout_without_logprobs_ships_no_surprisal():
+    rows = _rows([_row_segment([[1, 0, 2]], [], [1, 1])],
+                 [SimpleNamespace(step_idx=1, tool_results=[], exit_reason="finished")])
+    assert "sampled_neg_logprob_sum" not in rows[0].extra_fields
+    assert "sampled_token_count" not in rows[0].extra_fields
