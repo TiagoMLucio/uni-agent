@@ -1088,8 +1088,9 @@ def render_diagnostic(result: dict, data: dict, *, max_chars=80000, neighbors=10
             entries = [entry for entry in entries if entry["status"] != "not observed"]
     summary[1:] = [_protect_markers(item) for item in summary[1:]]
 
-    # Similar signatures control ordering only. Each test keeps its own inputs and
-    # errors; no public group/case catalogue or assertion of one common defect.
+    # Similar signatures order the records and pick which test is shown in full when not all fit.
+    # Each test keeps its own inputs and errors; no public group/case catalogue or assertion of
+    # one common defect.
     groups = defaultdict(list)
     for i, entry in enumerate(entries):
         key = (entry["label"], tuple(signature(e) for e in entry["events"]), entry["status"])
@@ -1115,21 +1116,35 @@ def render_diagnostic(result: dict, data: dict, *, max_chars=80000, neighbors=10
     text = compose(chosen)
     if len(text) > max_chars:
         return _limited_output(summary, [entries[i] for i in order], max_chars, data, neighbors)
-    # Keep short failure evidence before expanding context/locals/captured output.
-    for i in order:
-        candidate = {**chosen, i: "summary"}
+
+    def take(candidate):
+        nonlocal chosen, text
         proposal = compose(candidate)
         if len(proposal) <= max_chars:
             chosen, text = candidate, proposal
+            return True
+        return False
+
+    # Every test in full when it fits (with source windows, else without); else one full record per
+    # distinct failure, then the tests that fail the same way as short records while they fit, the
+    # rest by name.
+    if take({i: True for i in order}) or take({i: False for i in order}):
+        return text
+    if take({i: True for i in representatives}) or take({i: "summary" for i in representatives}):
+        for i in representatives:
+            if chosen[i] == "summary":
+                take({**chosen, i: True})
+        for i in rest:
+            take({**chosen, i: "summary"})
+        return text
+    # Keep short failure evidence before expanding context/locals/captured output.
+    for i in order:
+        take({**chosen, i: "summary"})
     # Expanded records still include edited-source windows with ten neighbors.
     for detailed in (False, True):
         for i in order:
-            if i not in chosen:
-                continue
-            candidate = {**chosen, i: detailed}
-            proposal = compose(candidate)
-            if len(proposal) <= max_chars:
-                chosen, text = candidate, proposal
+            if i in chosen:
+                take({**chosen, i: detailed})
     return text
 
 

@@ -837,3 +837,40 @@ def test_ambiguous_quoted_feedback_does_not_authorize_removing_prompt_components
     content = "Task quotes previous feedback:\n" + feedback + "\nCurrent feedback:\n" + feedback
     messages = [{"role": "user", "content": content}]
     assert fit_message_feedback(messages, 100) == messages
+
+
+def test_one_full_record_per_failure_then_short_records_then_names():
+    from uni_agent.reward.diagnostic_feedback import BLOCK_HEADER, SUMMARY_NOTE
+
+    def event(node, kind, message):
+        frame = {"path": "pkg/mod.py", "line": 7, "function": "pick", "statement": "return items[idx]",
+                 "values": {"items": "[1, 2]", "idx": "3", "table": f"'{node}" + "x" * 1500 + "'"}}
+        return {"nodeid": node, "phase": "call", "outcome": "failed",
+                "exception": {"type": kind, "message": message, "frames": [frame]}}
+
+    same = [f"test_same_{i}" for i in range(6)]
+    events = [event(n, "IndexError", "list index out of range") for n in same]
+    events.append(event("test_other", "KeyError", "'k'"))
+    data = {"events": events, "complete": True}
+    nodes = same + ["test_other"]
+
+    def blocks(text):
+        heads = list(BLOCK_HEADER.finditer(text))
+        return {h[1].split(" (")[0]: text[h.start():(heads[k + 1].start() if k + 1 < len(heads) else len(text))]
+                for k, h in enumerate(heads)}
+
+    full = render_diagnostic(result(nodes), data, max_chars=10**9)
+    assert SUMMARY_NOTE not in full and OMISSIONS not in full
+    # one test per failure stays in full, the tests failing the same way turn short
+    second = render_diagnostic(result(nodes), data, max_chars=len(full) - 1)
+    shown = blocks(second)
+    assert SUMMARY_NOTE not in shown["test_same_0"] and SUMMARY_NOTE not in shown["test_other"]
+    assert all(SUMMARY_NOTE in shown[n] for n in same[1:]) and OMISSIONS not in second
+    # then names, while the representatives keep their full records
+    third = render_diagnostic(result(nodes), data, max_chars=len(second) - 200)
+    shown = blocks(third)
+    assert OMISSIONS in third and SUMMARY_NOTE not in shown["test_same_0"] and "test_other" in shown
+    # a short record per failure when even one full record each does not fit
+    reps_short = render_diagnostic(result(nodes), data, max_chars=len(full) // 6)
+    shown = blocks(reps_short)
+    assert {"test_same_0", "test_other"} <= set(shown) and all(SUMMARY_NOTE in b for b in shown.values())
