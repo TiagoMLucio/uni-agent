@@ -12,13 +12,12 @@
 _target_: uni_agent.sdpo.TurnHintTeacher
 
 # Template for one injected hint; spliced immediately before the hinted turn's tokens.
-# The splice is a real user turn, so the teacher's instinct is to answer it: 9.9% of scored
-# turns opened with "Thank you for the guidance" against 0 of 514 the student ever wrote.
-# Those tokens exist only because the note appeared, and the student has no mass on them.
-# "Act on this directly in your next tool call" asked for the reasoning collapse it produced:
-# bare-call turns went 2.3% -> 91% over five steps, and the teacher's own continuations open
-# straight with a tool call. Deliberation is restored here; the no-acknowledgement half stays.
-turn_hint_template: "[Guidance for your next action: {hint}\nWork out in your own words what this implies for the current state before you act, then take the action it points to. Do not acknowledge it, thank anyone for it, quote it, or refer to it: it is not part of the conversation, and the turn you write must read as if it were never sent.]\n"
+# The splice is a real user turn, so any instruction in it is what the teacher answers:
+# "Thank you for the guidance" opened 9.9% of scored turns, "Act on this directly in your next
+# tool call" took bare-call turns from 2.3% to 91% in five steps, and the no-acknowledgement
+# wording after them was still quoted ("The guidance says") in 14 of 37 regenerated teacher
+# turns. A bare note carrying a hint of at most 12 words was referred to in 2 of 37.
+turn_hint_template: "Note: {hint}"
 
 # Rollout-side apply_chat_template kwargs, mirrored when deriving header/hint fragments
 # (e.g. {enable_thinking: false} for Qwen3.5); must match the agent config's value
