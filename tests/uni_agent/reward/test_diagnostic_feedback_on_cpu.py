@@ -232,6 +232,54 @@ def test_old_pytest_lifts_truncation_for_the_evaluation_only(tmp_path, monkeypat
     assert truncate._should_truncate_item(types.SimpleNamespace(config=Config()))
 
 
+def _run_pytest(tmp_path, plugin, extra_env=()):
+    (tmp_path / "test_cases.py").write_text("def test_ok():\n    pass\n")
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(tmp_path),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "UNI_AGENT_FEEDBACK_PATH": str(tmp_path / "events.jsonl"),
+        "UNI_AGENT_FEEDBACK_ROOT": str(tmp_path),
+        **dict(extra_env),
+    }
+    env.pop("PYTEST_ADDOPTS", None)
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-rA", "--color=no", "-p", plugin, "-p", "no:cacheprovider", "test_cases.py"],
+        cwd=tmp_path, env=env, text=True, capture_output=True, timeout=30,
+    )
+
+
+def test_the_plugin_parses_on_the_oldest_task_interpreters():
+    import ast
+
+    source = (Path(__file__).resolve().parents[3] / "uni_agent/reward/pytest_feedback_capture.py").read_text()
+    # Python 3.6 rejects `from __future__ import annotations` (SWE-bench's sklearn environments)
+    assert "from __future__ import annotations" not in source
+    ast.parse(source, feature_version=(3, 6))
+
+
+def test_a_plugin_the_interpreter_cannot_import_leaves_the_tests_running(tmp_path):
+    from uni_agent.reward.feedback_capture import SHIM
+
+    (tmp_path / "broken_impl.py").write_text("from __future__ import not_a_feature\n")
+    (tmp_path / "capture_shim.py").write_text(SHIM.format(impl="broken_impl"))
+    proc = _run_pytest(tmp_path, "capture_shim")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "PASSED test_cases.py::test_ok" in proc.stdout
+
+
+def test_a_failing_configure_disables_capture_and_leaves_the_tests_running(tmp_path):
+    from uni_agent.reward.feedback_capture import SHIM
+
+    plugin = Path(__file__).resolve().parents[3] / "uni_agent/reward/pytest_feedback_capture.py"
+    (tmp_path / "capture_impl.py").write_text(plugin.read_text())
+    (tmp_path / "capture_shim.py").write_text(SHIM.format(impl="capture_impl"))
+    proc = _run_pytest(tmp_path, "capture_shim", {"UNI_AGENT_FEEDBACK_VALUE_CHARS": "not-a-number"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "PASSED test_cases.py::test_ok" in proc.stdout
+    assert "Feedback capture disabled" in (tmp_path / "events.jsonl").read_text()
+
+
 def test_junit_preserves_duplicate_phase_records_complex_ids_and_captures():
     xml = """<testsuite><testcase classname="test_cases" name="test_f[a::b]">
     <failure message="call">original assertion</failure><system-out>runtime clue</system-out></testcase>

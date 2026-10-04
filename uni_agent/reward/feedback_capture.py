@@ -7,6 +7,8 @@ from pathlib import Path
 
 from uni_agent.reward.diagnostic_feedback import load_capture
 
+SHIM = "try:\n    from {impl} import *\nexcept Exception:\n    pass\n"
+
 
 async def install_capture(env, context: dict, value_chars: int = 4096):
     suffix = uuid.uuid4().hex
@@ -14,7 +16,9 @@ async def install_capture(env, context: dict, value_chars: int = 4096):
     report = Path(f"/tmp/{module}.jsonl")
     metadata = Path(f"/tmp/{module}.context.json")
     plugin = Path(__file__).with_name("pytest_feedback_capture.py").read_text()
-    await env.write_file(Path(f"/tmp/{module}.py"), plugin)
+    await env.write_file(Path(f"/tmp/{module}_impl.py"), plugin)
+    # pytest loads this shim: a plugin the task's interpreter cannot import must leave the tests running
+    await env.write_file(Path(f"/tmp/{module}.py"), SHIM.format(impl=f"{module}_impl"))
     await env.write_file(metadata, json.dumps(context))
     lines = [
         'export PYTHONPATH="/tmp:${PYTHONPATH:-}"',

@@ -4,8 +4,6 @@ No uni-agent imports or model dependencies. Incremental reports survive interrup
 sessions; this plugin observes tests without changing their outcomes.
 """
 
-from __future__ import annotations
-
 import ast
 import hashlib
 import inspect
@@ -209,6 +207,17 @@ def _lift_truncation(config):
 
 
 def pytest_configure(config):
+    global _ACTIVE_CONFIG
+    try:
+        _configure(config)
+    except Exception as exc:
+        if _ACTIVE_CONFIG is config:
+            _ACTIVE_CONFIG = None
+        _ENABLED[config] = False
+        _emit(capture_error=f"Feedback capture disabled: {type(exc).__name__}: {exc}")
+
+
+def _configure(config):
     global _ROOT, _FILE, _VALUE_CHARS, _ACTIVE_CONFIG
     config_root = Path(str(getattr(config, "rootpath", getattr(config, "rootdir", Path.cwd())))).resolve()
     root = Path(os.environ.get("UNI_AGENT_FEEDBACK_ROOT", str(config_root))).resolve()
@@ -304,5 +313,5 @@ def pytest_sessionfinish(session, exitstatus):
     global _ACTIVE_CONFIG
     if not _ENABLED.get(session.config):
         return
-    _emit(session={"complete": True, "exitstatus": int(exitstatus), "collected": session.testscollected})
+    _emit(session={"complete": True, "exitstatus": int(exitstatus), "collected": getattr(session, "testscollected", None)})
     _ACTIVE_CONFIG = None
