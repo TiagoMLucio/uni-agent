@@ -84,6 +84,19 @@ def test_an_untracked_file_still_reaches_the_patch(tmp_path):
     assert "reproduce.py" in out.read_text()
 
 
+@pytest.mark.skipif(shutil.which("iconv") is None, reason="needs iconv")
+def test_a_created_file_that_is_not_utf8_stays_out_of_the_patch(tmp_path):
+    """Git calls it text (no NUL byte), so it used to reach the patch, which then failed to decode."""
+    repo = _repo(tmp_path)
+    (repo / "prof.out").write_bytes(b"cProfile\x80\x93 dump\n")
+    out = tmp_path / "patch.diff"
+    output = _run(patch_extract_command(str(out), repo_dir=str(repo)))
+    assert PATCH_EXTRACT_OK in output
+    patch = out.read_bytes().decode("utf-8")
+    assert "return 2" in patch and "prof.out" not in patch
+    assert (repo / "prof.out").exists(), "unstaged, not deleted"
+
+
 def test_a_failing_cd_does_not_pass_for_an_empty_patch(tmp_path):
     """The real `/testbed`, which does not exist here: the old command diffed the cwd instead."""
     out = tmp_path / "patch.diff"

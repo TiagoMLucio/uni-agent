@@ -18,7 +18,9 @@ def patch_extract_command(patch_file: str, diff_args: str = "", repo_dir: str = 
     whatever directory the session is in and a failed ``git add`` diffs an unstaged index.
 
     A text diff cannot carry a binary (git emits only "Binary files differ", which no apply
-    command accepts), so binaries the agent left behind are unstaged first. ``diff_args`` are
+    command accepts), so binaries the agent left behind are unstaged first. Git calls a file
+    binary only on a NUL byte, so created files that are not UTF-8 go too: a profiler dump that
+    passed as text made the patch unreadable and zeroed a correct fix. ``diff_args`` are
     extra git-diff flags for the reflector's copy; the graded prediction is always taken with
     none. The attributes file is what makes ``-W`` find Python function boundaries: without it
     git falls back to a heuristic that expands every hunk to the whole file.
@@ -28,6 +30,9 @@ def patch_extract_command(patch_file: str, diff_args: str = "", repo_dir: str = 
         f"cd {repo_dir} && printf '*.py diff=python\\n' > {attrs} && git add -A && "
         "{ git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
         "| xargs -r -d '\\n' git reset -q -- ; "
+        "git diff --cached --name-only --diff-filter=A -z | { command -v iconv >/dev/null && "
+        "xargs -0 -r sh -c 'for f; do iconv -f UTF-8 -t UTF-8 \"$f\" >/dev/null 2>&1 || "
+        "git reset -q -- \"$f\"; done' _ ; } ; "
         f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
         f"> {patch_file} ; }} && echo {PATCH_EXTRACT_OK}"
     )
