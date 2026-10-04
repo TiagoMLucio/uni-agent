@@ -1,11 +1,12 @@
 """A reflector served by a hosted model instead of the policy: the OpenAI Responses API, or any
 OpenAI-compatible Chat Completions endpoint (``base_url``).
 
-One call per failed trace. The prompt is a labeling brief (diagnose the remaining problems, grade
-every turn as a hint position, name the best turns), so the answer is a JSON object under a fixed
-schema and its best turns, in the model's order, become the hints. The trajectory is rendered in
-the tagged form that brief was measured on: each turn shows the tool output the agent saw right
-before writing it, then what the agent wrote and the tool it called.
+One call per failed trace. The prompt is a labeling brief answered as a JSON object under a fixed
+schema: the v4 brief grades every turn and names the best ones, which become the hints in the
+model's order (``parse: hints``); the protocol brief names one turn and its hint (``parse:
+turn_hint``). The trajectory is rendered in the tagged form those briefs were measured on: each
+turn shows the tool output the agent saw right before writing it, then what the agent wrote and
+the tool it called.
 """
 
 import asyncio
@@ -61,6 +62,11 @@ _TOP = {"type": "array", "maxItems": 3, "items": {
         "turn": {"type": "integer"}, "problem": {"type": "string"}, "hint": {"type": "string"}, "why": {"type": "string"}}}}
 ANSWER_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["problems", "turns", "top"],
                  "properties": {"problems": _PROBLEMS, "turns": _TURNS, "top": _TOP}}
+#: written in this order, so the turn is chosen after naming the problem and the hint after its evidence
+TURN_HINT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["problem", "turn", "evidence", "hint"],
+                    "properties": {"problem": {"type": "string"}, "turn": {"type": "integer"},
+                                   "evidence": {"type": "string"}, "hint": {"type": "string"}}}
+SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -112,6 +118,8 @@ class ApiReflectionConfig(BaseReflectionConfig):
     def _check_calls(self):
         if len(self.calls) != 1:
             raise ValueError("the api reflector makes exactly one call per trace")
+        if self.calls[0].parse not in SCHEMAS:
+            raise ValueError(f"the api reflector's call parses its answer as one of {sorted(SCHEMAS)}")
         unknown = _fields(self.calls[0].user) - FIELDS
         if unknown:
             raise ValueError(f"call {self.calls[0].id!r} references fields it cannot be given: {sorted(unknown)}")
@@ -163,7 +171,8 @@ class ApiReflector(AbstractReflector):
                     try:
                         with rollout_trace_span(f"reflect:{call.id}", metadata={
                                 "model": cfg.model, "obs_cap": obs_cap, "resp_cap": resp_cap}):
-                            text, usage, status = await self._request(client, RateLimitError, messages, max_tokens)
+                            text, usage, status = await self._request(
+                                client, RateLimitError, messages, max_tokens, call.parse)
                     except BadRequestError as exc:
                         if "context" not in str(exc).lower():
                             self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
@@ -176,7 +185,7 @@ class ApiReflector(AbstractReflector):
                         self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
                         await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=repr(exc))
                         return {}
-                    hints, leaks = self._hints(text, turns, task)
+                    hints, leaks = self._hints(text, turns, task, call.parse)
                     await self._record(call.id, None, messages, text, usage.get("input_tokens"), obs_cap, resp_cap,
                                        draw=draw, extra={"model": cfg.model, "status": status,
                                                          "seconds": round(time.monotonic() - start, 1),
@@ -193,15 +202,16 @@ class ApiReflector(AbstractReflector):
         self.logger.warning("Reflection skipped: render over budget at every shrink level")
         return {}
 
-    async def _request(self, client, rate_limit_error, messages, max_tokens) -> tuple[str, dict, str]:
+    async def _request(self, client, rate_limit_error, messages, max_tokens, parse) -> tuple[str, dict, str]:
         """One call on either API: (reply text, token use, completion status)."""
         cfg = self.config
         if cfg.base_url is None:
+            name, schema = SCHEMAS[parse]
             response = await self._create(
                 client.responses.create, rate_limit_error,
                 model=cfg.model, instructions=messages[0]["content"], input=messages[1]["content"],
                 reasoning={"effort": cfg.reasoning_effort}, max_output_tokens=max_tokens,
-                text={"format": {"type": "json_schema", "name": "hint_positions", "schema": ANSWER_SCHEMA, "strict": True}},
+                text={"format": {"type": "json_schema", "name": name, "schema": schema, "strict": True}},
             )
             u = response.usage
             usage = {} if u is None else {
@@ -250,11 +260,17 @@ class ApiReflector(AbstractReflector):
             self._counts[f"reflect_{key}"] += value
         return usage
 
-    def _hints(self, text: str, turns: list[dict], task: str) -> tuple[dict[int, str], dict[int, list[str]]]:
+    def _hints(self, text: str, turns: list[dict], task: str,
+               parse: str = "hints") -> tuple[dict[int, str], dict[int, list[str]]]:
         """The best turns in the model's order, capped at the budget, with the names each hint
         cites that the agent had not seen before that turn (logged, never used to drop a hint)."""
         answer = self._extract_json_object(text, strict=False)
-        top = answer.get("top") if isinstance(answer, dict) else None
+        if not isinstance(answer, dict):
+            top = []
+        elif parse == "turn_hint":
+            top = [{"turn": answer.get("turn"), "hint": answer.get("hint")}]
+        else:
+            top = answer.get("top")
         valid = {turn["step"] for turn in turns}
         hints: dict[int, str] = {}
         for pick in top if isinstance(top, list) else []:

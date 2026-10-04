@@ -87,11 +87,11 @@ def reflect(monkeypatch, replies, turns=TURNS, feedback="1 failed", agent_patch=
             policy=None, **over):
     seen = []
     monkeypatch.setitem(sys.modules, "openai", fake_openai(replies, seen))
-    cfg = ApiReflector.Config(
-        name="openai", model="gpt-6-luna", enabled=True,
-        calls=[{"id": "luna", "system": "sys", "parse": "hints",
-                "user": "{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}],
-        **over)
+    cfg = ApiReflector.Config(**{
+        "name": "openai", "model": "gpt-6-luna", "enabled": True,
+        "calls": [{"id": "luna", "system": "sys", "parse": "hints",
+                   "user": "{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}],
+        **over})
     r = ApiReflector(policy or Policy(), cfg)
     hints = asyncio.run(r.reflect_trajectory(task=TASK, turns=turns, gold="diff --git a/a.py b/a.py\n+x",
                                              feedback=feedback, agent_patch=agent_patch))
@@ -160,6 +160,30 @@ def test_response_cut_keeps_the_agents_words():
     assert "I will write the module." in out and "t" * 100 not in out
     assert "str_replace_editor create /testbed/a.py\n<file_text>" in out and "chars elided" in out
     assert len(out) < 3_800
+
+
+def turn_hint(turn, hint):
+    return json.dumps({"problem": "p", "turn": turn, "evidence": "e", "hint": hint})
+
+
+def test_turn_hint_answer(monkeypatch):
+    hints, seen, _ = reflect(monkeypatch, [turn_hint(9, "no such turn"), turn_hint(1, "check `parse_row`")],
+                             calls=[{"id": "luna", "system": "sys", "parse": "turn_hint",
+                                     "user": "{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}])
+    assert hints == {1: "check `parse_row`"} and len(seen) == 2
+    assert seen[0]["text"]["format"]["name"] == "hint_turn" and seen[0]["text"]["format"]["strict"]
+
+
+def test_parse_belongs_to_its_reflector():
+    import pytest
+    from uni_agent.reflection.pipeline import PipelineReflectionConfig
+
+    with pytest.raises(ValueError, match="parses its answer"):
+        ApiReflector.Config(name="openai", model="m", calls=[{"id": "x", "system": "s", "user": "{turns}"}])
+    with pytest.raises(ValueError, match="api reflector's answer"):
+        PipelineReflectionConfig(name="pipeline", calls=[
+            {"id": "a", "system": "s", "user": "{turns}", "parse": "turn_hint"},
+            {"id": "b", "system": "s", "user": "{turns}", "parse": "hints"}])
 
 
 def test_chat_completions_endpoint(monkeypatch):

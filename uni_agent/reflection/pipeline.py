@@ -64,7 +64,8 @@ class CallSpec(BaseModel):
     system: str
     user: str
     per: Literal["trace", "turn"] = "trace"
-    parse: Literal["text", "turns", "hints"] = "text"
+    #: ``turn_hint`` is the api reflector's answer naming one turn and its hint
+    parse: Literal["text", "turns", "hints", "turn_hint"] = "text"
     #: ``delete_only`` refuses a reply that introduces a word the draft did not have. The stage
     #: sees the draft, which was written with the patch, so an unconstrained rewrite can restate
     #: privileged content the stage itself never saw.
@@ -90,6 +91,8 @@ class PipelineReflectionConfig(BaseReflectionConfig):
             unknown = _fields(call.user) - allowed
             if unknown:
                 raise ValueError(f"call {call.id!r} references fields it cannot be given: {sorted(unknown)}")
+            if call.parse == "turn_hint":
+                raise ValueError(f"call {call.id!r}: parse=turn_hint is the api reflector's answer")
             if call.per == "turn" and call.parse == "turns":
                 raise ValueError(f"call {call.id!r}: a per-turn call cannot select the turns")
             if call.edit == "delete_only" and call.parse != "hints":
