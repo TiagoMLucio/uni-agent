@@ -36,7 +36,10 @@ RATE_LIMIT_WAIT_S = 1800.0
 #: one whole reflection, retries and rate-limit waits included: the step waits for every rollout,
 #: and a stalled request is resent MAX_RETRIES times at TIMEOUT_S each
 WALL_S = 1800.0
-RETRY_IN = re.compile(r"try again in ([\d.]+)(ms|s)")
+#: "try again in 1.2s", "20ms", "6m0s", "7h12m0s": a per-day limit asks for hours
+RETRY_IN = re.compile(r"try again in ((?:[\d.]+(?:ms|h|m|s))+)")
+RETRY_UNIT = re.compile(r"([\d.]+)(ms|h|m|s)")
+SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
 #: chat-template control tokens and lone surrogates: the teacher encodes a hint with special tokens parsed
 UNSAFE = re.compile(r"<\|[^<>|\n]*\|>|</?(?:tool_call|tool_response|think)>|[\ud800-\udfff]")
 #: token use per call, summed over the trajectory's calls
@@ -103,6 +106,14 @@ def unseen_names(hint: str, seen: str) -> list[str]:
     names = {name for quoted in QUOTED.findall(hint) for name in IDENT.findall(quoted) if len(name) >= 3}
     names |= set(BARE.findall(QUOTED.sub(" ", hint)))
     return sorted(name for name in names if name not in seen and not all(part in seen for part in name.split(".")))
+
+
+def retry_after(message: str) -> float | None:
+    """The wait a 429 asks for, in seconds; ``None`` when it names none."""
+    match = RETRY_IN.search(message)
+    if match is None:
+        return None
+    return sum(float(n) * SECONDS[unit] for n, unit in RETRY_UNIT.findall(match.group(1)))
 
 
 class ApiReflectionConfig(BaseReflectionConfig):
@@ -247,7 +258,8 @@ class ApiReflector(AbstractReflector):
         return choice.message.content or "", self._tally(usage), choice.finish_reason
 
     async def _create(self, create, rate_limit_error, **request):
-        """One request, waiting out 429s for as long as the API asks, up to RATE_LIMIT_WAIT_S in all."""
+        """One request, waiting out 429s for as long as the API asks, up to RATE_LIMIT_WAIT_S in all;
+        a wait that would pass it (a per-day limit) fails at once."""
         deadline = time.monotonic() + RATE_LIMIT_WAIT_S
         while True:
             try:
@@ -256,9 +268,8 @@ class ApiReflector(AbstractReflector):
                 # a spent quota, or one request above the per-minute limit, never clears by waiting
                 if "insufficient_quota" in str(exc) or "Request too large" in str(exc):
                     raise
-                match = RETRY_IN.search(str(exc))
-                wait = (float(match.group(1)) / (1000 if match.group(2) == "ms" else 1)) if match else 20.0
-                wait += random.uniform(1.0, 10.0)
+                wait = retry_after(str(exc))
+                wait = (20.0 if wait is None else wait) + random.uniform(1.0, 10.0)
                 if time.monotonic() + wait > deadline:
                     raise
                 self._counts["reflect_rate_limited"] += 1

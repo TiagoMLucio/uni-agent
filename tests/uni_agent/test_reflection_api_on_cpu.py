@@ -240,6 +240,24 @@ def test_a_429_that_never_clears_is_not_waited_out(monkeypatch, message):
     assert len(seen) == 1 and r.call_metrics()["reflect_rate_limited"] == 0
 
 
+def test_the_asked_wait_is_read_in_any_unit():
+    from uni_agent.reflection.api import retry_after
+    assert retry_after("Please try again in 2s.") == 2.0 and retry_after("try again in 20ms") == 0.02
+    assert retry_after("try again in 6m0s.") == 360.0 and retry_after("try again in 1h2m3.5s") == 3723.5
+    assert retry_after("Rate limit reached for requests") is None
+
+
+def test_a_per_day_limit_is_not_waited_out_but_a_per_minute_one_is(monkeypatch):
+    from uni_agent.reflection import api
+    monkeypatch.setattr(api.random, "uniform", lambda a, b: 0.0)
+    day = RateLimitError("Rate limit reached ... on requests per day (RPD): Limit 10000. Please try again in 7h12m0s.")
+    _, seen, r = reflect(monkeypatch, [day, answer((1, "ok"))], raises=ReflectionFailed)
+    assert len(seen) == 1 and r.call_metrics()["reflect_rate_limited"] == 0
+    minute = RateLimitError("Rate limit reached ... on tokens per min (TPM): Limit 200000. Please try again in 15ms.")
+    hints, seen, r = reflect(monkeypatch, [minute, answer((1, "ok"))])
+    assert hints == {1: "ok"} and len(seen) == 2 and r.call_metrics()["reflect_rate_limited"] == 1
+
+
 def test_a_stalled_call_ends_at_the_wall_budget(monkeypatch):
     from uni_agent.reflection import api
     monkeypatch.setattr(api, "WALL_S", 0.05)
