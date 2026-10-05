@@ -934,38 +934,47 @@ def _limited_output(summary, entries, max_chars, data, neighbors):
         if len("\n".join([*base, line, END])) + 180 <= max_chars:
             base.append(line)
 
+    def count_line(missing, shown):
+        return f"Test details omitted for {missing} tests; {missing - shown} additional test identifiers omitted."
+
     def compose(selected, identifiers=()):
         shared = {"values": {}, "frames": {}, "sources": set()}
         blocks = [_render_entry(entries[i], data, "summary", neighbors, shared) for i in selected]
         missing = len(entries) - len(selected)
-        footer = (
-            "\n".join(
-                [
-                    OMISSIONS,
-                    *identifiers,
-                    f"Test details omitted for {missing} tests; "
-                    f"{missing - len(identifiers)} additional test identifiers omitted.",
-                ]
-            )
-            if missing
-            else ""
-        )
+        footer = "\n".join([OMISSIONS, *identifiers, count_line(missing, len(identifiers))]) if missing else ""
         return "\n\n".join(filter(None, ["\n".join(base), DETAILS if blocks else "", *blocks, footer, END]))
 
-    # Even if the identifiers alone cannot fit, a real error takes precedence.
-    # Recompose shared references only from records actually included.
-    selected = []
+    def ending(missing, listed=0, shown=0):
+        """Characters compose adds after the records; listed counts the identifier lines with their newlines."""
+        return (2 + len(OMISSIONS) + listed + 1 + len(count_line(missing, shown)) if missing else 0) + 2 + len(END)
+
+    def render(i, shared):
+        shared = {key: references.copy() for key, references in shared.items()}
+        # A comprehension, as in compose: before Python 3.12 its frame counts toward the recursion limit.
+        [block] = [_render_entry(entries[j], data, "summary", neighbors, shared) for j in [i]]
+        return block, shared
+
+    # Even if the identifiers alone cannot fit, a real error takes precedence. Each candidate follows
+    # every selected record, so only its own block is new, rendered on a copy of the shared references.
+    selected, shared, head = [], {"values": {}, "frames": {}, "sources": set()}, len("\n".join(base))
     for i, entry in enumerate(entries):
-        if entry["events"] and len(compose([*selected, i])) <= max_chars:
+        if not entry["events"]:
+            continue
+        block, after = render(i, shared)
+        grown = head + (0 if selected else 2 + len(DETAILS)) + 2 + len(block)
+        if grown + ending(len(entries) - len(selected) - 1) <= max_chars:
             selected.append(i)
-    kept = []
+            shared, head = after, grown
+    kept, listed = [], 0
     selected_set = set(selected)
+    missing = len(entries) - len(selected)
     for i, entry in enumerate(entries):
         if i in selected_set:
             continue
         line = "- " + _entry_description(entry)
-        if len(compose(selected, [*kept, line])) <= max_chars:
+        if head + ending(missing, listed + len(line) + 1, len(kept) + 1) <= max_chars:
             kept.append(line)
+            listed += len(line) + 1
     text = compose(selected, kept)
     if len(text) <= max_chars:
         return text
