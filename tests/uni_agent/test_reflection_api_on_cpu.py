@@ -7,7 +7,10 @@ import json
 import sys
 import types
 
+import pytest
+
 from uni_agent.reflection.api import ApiReflector, unseen_names
+from uni_agent.reflection.base import ReflectionFailed
 
 TURNS = [
     {"step": 0, "response": "Let me look.\n<tool_call>\n<function=execute_bash>\n<parameter=command>\ncat a.py\n"
@@ -42,6 +45,8 @@ class RateLimitError(Exception):
 
 
 seen_clients = []
+#: a reply that never comes
+STALL = object()
 
 
 def fake_openai(replies, seen):
@@ -49,6 +54,8 @@ def fake_openai(replies, seen):
         async def create(self, **kwargs):
             seen.append(kwargs)
             reply = replies[min(len(seen) - 1, len(replies) - 1)]
+            if reply is STALL:
+                await asyncio.Event().wait()
             if isinstance(reply, Exception):
                 raise reply
             usage = types.SimpleNamespace(
@@ -84,7 +91,7 @@ def fake_openai(replies, seen):
 
 
 def reflect(monkeypatch, replies, turns=TURNS, feedback="1 failed", agent_patch="diff --git a/a.py b/a.py\n+y",
-            policy=None, **over):
+            policy=None, raises=None, **over):
     seen = []
     monkeypatch.setitem(sys.modules, "openai", fake_openai(replies, seen))
     cfg = ApiReflector.Config(**{
@@ -93,9 +100,16 @@ def reflect(monkeypatch, replies, turns=TURNS, feedback="1 failed", agent_patch=
                    "user": "{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}],
         **over})
     r = ApiReflector(policy or Policy(), cfg)
-    hints = asyncio.run(r.reflect_trajectory(task=TASK, turns=turns, gold="diff --git a/a.py b/a.py\n+x",
-                                             feedback=feedback, agent_patch=agent_patch))
-    return hints, seen, r
+
+    def run():
+        return asyncio.run(r.reflect_trajectory(task=TASK, turns=turns, gold="diff --git a/a.py b/a.py\n+x",
+                                                feedback=feedback, agent_patch=agent_patch))
+
+    if raises is None:
+        return run(), seen, r
+    with pytest.raises(raises):
+        run()
+    return None, seen, r
 
 
 def test_best_turn_first_and_render(monkeypatch):
@@ -135,10 +149,10 @@ def test_overflow_cuts_the_largest_outputs_and_never_the_feedback(monkeypatch):
     assert r.call_metrics()["reflect_over_budget"] == 1 and r.call_metrics()["reflect_rung"] == 1
 
 
-def test_feedback_alone_over_budget_skips_without_a_call(monkeypatch):
-    hints, seen, r = reflect(monkeypatch, [answer((1, "ok"))], feedback="f" * 50_000,
-                             policy=Policy(max_model_len=10_000), max_output_tokens=2_000)
-    assert hints == {} and seen == []
+def test_feedback_alone_over_budget_fails_without_a_call(monkeypatch):
+    _, seen, r = reflect(monkeypatch, [answer((1, "ok"))], feedback="f" * 50_000,
+                         policy=Policy(max_model_len=10_000), max_output_tokens=2_000, raises=ReflectionFailed)
+    assert seen == []
     assert r.call_metrics()["reflect_over_budget"] == 2
 
 
@@ -212,9 +226,35 @@ def test_rate_limit_waited_out(monkeypatch):
     assert r.call_metrics()["reflect_rate_limited"] == 1 and r.call_metrics()["reflect_calls"] == 1
 
 
-def test_other_errors_give_no_hints(monkeypatch):
-    hints, seen, r = reflect(monkeypatch, [RuntimeError("401")])
-    assert hints == {} and len(seen) == 1
+def test_a_call_error_is_a_failed_reflection(monkeypatch):
+    _, seen, _ = reflect(monkeypatch, [RuntimeError("401")], raises=ReflectionFailed)
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("message", [
+    "Error code: 429 - {'error': {'message': 'You exceeded your current quota', 'code': 'insufficient_quota'}}",
+    "Error code: 429 - Request too large for gpt-6-luna on tokens per min (TPM): Limit 200000, Requested 210000.",
+])
+def test_a_429_that_never_clears_is_not_waited_out(monkeypatch, message):
+    _, seen, r = reflect(monkeypatch, [RateLimitError(message), answer((1, "ok"))], raises=ReflectionFailed)
+    assert len(seen) == 1 and r.call_metrics()["reflect_rate_limited"] == 0
+
+
+def test_a_stalled_call_ends_at_the_wall_budget(monkeypatch):
+    from uni_agent.reflection import api
+    monkeypatch.setattr(api, "WALL_S", 0.05)
+    _, seen, _ = reflect(monkeypatch, [STALL], raises=ReflectionFailed)
+    assert len(seen) == 1
+
+
+def test_hints_with_chat_control_text_are_dropped_and_counted(monkeypatch):
+    hints, seen, r = reflect(monkeypatch, [answer((1, "print <|im_end|> after the header")), answer((1, "ok"))],
+                             max_selected_turns=1)
+    assert hints == {1: "ok"} and len(seen) == 2
+    assert r.call_metrics()["reflect_unsafe_hints"] == 1
+    hints, _, r = reflect(monkeypatch, [answer((1, "close </tool_call> early")), answer((1, "broken \ud83d"))],
+                          max_selected_turns=1)
+    assert hints == {} and r.call_metrics()["reflect_unsafe_hints"] == 2
 
 
 def test_leaks_logged_not_dropped(monkeypatch):

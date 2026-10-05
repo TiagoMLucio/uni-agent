@@ -18,7 +18,7 @@ from typing import ClassVar
 
 from pydantic import model_validator
 
-from uni_agent.reflection.base import OVER_BUDGET, AbstractReflector, BaseReflectionConfig
+from uni_agent.reflection.base import OVER_BUDGET, AbstractReflector, BaseReflectionConfig, ReflectionFailed
 from uni_agent.reflection.facts import patch_view
 from uni_agent.reflection.pipeline import CallSpec, PipelineReflectionConfig, _fields
 from uni_agent.reflection.registry import register_reflector
@@ -33,7 +33,12 @@ MAX_RETRIES = 8
 #: how long one reflection keeps waiting out the account's tokens-per-minute limit: the failed
 #: rollouts of a step all ask at once, and the client's own backoff gives up within seconds
 RATE_LIMIT_WAIT_S = 1800.0
+#: one whole reflection, retries and rate-limit waits included: the step waits for every rollout,
+#: and a stalled request is resent MAX_RETRIES times at TIMEOUT_S each
+WALL_S = 1800.0
 RETRY_IN = re.compile(r"try again in ([\d.]+)(ms|s)")
+#: chat-template control tokens and lone surrogates: the teacher encodes a hint with special tokens parsed
+UNSAFE = re.compile(r"<\|[^<>|\n]*\|>|</?(?:tool_call|tool_response|think)>|[\ud800-\udfff]")
 #: token use per call, summed over the trajectory's calls
 USAGE = ("reflect_input_tokens", "reflect_cached_tokens", "reflect_output_tokens", "reflect_reasoning_tokens")
 
@@ -161,6 +166,7 @@ class ApiReflector(AbstractReflector):
         def render_user(obs_cap, resp_cap):
             return call.user.format(**values, turns=self._render_attempt(turns, obs_cap, resp_cap))
 
+        deadline = time.monotonic() + WALL_S
         async with AsyncOpenAI(api_key=os.environ.get(cfg.api_key_env), base_url=cfg.base_url,
                                timeout=TIMEOUT_S, max_retries=MAX_RETRIES) as client:
             async for rung, obs_cap, resp_cap, messages, _, _ in self._renders(
@@ -171,20 +177,25 @@ class ApiReflector(AbstractReflector):
                     try:
                         with rollout_trace_span(f"reflect:{call.id}", metadata={
                                 "model": cfg.model, "obs_cap": obs_cap, "resp_cap": resp_cap}):
-                            text, usage, status = await self._request(
-                                client, RateLimitError, messages, max_tokens, call.parse)
+                            text, usage, status = await asyncio.wait_for(
+                                self._request(client, RateLimitError, messages, max_tokens, call.parse),
+                                timeout=deadline - start)
                     except BadRequestError as exc:
                         if "context" not in str(exc).lower():
                             self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
                             await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=repr(exc))
-                            return {}
+                            raise ReflectionFailed(f"reflection call failed: {exc!r}") from exc
                         self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
                         await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=OVER_BUDGET)
                         break
+                    except asyncio.TimeoutError as exc:
+                        await self._record(call.id, None, messages, None, None, obs_cap, resp_cap,
+                                           error=f"over the {WALL_S:.0f} s wall budget")
+                        raise ReflectionFailed(f"reflection over its {WALL_S:.0f} s wall budget") from exc
                     except Exception as exc:
                         self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
                         await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=repr(exc))
-                        return {}
+                        raise ReflectionFailed(f"reflection call failed: {exc!r}") from exc
                     hints, leaks = self._hints(text, turns, task, call.parse)
                     await self._record(call.id, None, messages, text, usage.get("input_tokens"), obs_cap, resp_cap,
                                        draw=draw, extra={"model": cfg.model, "status": status,
@@ -199,8 +210,7 @@ class ApiReflector(AbstractReflector):
                 else:
                     # a reply the parser could not use is no reason to ask again from a smaller view
                     return {}
-        self.logger.warning("Reflection skipped: render over budget at every shrink level")
-        return {}
+        raise ReflectionFailed("render over budget at every shrink level")
 
     async def _request(self, client, rate_limit_error, messages, max_tokens, parse) -> tuple[str, dict, str]:
         """One call on either API: (reply text, token use, completion status)."""
@@ -243,6 +253,9 @@ class ApiReflector(AbstractReflector):
             try:
                 return await create(**request)
             except rate_limit_error as exc:
+                # a spent quota, or one request above the per-minute limit, never clears by waiting
+                if "insufficient_quota" in str(exc) or "Request too large" in str(exc):
+                    raise
                 match = RETRY_IN.search(str(exc))
                 wait = (float(match.group(1)) / (1000 if match.group(2) == "ms" else 1)) if match else 20.0
                 wait += random.uniform(1.0, 10.0)
@@ -252,8 +265,8 @@ class ApiReflector(AbstractReflector):
                 await asyncio.sleep(wait)
 
     def call_metrics(self) -> dict[str, float]:
-        return {**super().call_metrics(),
-                **{key: float(self._counts[key]) for key in (*USAGE, "reflect_leaky_hints", "reflect_rate_limited")}}
+        return {**super().call_metrics(), **{key: float(self._counts[key]) for key in (
+            *USAGE, "reflect_leaky_hints", "reflect_rate_limited", "reflect_unsafe_hints")}}
 
     def _tally(self, usage: dict[str, int]) -> dict[str, int]:
         for key, value in usage.items():
@@ -278,6 +291,10 @@ class ApiReflector(AbstractReflector):
                 break
             step, hint = (pick.get("turn"), pick.get("hint")) if isinstance(pick, dict) else (None, None)
             if step in valid and step not in hints and isinstance(hint, str) and hint.strip():
+                if UNSAFE.search(hint):
+                    self._counts["reflect_unsafe_hints"] += 1
+                    self.logger.warning(f"Hint for turn {step} dropped, it carries chat control text: {hint!r}")
+                    continue
                 hints[step] = self._clip_diagnosis(hint.strip())
         leaks = {}
         for step in hints:
