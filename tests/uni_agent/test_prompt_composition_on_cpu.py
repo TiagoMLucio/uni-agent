@@ -167,6 +167,12 @@ def test_the_reward_flags_are_absent_when_the_reward_did_not_report_them():
     assert out["eval_completed"] == 1.0 and out["patch_apply_failed"] == 0.0
 
 
+def test_a_feedback_render_failure_reaches_the_metrics_only_when_reported():
+    assert reward_metrics({"feedback_render_failed": True}, source_edited=0.0)["feedback_render_failed"] == 1.0
+    assert reward_metrics({"feedback_render_failed": False}, source_edited=0.0)["feedback_render_failed"] == 0.0
+    assert "feedback_render_failed" not in reward_metrics({}, source_edited=0.0)
+
+
 def test_empty_patch_after_source_edit_needs_a_source_edit():
     assert reward_metrics({"empty_patch": True}, source_edited=1.0)["empty_patch_after_source_edit"] == 1.0
     assert reward_metrics({"empty_patch": True}, source_edited=0.0)["empty_patch_after_source_edit"] == 0.0

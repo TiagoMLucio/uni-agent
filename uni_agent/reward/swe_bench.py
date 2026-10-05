@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import re
@@ -23,6 +24,7 @@ from swebench.harness.utils import get_modified_files
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction import AgentEnv
+from uni_agent.interaction.env import clip_output
 from uni_agent.reward.base import (
     PATCH_EXTRACT_OK,
     AbstractRewardSpec,
@@ -94,6 +96,8 @@ def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commi
 
 #: Parts rendered (in order) when ``FeedbackConfig.parts`` is not configured.
 DEFAULT_FEEDBACK_PARTS = ["summary", "failing_tests", "regressions", "failure_mode"]
+#: heads the raw test output that stands in when the renderer itself fails
+RENDER_FAILED = "[The feedback renderer failed on this run; the raw test output follows.]"
 
 #: Every entry in ``FeedbackConfig.parts`` must be one of these.
 SUPPORTED_FEEDBACK_PARTS = [
@@ -377,6 +381,17 @@ class FeedbackConfig(BaseModel):
 
     def _item_template(self, part: str) -> str:
         return self.item_templates.get(part) or DEFAULT_FEEDBACK_ITEM_TEMPLATES.get(part, "- {test}")
+
+    def render_or_raw(self, logger, **kwargs) -> tuple[str | None, bool]:
+        """:meth:`render`, or the raw test output behind :data:`RENDER_FAILED` when the renderer
+        raises, and whether it did: a renderer bug must cost the feedback's form, not the rollout."""
+        try:
+            return self.render(**kwargs), False
+        except Exception:
+            logger.exception(f"Feedback render failed for {kwargs.get('instance_id') or '?'}; raw test output used")
+            # clip_output's own elision notice (under 80 chars) is not counted in its limit
+            raw = clip_output(kwargs.get("output") or "", max(0, self.max_chars - len(RENDER_FAILED) - 81))
+            return f"{RENDER_FAILED}\n{raw}", True
 
     def render(
         self, *, result: dict, output: str = "", patch: str | None = None, instance_id: str = "", seed: int = 0,
@@ -754,7 +769,10 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
         if self.feedback.enabled:
             instance_id = self.metadata.get("instance_id", "")
             with rollout_trace_span("feedback_render") as feedback_span:
-                extra_info["feedback"] = self.feedback.render(
+                # many failing tests take seconds to fit, and a worker's rollouts share this event loop
+                extra_info["feedback"], result["feedback_render_failed"] = await asyncio.to_thread(
+                    self.feedback.render_or_raw,
+                    self.logger,
                     result=result,
                     output=output,
                     patch=patch,

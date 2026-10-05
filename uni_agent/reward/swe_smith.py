@@ -19,6 +19,7 @@ the eval script is built and how its output is parsed/graded:
 Feedback rendering is identical, so we reuse :class:`~uni_agent.reward.swe_bench.FeedbackConfig`.
 """
 
+import asyncio
 import re
 import time
 import uuid
@@ -324,7 +325,10 @@ class SWESmithRewardSpec(AbstractRewardSpec):
         extra_info: dict = {}
         if self.feedback.enabled:
             with rollout_trace_span("feedback_render") as feedback_span:
-                extra_info["feedback"] = self.feedback.render(
+                # many failing tests take seconds to fit, and a worker's rollouts share this event loop
+                extra_info["feedback"], result["feedback_render_failed"] = await asyncio.to_thread(
+                    self.feedback.render_or_raw,
+                    self.logger,
                     result=result,
                     output=output,
                     patch=patch,

@@ -193,6 +193,8 @@ def reward_metrics(reward_result: dict, source_edited: float) -> dict[str, float
         # source was edited and none of it reached the graded patch: scored as an ordinary
         # wrong answer, so it biases every number the run reports
         out["empty_patch_after_source_edit"] = float(out["empty_patch"] > 0 and source_edited > 0)
+    if "feedback_render_failed" in reward_result:
+        out["feedback_render_failed"] = float(bool(reward_result["feedback_render_failed"]))
     return out
 
 
