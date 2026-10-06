@@ -70,9 +70,12 @@ def fake_openai(replies, seen, plan=()):
             yield types.SimpleNamespace(type="response.failed", response=types.SimpleNamespace(
                 error=types.SimpleNamespace(code=reply[1], message="failed")))
             return
-        yield types.SimpleNamespace(type="response.output_text.delta", delta=reply[:5])
+        # as the plan streams it: the answer only in the deltas, an unstored response completing with no output
+        for start in range(0, len(reply), 7):
+            yield types.SimpleNamespace(type="response.output_text.delta", delta=reply[start:start + 7])
+        yield types.SimpleNamespace(type="response.output_text.done", text=reply)
         yield types.SimpleNamespace(type="response.completed", response=types.SimpleNamespace(
-            output_text=reply, usage=plan_usage(), status="completed"))
+            output_text="", usage=plan_usage(), status="completed"))
 
     class PlanResponses:
         async def create(self, **kwargs):

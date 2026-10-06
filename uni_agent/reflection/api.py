@@ -294,10 +294,13 @@ class ApiReflector(AbstractReflector):
                         "reasoning": {"effort": cfg.reasoning_effort}, "store": False, "stream": True}
                 if self._plan_schema:
                     body["text"] = {"format": {"type": "json_schema", "name": name, "schema": schema, "strict": True}}
-                final = None
+                # unstored responses complete with an empty output: the answer exists only in the text deltas
+                final, text = None, ""
                 async with AsyncOpenAI(api_key=token, timeout=TIMEOUT_S, max_retries=0) as plan:
                     async for event in await plan.responses.create(**body):
-                        if event.type == "response.completed":
+                        if event.type == "response.output_text.delta":
+                            text += event.delta or ""
+                        elif event.type == "response.completed":
                             final = event.response
                         elif event.type in ("response.failed", "error"):
                             failed = getattr(getattr(event, "response", None), "error", None) or event
@@ -313,7 +316,7 @@ class ApiReflector(AbstractReflector):
                     "reasoning_tokens": getattr(u.output_tokens_details, "reasoning_tokens", 0) or 0,
                 }
                 self._counts["reflect_plan_calls"] += 1
-                return final.output_text or "", self._tally(usage), final.status
+                return text or final.output_text or "", self._tally(usage), final.status
             except chatgpt_plan.PlanUnavailable as exc:
                 self._plan_off = True
                 self.logger.warning(f"ChatGPT plan unavailable for the rest of the run, using the API key: {exc}")
