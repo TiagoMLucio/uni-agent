@@ -127,7 +127,8 @@ class ApiReflectionConfig(BaseReflectionConfig):
     base_url: str | None = None
     #: the environment variable holding the endpoint's key
     api_key_env: str = "OPENAI_API_KEY"
-    #: extra request parameters for a Chat Completions endpoint (the model's recommended sampling)
+    #: extra request parameters: a Chat Completions endpoint's recommended sampling, or the Responses API's
+    #: service_tier (flex bills half and may queue; its capacity 429s are waited out like rate limits)
     sampling: dict = {}
 
     @model_validator(mode="after")
@@ -233,6 +234,7 @@ class ApiReflector(AbstractReflector):
                 model=cfg.model, instructions=messages[0]["content"], input=messages[1]["content"],
                 reasoning={"effort": cfg.reasoning_effort}, max_output_tokens=max_tokens,
                 text={"format": {"type": "json_schema", "name": name, "schema": schema, "strict": True}},
+                **cfg.sampling,
             )
             u = response.usage
             usage = {} if u is None else {

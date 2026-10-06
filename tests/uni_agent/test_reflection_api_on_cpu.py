@@ -200,6 +200,11 @@ def test_parse_belongs_to_its_reflector():
             {"id": "b", "system": "s", "user": "{turns}", "parse": "hints"}])
 
 
+def test_responses_request_carries_the_extra_parameters(monkeypatch):
+    hints, seen, _ = reflect(monkeypatch, [answer((1, "ok"))], sampling={"service_tier": "flex"})
+    assert hints == {1: "ok"} and seen[0]["service_tier"] == "flex" and seen[0]["reasoning"] == {"effort": "high"}
+
+
 def test_chat_completions_endpoint(monkeypatch):
     monkeypatch.setenv("DEEPINFRA_API_KEY", "k")
     hints, seen, r = reflect(monkeypatch, [answer((1, "ok"))], base_url="https://api.deepinfra.com/v1/openai",
