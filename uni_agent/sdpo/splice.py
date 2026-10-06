@@ -80,9 +80,9 @@ def build_spliced_teacher_row(
     return torch.cat(pieces), pack(sub_rows), fallbacks, [(sub_row.start, sub_row.end) for sub_row in sub_rows]
 
 
-def turn_token_mask(response_len: int, spans: list[tuple[int, int]]) -> torch.Tensor:
-    """Per-token distillation mask: 1 on the scored spans, 0 elsewhere."""
+def turn_token_mask(response_len: int, spans: list[tuple[int, int]], skip: int = 0) -> torch.Tensor:
+    """Per-token distillation mask: 1 on the scored spans past their first ``skip`` tokens, 0 elsewhere."""
     mask = torch.zeros(response_len, dtype=torch.float32)
     for start, end in spans:
-        mask[start:end] = 1.0
+        mask[min(start + skip, end):end] = 1.0
     return mask

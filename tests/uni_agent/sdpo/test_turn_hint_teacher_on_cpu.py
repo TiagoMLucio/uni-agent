@@ -235,8 +235,8 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     params = inspect.signature(TurnHintTeacher.__init__).parameters
     trainer_provided = {"self", "tokenizer", "max_prefix_len", "apply_chat_template_kwargs", "success_reward_threshold"}
     assert set(options) - {"_target_"} == set(params) - trainer_provided
-    assert set(options) == {"_target_", "turn_hint_template", "chat_template_kwargs"}
-    assert options["chat_template_kwargs"] == {}
+    assert set(options) == {"_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens"}
+    assert options["chat_template_kwargs"] == {} and options["skip_first_tokens"] == 0
 
     teacher = make_teacher(
         SelfDistillationConfig(teacher=turn_hints_options(chat_template_kwargs={"enable_thinking": False})),
@@ -258,6 +258,31 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
         build(turn_hint_template="no placeholder")
     with pytest.raises(ValueError, match="turn_hint_template"):
         build(turn_hint_template="{hint} and {other}")
+    for bad in (-1, 2.5, True):
+        with pytest.raises(ValueError, match="skip_first_tokens"):
+            build(skip_first_tokens=bad)
+
+
+def test_turn_hint_teacher_leaves_the_start_of_each_hinted_turn_unscored():
+    """``skip_first_tokens`` drops the first tokens of every hinted span from both masks; a span no
+    longer than the skip is left out whole, and the splice itself is unchanged."""
+    tok = ToyTokenizer()
+
+    def build(skip):
+        teacher = make_teacher(SelfDistillationConfig(teacher=turn_hints_options(skip_first_tokens=skip)), tok,
+                               max_prefix_len=4096)
+        extra = [{"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]}]
+        return teacher.build(_inputs(extra, ["a"], [0.0], [None]))
+
+    whole, skipped = build(0), build(2)
+    start1 = len(TURN0 + OBS)
+    expected = torch.zeros(RESPONSE.shape[0])
+    expected[2 : len(TURN0)] = 1.0
+    expected[start1 + 2 : start1 + len(TURN1)] = 1.0
+    assert torch.equal(skipped.fields["self_distillation_mask"][0], expected)
+    assert torch.equal(skipped.fields["teacher_input_ids"][0], whole.fields["teacher_input_ids"][0])
+    assert whole.fields["loss_mask"][0].sum() - skipped.fields["loss_mask"][0].sum() == 3  # token 1 was unscored already
+    assert turn_token_mask(RESPONSE.shape[0], [(0, len(TURN0))], skip=len(TURN0) + 5).sum() == 0
 
 
 def test_launcher_config_builds_the_turn_hint_teacher():

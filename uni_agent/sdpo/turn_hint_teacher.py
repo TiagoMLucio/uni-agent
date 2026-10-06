@@ -43,7 +43,8 @@ class TurnHintTeacher(SDPOTeacher):
     options are ``uni_agent/conf/sdpo_teacher/turn_hints.yaml``: ``turn_hint_template``
     (``{hint}`` is the only placeholder) and ``chat_template_kwargs`` (the rollout's
     ``apply_chat_template`` kwargs, so the header and hint fragments match the rollout tokens;
-    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here). Every
+    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here), and
+    ``skip_first_tokens`` (the start of each hinted turn left out of the distillation mask). Every
     hint the reflector shipped is spliced; its ``max_selected_turns`` is the one cap.
     """
 
@@ -58,6 +59,7 @@ class TurnHintTeacher(SDPOTeacher):
         success_reward_threshold: Optional[float] = None,
         turn_hint_template: str,
         chat_template_kwargs: Optional[dict] = None,
+        skip_first_tokens: int = 0,
     ):
         super().__init__(
             tokenizer,
@@ -66,6 +68,9 @@ class TurnHintTeacher(SDPOTeacher):
             success_reward_threshold=success_reward_threshold,
         )
         _validate_hint_template("turn_hint_template", turn_hint_template)
+        if isinstance(skip_first_tokens, bool) or not isinstance(skip_first_tokens, int) or skip_first_tokens < 0:
+            raise ValueError(f"skip_first_tokens must be a non-negative int, got {skip_first_tokens!r}")
+        self.skip_first_tokens = skip_first_tokens
         self.turn_hint_template = turn_hint_template
         self.template_kwargs = dict(chat_template_kwargs or {})
         self.header_ids = torch.tensor(
@@ -104,7 +109,7 @@ class TurnHintTeacher(SDPOTeacher):
                     self.header_ids,
                 )
                 hint_fallbacks += fallbacks
-                mask_row = turn_token_mask(response_ids.shape[0], spans)
+                mask_row = turn_token_mask(response_ids.shape[0], spans, self.skip_first_tokens)
             else:
                 seq = torch.cat([prompt_ids[-1:], response_ids[:1]])
                 meta = DEGENERATE_META

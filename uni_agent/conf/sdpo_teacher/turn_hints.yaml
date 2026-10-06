@@ -22,3 +22,10 @@ turn_hint_template: "Note: {hint}"
 # Rollout-side apply_chat_template kwargs, mirrored when deriving header/hint fragments
 # (e.g. {enable_thinking: false} for Qwen3.5); must match the agent config's value
 chat_template_kwargs: {}
+
+# Tokens at the start of each hinted turn left out of the distillation mask. Any hint, even one
+# from another trace, moves the base teacher's first token from reacting to the last output
+# ("So", "Perfect") toward announcing ("Let", "Wait"), a content-free push that adds up over
+# steps; the first 8 tokens hold 35% of the hinted turn's KL and as much of its hint-specific
+# part. 0 scores the whole turn.
+skip_first_tokens: 0
