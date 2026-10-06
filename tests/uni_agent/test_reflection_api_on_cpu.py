@@ -36,20 +36,52 @@ def answer(*top):
                        "top": [{"turn": t, "problem": "P1", "hint": h, "why": "y"} for t, h in top]})
 
 
-class BadRequestError(Exception):
-    pass
+class APIStatusError(Exception):
+    def __init__(self, message="", status_code=500, code=None, param=None):
+        super().__init__(message)
+        self.status_code, self.code, self.param = status_code, code, param
 
 
-class RateLimitError(Exception):
-    pass
+class BadRequestError(APIStatusError):
+    def __init__(self, message="", code=None, param=None):
+        super().__init__(message, 400, code, param)
+
+
+class RateLimitError(APIStatusError):
+    def __init__(self, message="", code=None):
+        super().__init__(message, 429, code)
 
 
 seen_clients = []
 #: a reply that never comes
 STALL = object()
+#: the ChatGPT plan's requests (a client whose key is the plan's access token)
+plan_seen = []
 
 
-def fake_openai(replies, seen):
+def plan_usage():
+    return types.SimpleNamespace(input_tokens=500, output_tokens=60, input_tokens_details=types.SimpleNamespace(cached_tokens=0),
+                                 output_tokens_details=types.SimpleNamespace(reasoning_tokens=50))
+
+
+def fake_openai(replies, seen, plan=()):
+    async def plan_stream(reply):
+        if isinstance(reply, tuple):
+            yield types.SimpleNamespace(type="response.failed", response=types.SimpleNamespace(
+                error=types.SimpleNamespace(code=reply[1], message="failed")))
+            return
+        yield types.SimpleNamespace(type="response.output_text.delta", delta=reply[:5])
+        yield types.SimpleNamespace(type="response.completed", response=types.SimpleNamespace(
+            output_text=reply, usage=plan_usage(), status="completed"))
+
+    class PlanResponses:
+        async def create(self, **kwargs):
+            plan_seen.append(kwargs)
+            reply = plan[min(len(plan_seen) - 1, len(plan) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            return plan_stream(reply)
+
     class Responses:
         async def create(self, **kwargs):
             seen.append(kwargs)
@@ -78,7 +110,7 @@ def fake_openai(replies, seen):
     class AsyncOpenAI:
         def __init__(self, **kwargs):
             seen_clients.append(kwargs)
-            self.responses = Responses()
+            self.responses = PlanResponses() if kwargs.get("api_key") == "plan-token" else Responses()
             self.chat = types.SimpleNamespace(completions=Completions())
 
         async def __aenter__(self):
@@ -87,19 +119,21 @@ def fake_openai(replies, seen):
         async def __aexit__(self, *exc):
             return False
 
-    return types.SimpleNamespace(AsyncOpenAI=AsyncOpenAI, BadRequestError=BadRequestError, RateLimitError=RateLimitError)
+    return types.SimpleNamespace(AsyncOpenAI=AsyncOpenAI, APIStatusError=APIStatusError, BadRequestError=BadRequestError,
+                                 RateLimitError=RateLimitError)
 
 
 def reflect(monkeypatch, replies, turns=TURNS, feedback="1 failed", agent_patch="diff --git a/a.py b/a.py\n+y",
-            policy=None, raises=None, **over):
+            policy=None, raises=None, plan=(), reflector=None, **over):
     seen = []
-    monkeypatch.setitem(sys.modules, "openai", fake_openai(replies, seen))
+    plan_seen.clear()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai(replies, seen, plan))
     cfg = ApiReflector.Config(**{
         "name": "openai", "model": "gpt-6-luna", "enabled": True,
         "calls": [{"id": "luna", "system": "sys", "parse": "hints",
                    "user": "{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}],
         **over})
-    r = ApiReflector(policy or Policy(), cfg)
+    r = reflector or ApiReflector(policy or Policy(), cfg)
 
     def run():
         return asyncio.run(r.reflect_trajectory(task=TASK, turns=turns, gold="diff --git a/a.py b/a.py\n+x",
@@ -290,3 +324,79 @@ def test_unseen_names():
     seen = "class DotEnv:\n    def get(self): ...\nparse_row"
     assert unseen_names("use `DotEnv.get()` in parse_row", seen) == []
     assert unseen_names("raise `SystemExit` from `load_config`", seen) == ["SystemExit", "load_config"]
+
+
+@pytest.fixture
+def plan(monkeypatch):
+    from uni_agent.reflection import api, chatgpt_plan
+
+    monkeypatch.setattr(chatgpt_plan, "access_token", lambda path: "plan-token")
+    monkeypatch.setattr(api, "PLAN_BUSY_WAIT_S", 0.0)
+    monkeypatch.setattr(api.random, "uniform", lambda a, b: 0.0)
+    return {"plan_credentials": "/creds/chatgpt_plan.json", "sampling": {"service_tier": "flex"}}
+
+
+def test_the_plan_serves_the_call_in_its_required_form(monkeypatch, plan):
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))], **plan)
+    assert hints == {1: "plan"} and seen == [] and len(plan_seen) == 1
+    req = plan_seen[0]
+    assert req["store"] is False and req["stream"] is True and req["input"][0]["role"] == "user"
+    assert "max_output_tokens" not in req and "service_tier" not in req and req["reasoning"] == {"effort": "high"}
+    assert req["instructions"] == "sys" and req["text"]["format"]["strict"]
+    metrics = r.call_metrics()
+    assert metrics["reflect_plan_calls"] == 1 and metrics["reflect_plan_fallbacks"] == 0
+    assert metrics["reflect_input_tokens"] == 500
+
+
+def test_a_spent_plan_hands_the_rest_of_the_run_to_the_api_on_flex(monkeypatch, plan):
+    spent = RateLimitError("weekly cap", code="subscription_sharing_usage_limit_exceeded")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[spent], **plan)
+    assert hints == {1: "api"} and len(plan_seen) == 1 and seen[0]["service_tier"] == "flex" and r._plan_off
+    hints, seen, r = reflect(monkeypatch, [answer((2, "api again"))], plan=[answer((1, "plan"))], reflector=r, **plan)
+    assert hints == {2: "api again"} and plan_seen == []
+    assert r.call_metrics()["reflect_plan_fallbacks"] == 1
+
+
+@pytest.mark.parametrize("failure", [("failed", "subscription_sharing_usage_limit_exceeded"),
+                                     RateLimitError("", code="subscription_sharing_invalid_user")])
+def test_a_refused_plan_turns_off_whether_the_request_or_the_stream_says_so(monkeypatch, plan, failure):
+    hints, _, r = reflect(monkeypatch, [answer((1, "api"))], plan=[failure], **plan)
+    assert hints == {1: "api"} and r._plan_off
+
+
+def test_a_busy_plan_is_retried_before_the_api_serves(monkeypatch, plan):
+    busy = APIStatusError("busy", 503, "subscription_sharing_usage_unavailable")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[busy, answer((1, "plan"))], **plan)
+    assert hints == {1: "plan"} and len(plan_seen) == 2 and seen == [] and not r._plan_off
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[busy], **plan)
+    assert hints == {1: "api"} and len(plan_seen) == 3 and not r._plan_off
+
+
+def test_a_refused_answer_schema_is_dropped_once(monkeypatch, plan):
+    unsupported = BadRequestError("no schema", code="subscription_sharing_unsupported_capability", param="text.format")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[unsupported, answer((1, "plan"))], **plan)
+    assert hints == {1: "plan"} and "text" in plan_seen[0] and "text" not in plan_seen[1] and seen == []
+
+
+def test_a_context_error_from_the_plan_moves_down_the_ladder(monkeypatch, plan):
+    too_long = BadRequestError("maximum context length exceeded")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[too_long, answer((1, "plan"))], **plan)
+    assert hints == {1: "plan"} and len(plan_seen) == 2 and seen == []
+    assert r.call_metrics()["reflect_plan_fallbacks"] == 0
+
+
+def test_a_refused_refresh_turns_the_plan_off(monkeypatch, plan):
+    from uni_agent.reflection import chatgpt_plan
+
+    def refused(path):
+        raise chatgpt_plan.PlanUnavailable("token endpoint refused (400): invalid_grant")
+
+    monkeypatch.setattr(chatgpt_plan, "access_token", refused)
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))], **plan)
+    assert hints == {1: "api"} and plan_seen == [] and r._plan_off
+
+
+def test_plan_calls_need_the_responses_api():
+    with pytest.raises(ValueError, match="needs no base_url"):
+        ApiReflector.Config(name="openai", model="m", base_url="https://x/v1", plan_credentials="/c.json",
+                            calls=[{"id": "x", "system": "s", "user": "{turns}", "parse": "hints"}])
