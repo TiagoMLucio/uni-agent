@@ -89,6 +89,21 @@ def test_the_dump_is_written_off_the_event_loop(tmp_path, monkeypatch):
     assert dumped["reward_score"] == -100
 
 
+def test_undecodable_bytes_in_the_trajectory_do_not_cost_the_dump(tmp_path, monkeypatch):
+    bad = b"bad_\xff_name.txt".decode("utf-8", "surrogateescape")
+    run = _Interaction.run
+
+    async def run_with_bad_bytes(self):
+        return {**await run(self), "messages": [{"role": "tool", "content": bad}]}
+
+    monkeypatch.setattr(_Interaction, "run", run_with_bad_bytes)
+    loop = _loop(tmp_path, monkeypatch)
+    assert _run(loop) == [("scored", -100)]
+    dumped = (tmp_path / loop.run_id / "interaction_result.json").read_text(encoding="utf-8")
+    assert "bad_\\udcff_name.txt" in dumped
+    assert json.loads(dumped)["messages"] == [{"role": "tool", "content": bad}]
+
+
 def test_a_failed_dump_keeps_the_scored_row(tmp_path, monkeypatch):
     def full_disk(self, interaction_result):
         raise OSError(122, "Disk quota exceeded")

@@ -860,6 +860,7 @@ class UniAgentLoop(AgentLoopBase):
         (self.output_dir / "interaction_result.json").write_text(
             json.dumps(save_content, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
+            errors="backslashreplace",
         )
 
     def _init_config(self, sampling_params: dict[str, Any], **kwargs):
