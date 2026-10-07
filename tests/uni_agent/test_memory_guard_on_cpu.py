@@ -79,6 +79,19 @@ def test_the_command_over_the_sandbox_cap_is_killed_and_the_shell_survives(caplo
         _teardown(deployment)
 
 
+def test_the_guard_counts_rss_where_pss_is_hidden(monkeypatch, caplog):
+    """On Arrhenius the trainer cannot read a fakeroot sandbox's smaps_rollup (PermissionError)."""
+    real_open = open
+
+    def no_smaps(path, *args, **kwargs):
+        if str(path).endswith("/smaps_rollup"):
+            raise PermissionError(13, "Permission denied", path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", no_smaps)
+    test_the_command_over_the_sandbox_cap_is_killed_and_the_shell_survives(caplog)
+
+
 def test_a_sandbox_without_a_data_cap_is_not_guarded():
     deployment = _sandbox(None)
     try:
