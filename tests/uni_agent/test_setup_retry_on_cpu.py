@@ -29,6 +29,9 @@ class FlakyEnv:
     async def install_tools(self, tools):
         self.ledger.append("install_tools")
 
+    def guard_memory(self):
+        self.ledger.append("guard_memory")
+
     async def close(self):
         self.ledger.append("close")
 
@@ -74,7 +77,7 @@ def test_transient_failure_is_retried_with_a_fresh_sandbox():
     loop = _run_setup(ledger, fail_times=1, setup_retries=2)
     assert loop.setup_attempts == 2, "should have succeeded on the second attempt"
     # the broken sandbox is torn down and a new one built before retrying
-    assert ledger == ["init", "start", "close", "init", "start", "install_tools"], ledger
+    assert ledger == ["init", "start", "close", "init", "start", "install_tools", "guard_memory"], ledger
     assert loop.interaction.env is loop.env, "the interaction runs on the rebuilt sandbox"
 
 

@@ -564,6 +564,7 @@ class UniAgentLoop(AgentLoopBase):
                     if self.skills_manager is not None:
                         await self.env.install_skills(self.skills_manager)
                         self.interaction.inject_skills_manifest()
+                self.env.guard_memory()
                 return
             except Exception as e:
                 if attempt == setup_retries:

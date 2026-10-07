@@ -235,6 +235,11 @@ class AgentEnv:
             self.privileged_context = output.strip()
             self.logger.info(f"Captured {len(self.privileged_context)} chars of privileged context")
 
+    def guard_memory(self) -> None:
+        """Start the deployment's memory guard; only the agent's own sandbox calls this, never a grading one."""
+        if guard := getattr(self.deployment, "guard_memory", None):
+            guard()
+
     @auto_await
     async def install_tools(self, tools: list[AbstractTool]) -> None:
         self.logger.info(f"Installing {len(tools)} tools...")

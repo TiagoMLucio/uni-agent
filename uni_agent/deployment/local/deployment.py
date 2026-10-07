@@ -67,6 +67,96 @@ def _process_tree(root: int) -> list[int]:
     return tree
 
 
+def _parents(root: int) -> dict[int, int]:
+    """Each descendant of ``root`` and its parent, walked through the kernel's per-task children lists."""
+    if not os.path.exists(f"/proc/{root}/task/{root}/children"):
+        children: dict[int, list[int]] = {}
+        for pid in _process_tree(root):
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    children.setdefault(int(f.read().rsplit(")", 1)[1].split()[1]), []).append(pid)
+            except (OSError, ValueError, IndexError):
+                continue
+        return {pid: ppid for ppid, pids in children.items() for pid in pids}
+    parents, stack = {}, [root]
+    while stack:
+        pid = stack.pop()
+        try:
+            tids = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            continue
+        for tid in tids:
+            try:
+                with open(f"/proc/{pid}/task/{tid}/children") as f:
+                    kids = [int(kid) for kid in f.read().split()]
+            except OSError:
+                continue
+            for kid in kids:
+                parents[kid] = pid
+                stack.append(kid)
+    return parents
+
+
+def _memory(pid: int, field: str) -> int:
+    """Resident (cheap, double-counts shared pages) or proportional set size of ``pid``, in bytes."""
+    try:
+        if field == "rss":
+            with open(f"/proc/{pid}/statm") as f:
+                return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            return next(int(line.split()[1]) * 1024 for line in f if line.startswith("Pss:"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return 0
+
+
+def _data_limit(pid: int) -> int | None:
+    """The soft RLIMIT_DATA of ``pid`` in bytes, None when unlimited or unreadable."""
+    try:
+        with open(f"/proc/{pid}/limits") as f:
+            soft = next(line for line in f if line.startswith("Max data size")).split()[3]
+    except (OSError, StopIteration, IndexError):
+        return None
+    return None if soft == "unlimited" else int(soft)
+
+
+def _kill_runaway(root: int, limit: int, setup: set[int]) -> str | None:
+    """Kill the command (with all it started) holding most memory once the sandbox's total passes ``limit``."""
+    parents = _parents(root)
+    if sum(_memory(pid, "rss") for pid in parents) <= limit:
+        return None
+    pss = {pid: _memory(pid, "pss") for pid in parents}
+    total = sum(pss.values())
+    started = [pid for pid in parents if pid not in setup]
+    if total <= limit or sum(pss[pid] for pid in started) <= total - limit:
+        return None
+    command = max(started, key=pss.__getitem__)
+    while parents.get(command) in parents and parents[command] not in setup:
+        command = parents[command]
+    try:
+        with open(f"/proc/{command}/comm") as f:
+            name = f.read().strip()
+    except OSError:
+        name = "?"
+    victims = [command, *(pid for pid in started if _has_ancestor(pid, command, parents))]
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return (
+        f"Memory guard: the sandbox used {total / 2**30:.1f} GiB, over its {limit / 2**30:.1f} GiB cap; "
+        f"killed {name} (pid {command}) and the {len(victims) - 1} processes it started"
+    )
+
+
+def _has_ancestor(pid: int, ancestor: int, parents: dict[int, int]) -> bool:
+    while pid in parents:
+        pid = parents[pid]
+        if pid == ancestor:
+            return True
+    return False
+
+
 def _is_running_in_container() -> bool:
     return Path("/.dockerenv").exists()
 
@@ -123,6 +213,32 @@ class LocalDeployment(AbstractDeployment):
         self._server_log_handle: Any | None = None
         self._stopped = False
         self.startup_timings: dict[str, float] = {}
+        self._memory_guard: asyncio.Task | None = None
+
+    memory_guard_interval = 1.0
+
+    def guard_memory(self) -> None:
+        """Cap the sandbox's processes together at their per-process data cap (``ulimit -d``): a test runner
+        forking one worker per CPU stays under it in every process and once took 64 GiB of a node."""
+        if self._server_process is None or self._memory_guard is not None:
+            return
+        setup = {self._server_process.pid, *_parents(self._server_process.pid)}
+        limits = [limit for pid in setup if (limit := _data_limit(pid)) is not None]
+        if limits:
+            self.logger.info(f"Memory guard on: the sandbox may use {min(limits) / 2**30:.1f} GiB in total")
+            self._memory_guard = asyncio.create_task(self._guard_memory(min(limits), setup))
+
+    async def _guard_memory(self, limit: int, setup: set[int]) -> None:
+        root = self._server_process.pid
+        while True:
+            await asyncio.sleep(self.memory_guard_interval)
+            try:
+                killed = await asyncio.to_thread(_kill_runaway, root, limit, setup)
+            except Exception as exc:
+                self.logger.error(f"Memory guard check failed: {exc!r}")
+                continue
+            if killed:
+                self.logger.warning(killed)
 
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
@@ -408,6 +524,9 @@ class LocalDeployment(AbstractDeployment):
             self.logger.error(f"Failed to stop local Apptainer process: {exc}")
 
     async def stop(self):
+        if self._memory_guard is not None:
+            self._memory_guard.cancel()
+            self._memory_guard = None
         if self._stopped:
             return
 
