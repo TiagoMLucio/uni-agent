@@ -124,7 +124,8 @@ def _kill_runaway(root: int, limit: int, setup: set[int]) -> str | None:
     parents = _parents(root)
     if sum(_memory(pid, "rss") for pid in parents) <= limit:
         return None
-    pss = {pid: _memory(pid, "pss") for pid in parents}
+    # an Apptainer fakeroot sandbox hides smaps_rollup from the trainer, so its processes count by RSS
+    pss = {pid: _memory(pid, "pss") or _memory(pid, "rss") for pid in parents}
     total = sum(pss.values())
     started = [pid for pid in parents if pid not in setup]
     if total <= limit or sum(pss[pid] for pid in started) <= total - limit:
