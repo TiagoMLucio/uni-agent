@@ -186,6 +186,7 @@ def _rows(segments, trajectory):
         opening_messages=[],
         mask_abnormal_exit_traj=False,
         emit_feedback=False,
+        chat_model=SimpleNamespace(max_model_len=10**9),
     )
     loop._segment_to_output = functools.partial(UniAgentLoop._segment_to_output, loop)
     result = {"trajectory": trajectory, "segments": segments, "rollout_cache": segments[-1]["rollout_cache"]}

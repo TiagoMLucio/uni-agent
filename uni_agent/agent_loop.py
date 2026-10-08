@@ -1060,6 +1060,16 @@ class UniAgentLoop(AgentLoopBase):
         response_ids = prompt_ids[-len(response_mask) :]
         prompt_ids = prompt_ids[: len(prompt_ids) - len(response_mask)]
 
+        # every call reads and writes within max_model_len, so tokens past it are what the last observation added
+        # after the segment's final call: no gradient, yet a 227k-token row ran the update out of memory
+        room = self.chat_model.max_model_len - len(prompt_ids)
+        if 0 <= room < len(response_ids):
+            if any(response_mask[room:]):
+                self.logger.warning(f"generated tokens past max_model_len {self.chat_model.max_model_len}; row kept whole")
+            else:
+                response_ids, response_mask = response_ids[:room], response_mask[:room]
+                response_logprobs = response_logprobs[:room]
+
         max_prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
         max_response_length = self.config.actor_rollout_ref.rollout.response_length
         if len(prompt_ids) > max_prompt_length:

@@ -106,6 +106,7 @@ def _converted(exit_reason):
         config=types.SimpleNamespace(actor_rollout_ref=types.SimpleNamespace(
             rollout=types.SimpleNamespace(prompt_length=64, response_length=64))),
         opening_messages=[], mask_abnormal_exit_traj=False, emit_feedback=False,
+        chat_model=types.SimpleNamespace(max_model_len=10**9),
     )
     loop._segment_to_output = functools.partial(UniAgentLoop._segment_to_output, loop)
     cache = {"prompt_ids": [1, 2, 3, 4], "response_mask": [1, 1], "response_logprobs": [], "turn_spans": [[1, 2, 4]]}
