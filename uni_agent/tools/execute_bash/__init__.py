@@ -50,7 +50,7 @@ class ExecuteBashArguments(BaseModel):
     )
     timeout: int | None = Field(
         default=None,
-        description="Optional timeout in seconds for this command (defaults to the harness action timeout).",
+        description="Seconds to wait for output before the command is reported as still running.",
     )
 
 
