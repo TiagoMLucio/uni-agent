@@ -72,8 +72,8 @@ def test_composition_matches_what_data_prep_would_have_baked():
 
 
 PROMPTS_DIR = Path(__file__).parents[3] / "base" / "prompts"
-SYSTEM_FILE = PROMPTS_DIR / "system.txt"
-TASK_FILES = sorted(PROMPTS_DIR.glob("families/*.task*.txt"))
+SYSTEM_FILE = PROMPTS_DIR / "default" / "system.txt"
+TASK_FILES = sorted(PROMPTS_DIR.glob("*/*.task.txt"))
 
 
 @pytest.mark.skipif(
