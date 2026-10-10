@@ -92,6 +92,27 @@ def test_apptainer_command_places_runtime_args_before_image_and_uses_shell():
     ]
 
 
+def test_apptainer_process_drops_inherited_binds(monkeypatch):
+    seen = {}
+
+    def fake_popen(args, **kwargs):
+        seen["env"] = kwargs["env"]
+        return _FakeProcess()
+
+    for name in ("APPTAINER_BIND", "APPTAINER_BINDPATH", "APPTAINER_MOUNT", "SINGULARITY_BIND", "SINGULARITY_BINDPATH"):
+        monkeypatch.setenv(name, "/project,/scratch")
+    monkeypatch.setenv("APPTAINER_CACHEDIR", "/project/cache")
+    monkeypatch.setattr(local_deployment.subprocess, "Popen", fake_popen)
+    deployment = LocalDeployment(run_id="test", type="local", container_runtime="apptainer")
+
+    deployment._start_apptainer_process(["apptainer", "exec", "image.sif", "true"])
+    deployment._server_log_handle.close()
+    deployment._server_log_path.unlink()
+
+    assert not [name for name in seen["env"] if name.endswith(("_BIND", "_BINDPATH", "_MOUNT"))]
+    assert seen["env"]["APPTAINER_CACHEDIR"] == "/project/cache"
+
+
 def test_format_command_supports_token_and_port_placeholders():
     deployment = LocalDeployment(
         run_id="test",

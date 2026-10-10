@@ -23,6 +23,10 @@ from uni_agent.deployment.remote_runtime import RemoteRuntime as LocalRuntime
 from uni_agent.deployment.remote_runtime import RemoteRuntimeConfig as LocalRuntimeConfig
 
 _APPTAINER_RUNTIMES = {"apptainer", "singularity"}
+# an enclosing container exports its own binds in these, and a nested start applies them to the sandbox
+_INHERITED_BIND_ENV = frozenset(
+    f"{prefix}_{name}" for prefix in ("APPTAINER", "SINGULARITY") for name in ("BIND", "BINDPATH", "MOUNT")
+)
 _CONTAINER_RUNTIME_ENV_VARS = ("UNI_AGENT_CONTAINER_RUNTIME", "LOCAL_CONTAINER_RUNTIME")
 _DEFAULT_CONTAINER_RUNTIME_CANDIDATES = ("apptainer", "singularity", "docker", "podman")
 _IMAGE_URI_PREFIXES = (
@@ -186,6 +190,10 @@ def _runtime_basename(runtime: str) -> str:
 
 def _is_apptainer_runtime(runtime: str) -> bool:
     return _runtime_basename(runtime) in _APPTAINER_RUNTIMES
+
+
+def _sandbox_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _INHERITED_BIND_ENV}
 
 
 def _normalize_apptainer_image(image: str) -> str:
@@ -414,6 +422,7 @@ class LocalDeployment(AbstractDeployment):
             stdout=self._server_log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            env=_sandbox_env(),
         )
 
     async def _start_apptainer(self, token: str, published_port: int) -> None:
