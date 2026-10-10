@@ -13,15 +13,17 @@ SHIM = "try:\n    from {impl} import *\nexcept Exception:\n    pass\n"
 async def install_capture(env, context: dict, value_chars: int = 4096):
     suffix = uuid.uuid4().hex
     module = f"uniagent_feedback_{suffix}"
-    report = Path(f"/tmp/{module}.jsonl")
-    metadata = Path(f"/tmp/{module}.context.json")
+    # a directory of its own and no empty PYTHONPATH entry: neither /tmp nor the tests' cwd may become importable
+    home = Path(f"/tmp/{module}")
+    report = home / "report.jsonl"
+    metadata = home / "context.json"
     plugin = Path(__file__).with_name("pytest_feedback_capture.py").read_text()
-    await env.write_file(Path(f"/tmp/{module}_impl.py"), plugin)
+    await env.write_file(home / f"{module}_impl.py", plugin)
     # pytest loads this shim: a plugin the task's interpreter cannot import must leave the tests running
-    await env.write_file(Path(f"/tmp/{module}.py"), SHIM.format(impl=f"{module}_impl"))
+    await env.write_file(home / f"{module}.py", SHIM.format(impl=f"{module}_impl"))
     await env.write_file(metadata, json.dumps(context))
     lines = [
-        'export PYTHONPATH="/tmp:${PYTHONPATH:-}"',
+        f'export PYTHONPATH="{home}${{PYTHONPATH:+:$PYTHONPATH}}"',
         f"export UNI_AGENT_FEEDBACK_PATH={shlex.quote(str(report))}",
         f"export UNI_AGENT_FEEDBACK_CONTEXT={shlex.quote(str(metadata))}",
         "export UNI_AGENT_FEEDBACK_ROOT=/testbed",

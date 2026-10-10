@@ -1,5 +1,6 @@
 """Information-preservation checks on real reports and known lossy edge cases."""
 
+import asyncio
 import difflib
 import os
 import re
@@ -30,6 +31,7 @@ from uni_agent.reward.diagnostic_feedback import (
     signature,
     source_context,
 )
+from uni_agent.reward.feedback_capture import install_capture
 
 
 def result(fail=(), passed=(), regressions=(), complete=True):
@@ -985,3 +987,20 @@ def test_one_full_record_per_failure_then_short_records_then_names():
     reps_short = render_diagnostic(result(nodes), data, max_chars=len(full) // 6)
     shown = blocks(reps_short)
     assert {"test_same_0", "test_other"} <= set(shown) and all(SUMMARY_NOTE in b for b in shown.values())
+
+
+@pytest.mark.parametrize("inherited", [None, "/repo/src"])
+def test_the_observer_adds_only_its_own_directory_to_the_import_path(inherited):
+    class Env:
+        written = []
+
+        async def write_file(self, path, content):
+            self.written.append(path)
+
+    env = Env()
+    report, lines = asyncio.run(install_capture(env, {}))
+    (home,) = {path.parent for path in [*env.written, report]}
+    setup = "unset PYTHONPATH; " if inherited is None else f"export PYTHONPATH={inherited}; "
+    out = subprocess.run(["bash", "-c", f'{setup}{lines[0]}; echo "$PYTHONPATH"'], capture_output=True, text=True)
+    assert out.stdout.strip().split(":") == [str(home), *([inherited] if inherited else [])]
+    assert str(home) != "/tmp"
