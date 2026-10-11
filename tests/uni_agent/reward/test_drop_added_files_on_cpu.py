@@ -74,6 +74,12 @@ def test_a_recreated_graded_test_file_is_never_dropped():
     assert _files_to_drop(ADDS, BUG_PATCH_PLAIN, ["test_repro.py"]) == []
 
 
+def test_the_index_is_refreshed_before_the_forced_checkouts():
+    # a forced checkout over a stat-stale index rewrites every file, and a compiled project then rebuilds itself
+    script = _make_eval_script_list("inst", ADDS, "pytest -q", ["tests/test_x.py"])
+    assert script.index("git update-index -q --refresh") < script.index("git checkout -f inst")
+
+
 def test_output_altering_pytest_plugins_are_switched_off_before_the_tests():
     from uni_agent.reward.swe_smith import PYTEST_PLUGINS_OFF
 

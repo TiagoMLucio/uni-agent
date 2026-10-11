@@ -130,6 +130,8 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files, drop_fi
     return [
         f"cd {repo_directory}",
         f"git config --global --add safe.directory {repo_directory}",
+        # a fresh container's index matches no file's stat: unrefreshed, the forced checkout rewrites every file
+        "git update-index -q --refresh",
         # Bring the instance's bug branch, then step back one commit so the held-out
         # F2P/P2P test files are present again (-f discards any working-tree state).
         f"git checkout -f {instance_id}",
