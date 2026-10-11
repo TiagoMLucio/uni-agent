@@ -99,6 +99,21 @@ def _files_to_drop(patch: str, gold_bug_patch: str, graded_files: list[str]) -> 
     ]
 
 
+def _apply_cmds(test_files) -> list[str]:
+    """swesmith's apply ladder, with one attempt that leaves the graded test files out.
+
+    The agent works with those files deleted, so one it wrote back is a new file in its
+    prediction, and git refuses a prediction that creates a file the eval checkout has:
+    the source fix is lost with it. The agent's copy never counts anyway, the eval restores
+    the repo's own right after the apply. The attempt follows the first rung, the only one
+    that leaves the tree untouched when it fails.
+    """
+    skip = [f"--exclude={f}" for f in test_files or () if _SAFE_PATH_RE.match(f)]
+    if not skip:
+        return list(GIT_APPLY_CMDS)
+    return [GIT_APPLY_CMDS[0], f"git apply --verbose {' '.join(skip)}", *GIT_APPLY_CMDS[1:]]
+
+
 def _make_eval_script_list(instance_id, patch, test_command, test_files, drop_files=()):
     """Build the SWE-smith eval script (run in a clean checkout of the instance image).
 
@@ -120,7 +135,7 @@ def _make_eval_script_list(instance_id, patch, test_command, test_files, drop_fi
         apply_lines = ["echo 'empty prediction: nothing to apply'"]
     else:
         apply_lines = ["_applied=0"]
-        for cmd in GIT_APPLY_CMDS:
+        for cmd in _apply_cmds(test_files):
             apply_lines.append(f'if [ "$_applied" -eq 0 ] && {cmd} /tmp/swesmith_pred.diff; then _applied=1; fi')
         apply_lines.append(f"if [ \"$_applied\" -eq 0 ]; then echo '{APPLY_PATCH_FAIL}'; fi")
 
