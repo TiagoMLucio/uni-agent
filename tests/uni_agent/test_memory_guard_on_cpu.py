@@ -80,7 +80,7 @@ def test_the_command_over_the_sandbox_cap_is_killed_and_the_shell_survives(caplo
 
 
 def test_the_guard_counts_rss_where_pss_is_hidden(monkeypatch, caplog):
-    """On Arrhenius the trainer cannot read a fakeroot sandbox's smaps_rollup (PermissionError)."""
+    """The trainer cannot always read a fakeroot sandbox's smaps_rollup (PermissionError)."""
     real_open = open
 
     def no_smaps(path, *args, **kwargs):
