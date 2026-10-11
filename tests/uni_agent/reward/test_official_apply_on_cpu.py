@@ -11,6 +11,7 @@ The commands run through a real bash against a real repository standing in for `
 
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 from pathlib import Path
@@ -110,8 +111,7 @@ def test_a_non_utf8_file_in_the_diff_does_not_lose_the_prediction(tmp_path):
             return PATCH_EXTRACT_OK
 
         async def read_file(self, path, encoding=None, errors=None):
-            raw = b"diff --git a/notes.txt b/notes.txt\n+caf\xe9\n"
-            return raw.decode("utf-8", errors=errors or "strict")
+            return base64.b64encode(b"diff --git a/notes.txt b/notes.txt\n+caf\xe9\n").decode()
 
     patch = _spec(Extract())._get_interaction_env_patch()
 

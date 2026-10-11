@@ -1,5 +1,6 @@
 """Abstract base for reward specs."""
 
+import base64
 from abc import ABC, abstractmethod
 
 #: Echoed only when the whole extraction chain ran. The side session issues its command with
@@ -32,6 +33,8 @@ def patch_extract_command(patch_file: str, diff_args: str = "", repo_dir: str = 
     literally: a name starting with ``:`` is pathspec magic to git, ``*`` is a glob that unstaged
     every file, and a quoted name (a newline, a tab, a non-ASCII byte) never matched what it named.
     No literal tab or newline may appear in this text, since it is typed into a shell.
+
+    The diff is also left base64-encoded beside it, for :func:`read_patch`.
     """
     attrs = "/tmp/.uniagent_gitattributes"
     git = "git --literal-pathspecs"
@@ -57,8 +60,19 @@ def patch_extract_command(patch_file: str, diff_args: str = "", repo_dir: str = 
         f"cd {repo_dir} && printf '*.py diff=python\\n' > {attrs} && {stage} && "
         f"{{ {unstage_binaries} ; {unstage_non_utf8} ; "
         f"git -c core.attributesFile={attrs} diff --no-color --ignore-submodules=all {diff_args} --cached "
-        f"> {patch_file} ; }} && echo {PATCH_EXTRACT_OK}"
+        f"> {patch_file} ; }} && base64 {patch_file} > {patch_file}.b64 && echo {PATCH_EXTRACT_OK}"
     )
+
+
+async def read_patch(env, patch_file: str) -> str:
+    """The diff :func:`patch_extract_command` wrote, with its line endings as git wrote them.
+
+    The sandbox reads a file as text, which turns every CRLF into LF: the patch of a file with CRLF
+    line endings then matches nothing in the eval sandbox, and the edit is lost. Hence the base64
+    copy. Bytes that are not UTF-8 are escaped rather than refused.
+    """
+    raw = base64.b64decode(await env.read_file(f"{patch_file}.b64"))
+    return raw.decode("utf-8", errors="backslashreplace")
 
 
 def empty_patch_flag(patch: str | None) -> dict[str, bool]:

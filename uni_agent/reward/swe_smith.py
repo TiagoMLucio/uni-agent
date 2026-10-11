@@ -44,6 +44,7 @@ from uni_agent.reward.base import (
     AbstractRewardSpec,
     empty_patch_flag,
     patch_extract_command,
+    read_patch,
 )
 from uni_agent.reward.registry import register_reward_spec
 from uni_agent.reward.swe_bench import FeedbackConfig, _feedback_seed, clip_eval_report
@@ -419,7 +420,7 @@ class SWESmithRewardSpec(AbstractRewardSpec):
             )
             if PATCH_EXTRACT_OK not in output:
                 raise RuntimeError(f"the extraction never reached the diff: {output.strip()[-500:]}")
-            return await self.env.read_file(env_patch_file)
+            return await read_patch(self.env, env_patch_file.as_posix())
         except Exception as e:
             self.logger.error(f"Failed to get interaction environment patch: {e}")
             raise

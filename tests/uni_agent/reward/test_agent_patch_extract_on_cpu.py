@@ -6,6 +6,8 @@ one carries the identical tail.
 
 from __future__ import annotations
 
+import base64
+
 from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS
 
 from uni_agent.reward.base import PATCH_EXTRACT_OK
@@ -25,7 +27,7 @@ class Env:
         return PATCH_EXTRACT_OK
 
     async def read_file(self, path, **kwargs):
-        return "diff --git a/x.py b/x.py\n+fix\n"
+        return base64.b64encode(b"diff --git a/x.py b/x.py\n+fix\n").decode()
 
     async def write_file(self, path, content):
         pass

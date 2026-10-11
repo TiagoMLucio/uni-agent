@@ -30,6 +30,7 @@ from uni_agent.reward.base import (
     AbstractRewardSpec,
     empty_patch_flag,
     patch_extract_command,
+    read_patch,
 )
 from uni_agent.reward.registry import register_reward_spec
 from uni_agent.tracing import (
@@ -844,8 +845,7 @@ class SWEBenchRewardSpec(AbstractRewardSpec):
             )
             if PATCH_EXTRACT_OK not in output:
                 raise RuntimeError(f"the extraction never reached the diff: {output.strip()[-500:]}")
-            # a non-UTF-8 text file the agent left behind must not make the whole prediction unreadable
-            patch_content = await self.env.read_file(env_patch_file, errors="backslashreplace")
+            patch_content = await read_patch(self.env, env_patch_file.as_posix())
             return patch_content
         except Exception as e:
             self.logger.error(f"Failed to get patch: {e}")
