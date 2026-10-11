@@ -24,16 +24,39 @@ def patch_extract_command(patch_file: str, diff_args: str = "", repo_dir: str = 
     extra git-diff flags for the reflector's copy; the graded prediction is always taken with
     none. The attributes file is what makes ``-W`` find Python function boundaries: without it
     git falls back to a heuristic that expands every hunk to the whole file.
+
+    What the agent leaves behind is not ours to predict, so nothing here trusts a file's name or
+    kind. Tracked changes are staged first, then only the untracked regular files and symlinks,
+    which is all a text patch carries: ``git add -A`` aborts on a nested repository without a
+    commit, and that lost the whole prediction. Paths travel NUL-separated and are taken
+    literally: a name starting with ``:`` is pathspec magic to git, ``*`` is a glob that unstaged
+    every file, and a quoted name (a newline, a tab, a non-ASCII byte) never matched what it named.
+    No literal tab or newline may appear in this text, since it is typed into a shell.
     """
     attrs = "/tmp/.uniagent_gitattributes"
+    git = "git --literal-pathspecs"
+    each = "xargs -0 -r sh -c"
+    # an untracked file that cannot be staged is dropped; it must not take the tracked edits with it
+    stage = (
+        "git add -u && { git ls-files -z --others --exclude-standard "
+        f"| {each} 'for f; do if [ -L \"$f\" ] || [ -f \"$f\" ]; then printf \"%s\\0\" \"$f\"; fi; done' _ "
+        f"| xargs -0 -r {git} add --ignore-errors -- ; true ; }}"
+    )
+    # one numstat record per argument, "-<tab>-<tab><path>" for a binary
+    unstage_binaries = (
+        "git diff --cached --no-renames --numstat -z "
+        f"| {each} 't=$(printf \"\\t\"); for r; do case \"$r\" in \"-$t-$t\"*) "
+        f"{git} reset -q -- \"${{r#-$t-$t}}\";; esac; done' _"
+    )
+    unstage_non_utf8 = (
+        "git diff --cached --no-renames --name-only --diff-filter=A -z | { command -v iconv >/dev/null && "
+        f"{each} 'for f; do [ -L \"$f\" ] || iconv -f UTF-8 -t UTF-8 < \"$f\" >/dev/null 2>&1 || "
+        f"{git} reset -q -- \"$f\"; done' _ ; }}"
+    )
     return (
-        f"cd {repo_dir} && printf '*.py diff=python\\n' > {attrs} && git add -A && "
-        "{ git diff --cached --numstat | awk -F'\\t' '$1==\"-\"{print $3}' "
-        "| xargs -r -d '\\n' git reset -q -- ; "
-        "git diff --cached --name-only --diff-filter=A -z | { command -v iconv >/dev/null && "
-        "xargs -0 -r sh -c 'for f; do iconv -f UTF-8 -t UTF-8 \"$f\" >/dev/null 2>&1 || "
-        "git reset -q -- \"$f\"; done' _ ; } ; "
-        f"git -c core.attributesFile={attrs} diff --no-color {diff_args} --cached "
+        f"cd {repo_dir} && printf '*.py diff=python\\n' > {attrs} && {stage} && "
+        f"{{ {unstage_binaries} ; {unstage_non_utf8} ; "
+        f"git -c core.attributesFile={attrs} diff --no-color --ignore-submodules=all {diff_args} --cached "
         f"> {patch_file} ; }} && echo {PATCH_EXTRACT_OK}"
     )
 
