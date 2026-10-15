@@ -26,7 +26,7 @@ from uni_agent.sdpo.turn_hint_teacher import TurnHintBatch
 from verl.trainer import main_ppo_sync
 from verl.trainer.ppo.sdpo import TeacherInputs, make_teacher
 from verl.trainer.ppo.sdpo.batch import trace_weights
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, unpack
 from verl.workers.config.actor import SelfDistillationConfig
 
 VERL_CONFIG_DIR = Path(verl.__file__).parent / "trainer" / "config"
@@ -236,10 +236,11 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     trainer_provided = {"self", "tokenizer", "max_prefix_len", "apply_chat_template_kwargs", "success_reward_threshold"}
     assert set(options) - {"_target_"} == set(params) - trainer_provided
     assert set(options) == {
-        "_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens", "turn_hint_voice"
+        "_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens", "turn_hint_voice",
+        "contrast_hint",
     }
     assert options["chat_template_kwargs"] == {} and options["skip_first_tokens"] == 0
-    assert options["turn_hint_voice"] == "user"
+    assert options["turn_hint_voice"] == "user" and options["contrast_hint"] is None
 
     teacher = make_teacher(
         SelfDistillationConfig(teacher=turn_hints_options(chat_template_kwargs={"enable_thinking": False})),
@@ -266,6 +267,9 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
             build(skip_first_tokens=bad)
     with pytest.raises(ValueError, match="turn_hint_voice"):
         build(turn_hint_voice="assistant")
+    for bad in ("", "  ", 5):
+        with pytest.raises(ValueError, match="contrast_hint"):
+            build(contrast_hint=bad)
 
 
 def test_turn_hint_teacher_thought_voice_opens_the_hinted_turn():
@@ -310,6 +314,91 @@ def test_turn_hint_teacher_leaves_the_start_of_each_hinted_turn_unscored():
     assert torch.equal(skipped.fields["teacher_input_ids"][0], whole.fields["teacher_input_ids"][0])
     assert whole.fields["loss_mask"][0].sum() - skipped.fields["loss_mask"][0].sum() == 3  # token 1 was unscored already
     assert turn_token_mask(RESPONSE.shape[0], [(0, len(TURN0))], skip=len(TURN0) + 5).sum() == 0
+
+
+def _text(token_ids):
+    return "".join(chr(int(i)) for i in token_ids)
+
+
+@pytest.mark.parametrize("voice, template", [("user", "Note: {hint}"), ("thought", "{hint}")])
+def test_contrast_hint_adds_the_hint_subrows_with_only_the_text_swapped(voice, template):
+    """With ``contrast_hint`` every hinted turn ships a second sub-row after the hint ones: the same
+    sub-row with the contrast text through the same template and voice. Spans, masks, un-hinted rows
+    and metrics are the hint-only teacher's."""
+    tok = ToyTokenizer()
+    extra = [
+        {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]},
+        {"turn_spans": SPANS, "turn_hints": []},
+        {"turn_spans": SPANS, "turn_hints": [[1, "h2"]]},
+    ]
+
+    def build(**overrides):
+        options = turn_hints_options(turn_hint_template=template, turn_hint_voice=voice, **overrides)
+        teacher = make_teacher(SelfDistillationConfig(distillation_topk=100, teacher=options), tok, max_prefix_len=4096)
+        return teacher, teacher.build(_inputs(extra, ["a", "b", "c"], [0.0] * 3, [None] * 3))
+
+    plain_teacher, plain = build()
+    contrast_teacher, contrast = build(contrast_hint="Continue.")
+    assert not plain_teacher.contrasts and contrast_teacher.contrasts
+
+    def spliced(text):
+        return f"<user>Note: {text}</>" if voice == "user" else f"{text}\n\n"
+
+    for row in (0, 2):
+        plain_meta = plain.fields["teacher_seq_meta"][row].tolist()
+        meta = contrast.fields["teacher_seq_meta"][row].tolist()
+        plain_seq, seq = plain.fields["teacher_input_ids"][row], contrast.fields["teacher_input_ids"][row]
+        hint_rows, contrast_rows = unpack(meta), unpack(meta, contrast=True)
+        assert hint_rows == unpack(plain_meta) and unpack(plain_meta, contrast=True) == []
+        assert torch.equal(seq[: plain_seq.shape[0]], plain_seq), "the hint sub-rows are the hint-only teacher's"
+
+        hint_at, contrast_at = 0, plain_seq.shape[0]
+        for hint, hint_row, contrast_row in zip(plain.hinted_per_row[row], hint_rows, contrast_rows, strict=True):
+            hint_sub = _text(plain_seq[hint_at : hint_at + hint_row.total_len])
+            contrast_sub = _text(seq[contrast_at : contrast_at + contrast_row.total_len])
+            assert contrast_sub == hint_sub.replace(spliced(hint.text), spliced("Continue."))
+            assert spliced(hint.text) in hint_sub and spliced("Continue.") in contrast_sub
+            assert (contrast_row.start, contrast_row.end) == (hint_row.start, hint_row.end)
+            hint_at += hint_row.total_len
+            contrast_at += contrast_row.total_len
+        assert contrast_at == seq.shape[0]
+
+    assert contrast.fields["teacher_seq_meta"][1].tolist() == DEGENERATE_META
+    assert torch.equal(contrast.fields["teacher_input_ids"][1], plain.fields["teacher_input_ids"][1])
+    for key in ("self_distillation_mask", "loss_mask"):
+        for row in range(3):
+            assert torch.equal(contrast.fields[key][row], plain.fields[key][row])
+    assert contrast.metrics == plain.metrics and contrast.hinted_per_row == plain.hinted_per_row
+
+
+def test_contrast_hint_null_is_the_hint_only_teacher_bit_for_bit():
+    """The default builds exactly what the splice builds without a contrast: one sub-row per hint, the
+    meta five ints per sub-row."""
+    tok = ToyTokenizer()
+    teacher = make_teacher(SelfDistillationConfig(teacher=turn_hints_options()), tok, max_prefix_len=4096)
+    extra = [{"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]}]
+    out = teacher.build(_inputs(extra, ["a"], [0.0], [None]))
+    hinted = out.hinted_per_row[0]
+    header = torch.tensor(assistant_header_ids(tok), dtype=torch.int64)
+    hint_ids = [teacher.hint_ids(h) for h in hinted]
+    seq, meta, _, _ = build_spliced_teacher_row(PROMPT, RESPONSE, hinted, hint_ids, 4096, header)
+    assert torch.equal(out.fields["teacher_input_ids"][0], seq)
+    assert out.fields["teacher_seq_meta"][0].tolist() == meta and len(meta) == 1 + 5 * 2
+    assert teacher.contrast_ids is None and not teacher.contrasts
+
+
+def test_a_contrast_teacher_needs_top_k_distillation():
+    tok = ToyTokenizer()
+    options = turn_hints_options(contrast_hint="Continue.")
+    make_teacher(SelfDistillationConfig(distillation_topk=100, teacher=options), tok, max_prefix_len=4096)
+    with pytest.raises(ValueError, match="distillation_topk"):
+        make_teacher(SelfDistillationConfig(teacher=options), tok, max_prefix_len=4096)
+    with pytest.raises(ValueError, match="distillation_topk"):
+        make_teacher(
+            SelfDistillationConfig(full_logit_distillation=False, distillation_topk=100, teacher=options),
+            tok,
+            max_prefix_len=4096,
+        )
 
 
 def test_launcher_config_builds_the_turn_hint_teacher():

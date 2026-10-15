@@ -34,3 +34,6 @@ skip_first_tokens: 0
 # turn itself, right after its header (the start of its thinking when thinking is on), as the
 # agent's own words in their own paragraph.
 turn_hint_voice: user
+
+# Contrast teacher's hint text (same template and voice): target = student + hint teacher - contrast teacher.
+contrast_hint: null

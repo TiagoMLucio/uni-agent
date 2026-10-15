@@ -1,6 +1,8 @@
 """The spliced teacher row: one sub-row per hint, its meta packed by
 :mod:`verl.trainer.ppo.sdpo.teacher_meta`, plus the per-token mask."""
 
+from typing import Optional
+
 import torch
 
 from uni_agent.sdpo.hints import HintedTurn
@@ -19,32 +21,15 @@ def _sub_row(
     return torch.cat([prefix, *body]), SubRow(prefix.shape[0] + body_len, body_len, body_start, *span)
 
 
-def build_spliced_teacher_row(
-    prompt_ids: torch.Tensor,
+def _splice(
+    base_prefix: torch.Tensor,
     response_ids: torch.Tensor,
     hinted_turns: list[HintedTurn],
     hint_ids_list: list[torch.Tensor],
-    max_prefix_len: int,
     header_ids: torch.Tensor,
-    after_header: bool = False,
-) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
-    """One teacher sub-row per hinted turn, concatenated into a single row.
-
-    Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
-    and truncated after the scored span. The hint goes immediately before the turn's
-    assistant header, or with ``after_header`` immediately after it, opening the turn as
-    its own text; the whole turn is scored either way. When the header is not where the span
-    says, the hint is spliced at the span start instead and counted as a fallback.
-
-    Carrying every hint in one sequence would make the teacher score a later turn from a
-    state it could not reach: it would see its own earlier advice followed by the student
-    ignoring it.
-
-    The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, the packed
-    meta (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements
-    and the (start, end) spans for the distillation mask (== the meta spans).
-    """
-    base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
+    after_header: bool,
+) -> tuple[list[torch.Tensor], list[SubRow], int]:
+    """The sub-row of each hinted turn with its own hint tokens, their meta records and the fallback count."""
     header = header_ids.shape[0]
     pieces: list[torch.Tensor] = []
     sub_rows: list[SubRow] = []
@@ -82,7 +67,55 @@ def build_spliced_teacher_row(
         pieces.append(row)
         sub_rows.append(sub_row)
 
-    return torch.cat(pieces), pack(sub_rows), fallbacks, [(sub_row.start, sub_row.end) for sub_row in sub_rows]
+    return pieces, sub_rows, fallbacks
+
+
+def build_spliced_teacher_row(
+    prompt_ids: torch.Tensor,
+    response_ids: torch.Tensor,
+    hinted_turns: list[HintedTurn],
+    hint_ids_list: list[torch.Tensor],
+    max_prefix_len: int,
+    header_ids: torch.Tensor,
+    after_header: bool = False,
+    contrast_ids: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
+    """One teacher sub-row per hinted turn, concatenated into a single row.
+
+    Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
+    and truncated after the scored span. The hint goes immediately before the turn's
+    assistant header, or with ``after_header`` immediately after it, opening the turn as
+    its own text; the whole turn is scored either way. When the header is not where the span
+    says, the hint is spliced at the span start instead and counted as a fallback.
+
+    Carrying every hint in one sequence would make the teacher score a later turn from a
+    state it could not reach: it would see its own earlier advice followed by the student
+    ignoring it.
+
+    With ``contrast_ids``, one more sub-row per hinted turn follows them: the same sub-row with
+    those tokens in place of the hint.
+
+    The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, the packed
+    meta (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements
+    and the (start, end) spans for the distillation mask (== the meta spans).
+    """
+    base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
+    pieces, sub_rows, fallbacks = _splice(
+        base_prefix, response_ids, hinted_turns, hint_ids_list, header_ids, after_header
+    )
+    contrast_rows: list[SubRow] = []
+    if contrast_ids is not None:
+        contrast_pieces, contrast_rows, _ = _splice(
+            base_prefix, response_ids, hinted_turns, [contrast_ids] * len(hinted_turns), header_ids, after_header
+        )
+        pieces += contrast_pieces
+
+    return (
+        torch.cat(pieces),
+        pack(sub_rows, contrast_rows),
+        fallbacks,
+        [(sub_row.start, sub_row.end) for sub_row in sub_rows],
+    )
 
 
 def turn_token_mask(response_len: int, spans: list[tuple[int, int]], skip: int = 0) -> torch.Tensor:

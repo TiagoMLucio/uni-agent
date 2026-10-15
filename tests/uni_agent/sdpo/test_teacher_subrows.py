@@ -10,12 +10,16 @@ import torch
 
 from uni_agent.sdpo.hints import HintedTurn
 from uni_agent.sdpo.splice import build_spliced_teacher_row
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRowSpan
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, SubRowSpan, unpack
 from verl.workers.utils.sdpo import explode_turn_teacher_rows, response_keep_positions
 
 HEADER = torch.tensor([90, 91])
 PROMPT = torch.arange(100, 110)
 RESPONSE = torch.arange(0, 40)
+# the same response with the assistant header ahead of the turns at 12 and 24
+RESPONSE_WITH_HEADERS = RESPONSE.clone()
+RESPONSE_WITH_HEADERS[10:12] = HEADER
+RESPONSE_WITH_HEADERS[22:24] = HEADER
 
 
 def _hint(value, length=3):
@@ -112,6 +116,81 @@ def test_student_keeps_the_union_of_spans():
     keep = response_keep_positions(input_ids, responses, metas).values().tolist()
     want = [prompt_len + p - 1 for p in list(range(12, 16)) + list(range(24, 28))]
     assert keep == want
+
+
+def _split(seq, sub_rows):
+    out, offset = [], 0
+    for sub_row in sub_rows:
+        out.append(seq[offset : offset + sub_row.total_len].tolist())
+        offset += sub_row.total_len
+    return out
+
+
+def _swap(sub, old_value, new_ids):
+    at = sub.index(old_value)
+    return sub[:at] + new_ids.tolist() + sub[at + 3 :]
+
+
+def test_contrast_subrow_is_the_hint_subrow_with_only_the_hint_swapped():
+    """Per hinted turn a second sub-row follows the hint ones; it differs from its hint sub-row in the
+    hint tokens alone, for a hint before the header, after it, and joining the prompt on the first turn."""
+    contrast = _hint(800, length=5)
+    cases = [
+        (False, [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")], PROMPT),
+        (True, [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")], PROMPT),
+        (False, [HintedTurn(1, 0, 4, "a"), HintedTurn(5, 24, 28, "b")], torch.cat([PROMPT, HEADER])),
+        (True, [HintedTurn(1, 0, 4, "a"), HintedTurn(5, 24, 28, "b")], torch.cat([PROMPT, HEADER])),
+    ]
+    for after_header, hinted, prompt in cases:
+        hints = [_hint(900), _hint(901)]
+        plain_seq, plain_meta, plain_fallbacks, plain_spans = build_spliced_teacher_row(
+            prompt, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, after_header
+        )
+        seq, meta, fallbacks, spans = build_spliced_teacher_row(
+            prompt, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, after_header, contrast_ids=contrast
+        )
+        assert (fallbacks, spans) == (plain_fallbacks, plain_spans) and fallbacks == 0
+        hint_rows, contrast_rows = unpack(meta), unpack(meta, contrast=True)
+        assert hint_rows == unpack(plain_meta) and unpack(plain_meta, contrast=True) == []
+        assert len(meta) == 1 + 5 * 2 * len(hinted) and len(plain_meta) == 1 + 5 * len(hinted)
+        torch.testing.assert_close(seq[: plain_seq.shape[0]], plain_seq)
+
+        hint_subs = _split(plain_seq, hint_rows)
+        contrast_subs = _split(seq[plain_seq.shape[0] :], contrast_rows)
+        for hint_value, hint_sub, contrast_sub, hint_row, contrast_row in zip(
+            (900, 901), hint_subs, contrast_subs, hint_rows, contrast_rows, strict=True
+        ):
+            assert contrast_sub == _swap(hint_sub, hint_value, contrast)
+            assert (contrast_row.start, contrast_row.end) == (hint_row.start, hint_row.end)
+            assert contrast_row.total_len - hint_row.total_len == contrast.shape[0] - 3
+            body = torch.tensor(contrast_sub)[-contrast_row.body_len :]
+            start, end = contrast_row.start, contrast_row.end
+            torch.testing.assert_close(
+                body[contrast_row.body_start : contrast_row.body_start + end - start], RESPONSE_WITH_HEADERS[start:end]
+            )
+
+
+def test_contrast_leaves_the_students_spans_and_keep_positions_alone():
+    """The exploder flags the contrast sub-rows after the hint ones, on the same spans, and the student
+    still keeps each span once."""
+    hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
+    seq, meta, _, _ = build_spliced_teacher_row(
+        PROMPT, RESPONSE_WITH_HEADERS, hinted, [_hint(900), _hint(901)], 64, HEADER, contrast_ids=_hint(800, length=5)
+    )
+    seqs = torch.nested.nested_tensor([seq], layout=torch.jagged)
+    metas = torch.nested.nested_tensor([torch.tensor(meta)], layout=torch.jagged)
+    responses = torch.nested.nested_tensor([RESPONSE_WITH_HEADERS], layout=torch.jagged)
+
+    _, sub_resps, _, sub_spans = explode_turn_teacher_rows(seqs, metas, responses)
+    assert [s.contrast for s in sub_spans] == [False, False, True, True]
+    assert [(s.parent, s.start, s.end) for s in sub_spans] == [(0, 12, 16), (0, 24, 28)] * 2
+    for span, body in zip(sub_spans, sub_resps.unbind(), strict=True):
+        scored = body[span.body_start : span.body_start + span.end - span.start]
+        torch.testing.assert_close(scored, RESPONSE_WITH_HEADERS[span.start : span.end])
+
+    input_ids = torch.nested.nested_tensor([torch.cat([PROMPT, RESPONSE_WITH_HEADERS])], layout=torch.jagged)
+    keep = response_keep_positions(input_ids, responses, metas).values().tolist()
+    assert keep == [PROMPT.shape[0] + p - 1 for p in list(range(12, 16)) + list(range(24, 28))]
 
 
 def test_degenerate_row_encoding_round_trips():

@@ -51,6 +51,10 @@ class TurnHintTeacher(SDPOTeacher):
     ``turn_hint_voice`` (``user``: the hint is a user turn before the hinted turn; ``thought``: it
     opens the hinted turn after its header, as the agent's own words). Every hint the reflector
     shipped is spliced; its ``max_selected_turns`` is the one cap.
+
+    ``contrast_hint`` (a text spliced through the same template and voice) adds a contrast teacher:
+    every hinted turn ships a second sub-row with it in place of the hint, and the loss moves the
+    student by the difference of the two teachers instead of to the hint teacher.
     """
 
     needs_prompts = True
@@ -66,6 +70,7 @@ class TurnHintTeacher(SDPOTeacher):
         chat_template_kwargs: Optional[dict] = None,
         skip_first_tokens: int = 0,
         turn_hint_voice: str = "user",
+        contrast_hint: Optional[str] = None,
     ):
         super().__init__(
             tokenizer,
@@ -78,6 +83,8 @@ class TurnHintTeacher(SDPOTeacher):
             raise ValueError(f"skip_first_tokens must be a non-negative int, got {skip_first_tokens!r}")
         if turn_hint_voice not in _VOICES:
             raise ValueError(f"turn_hint_voice must be one of {_VOICES}, got {turn_hint_voice!r}")
+        if contrast_hint is not None and (not isinstance(contrast_hint, str) or not contrast_hint.strip()):
+            raise ValueError(f"contrast_hint must be null or a non-empty string, got {contrast_hint!r}")
         self.skip_first_tokens = skip_first_tokens
         self.turn_hint_voice = turn_hint_voice
         self.turn_hint_template = turn_hint_template
@@ -85,9 +92,14 @@ class TurnHintTeacher(SDPOTeacher):
         self.header_ids = torch.tensor(
             assistant_header_ids(tokenizer, template_kwargs=self.template_kwargs), dtype=torch.int64
         )
+        self.contrasts = contrast_hint is not None
+        self.contrast_ids = self._text_ids(contrast_hint) if self.contrasts else None
 
     def hint_ids(self, hint: HintedTurn) -> torch.Tensor:
-        text = self.turn_hint_template.format(hint=hint.text)
+        return self._text_ids(hint.text)
+
+    def _text_ids(self, hint_text: str) -> torch.Tensor:
+        text = self.turn_hint_template.format(hint=hint_text)
         if self.turn_hint_voice == "thought":
             # its own paragraph, a blank line before what the agent wrote
             ids = self.tokenizer.encode(text.strip() + "\n\n", add_special_tokens=False)
@@ -120,6 +132,7 @@ class TurnHintTeacher(SDPOTeacher):
                     self.max_prefix_len,
                     self.header_ids,
                     after_header=self.turn_hint_voice == "thought",
+                    contrast_ids=self.contrast_ids,
                 )
                 hint_fallbacks += fallbacks
                 mask_row = turn_token_mask(response_ids.shape[0], spans, self.skip_first_tokens)
