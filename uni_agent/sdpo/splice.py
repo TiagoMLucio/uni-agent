@@ -26,12 +26,14 @@ def build_spliced_teacher_row(
     hint_ids_list: list[torch.Tensor],
     max_prefix_len: int,
     header_ids: torch.Tensor,
+    after_header: bool = False,
 ) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
     and truncated after the scored span. The hint goes immediately before the turn's
-    assistant header and the whole turn is scored; when the header is not where the span
+    assistant header, or with ``after_header`` immediately after it, opening the turn as
+    its own text; the whole turn is scored either way. When the header is not where the span
     says, the hint is spliced at the span start instead and counted as a fallback.
 
     Carrying every hint in one sequence would make the teacher score a later turn from a
@@ -53,10 +55,13 @@ def build_spliced_teacher_row(
         hint_ids = hint_ids.to(response_ids.dtype)
         prefix = base_prefix
         if start >= header and torch.equal(response_ids[start - header : start], header_ids):
-            insert_at = start - header
+            insert_at = start if after_header else start - header
         elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
             # first turn: its assistant header is the prompt tail, so the hint joins the prefix
-            prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
+            if after_header:
+                prefix = torch.cat([prefix, hint_ids])
+            else:
+                prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
             insert_at = None
         else:
             insert_at = start
@@ -69,7 +74,7 @@ def build_spliced_teacher_row(
             body = [
                 response_ids[:insert_at],  # untouched history, no other hints
                 hint_ids,
-                response_ids[insert_at:start],  # the turn's assistant header
+                response_ids[insert_at:start],  # the turn's assistant header, empty when the hint follows it
                 response_ids[start:end],  # the span the teacher scores
             ]
             row, sub_row = _sub_row(prefix, body, scored=3, span=(start, end))

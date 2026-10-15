@@ -12,7 +12,7 @@ __all__ = [
 
 class HintedTurn(NamedTuple):
     """One reflection hint paired with the turn it lands on: ``[start, end)`` on the response
-    grid, spliced as a user turn before the turn's assistant header."""
+    grid, spliced as a user turn before the turn's assistant header or as the turn's opening."""
 
     step: int
     start: int

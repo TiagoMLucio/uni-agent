@@ -97,6 +97,73 @@ def test_cumulative_hints_and_truncation_after_last_span():
     _spans_map_back(seq, meta, response, hinted)
 
 
+def test_thought_opens_the_turn_after_its_header():
+    prompt = torch.arange(10, dtype=torch.int64)
+    response = torch.tensor([0, 1, 2, 3, 50, 51, 52, 53, 54, 90, 91, 92, 10, 11, 12, 13], dtype=torch.int64)
+    hinted = [HintedTurn(1, 12, 16, "hint")]
+    hint = torch.tensor([70, 71], dtype=torch.int64)
+
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER, after_header=True)
+
+    assert fallbacks == 0
+    expected = torch.cat([prompt, response[:12], hint, response[12:16]])
+    assert torch.equal(seq, expected), "a thought sits after the assistant header, before what the agent wrote"
+    _spans_map_back(seq, meta, response, hinted)
+
+
+def test_first_turn_thought_follows_the_prompt_tail():
+    prompt = torch.cat([torch.arange(5, dtype=torch.int64), HEADER])
+    response = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+    hinted = [HintedTurn(0, 0, 4, "hint")]
+    hint = torch.tensor([70, 71], dtype=torch.int64)
+
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER, after_header=True)
+
+    assert fallbacks == 0
+    assert torch.equal(seq, torch.cat([prompt, hint, response]))
+    assert meta == [1, seq.shape[0], 4, 0, 0, 4], "the thought in the prefix must not count toward the body"
+    _spans_map_back(seq, meta, response, hinted)
+
+
+def test_thought_without_its_header_falls_back_to_the_span_start():
+    prompt = torch.arange(10, dtype=torch.int64)
+    response = torch.tensor([0, 1, 2, 3, 50, 51, 52, 10, 11, 12], dtype=torch.int64)
+    hinted = [HintedTurn(1, 7, 10, "hint")]
+    hint = torch.tensor([70, 71], dtype=torch.int64)
+
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER, after_header=True)
+
+    assert fallbacks == 1
+    assert torch.equal(seq, torch.cat([prompt, response[:7], hint, response[7:10]]))
+    _spans_map_back(seq, meta, response, hinted)
+
+
+def test_cumulative_thoughts_each_open_their_own_turn():
+    prompt = torch.arange(4, dtype=torch.int64)
+    response = torch.cat(
+        [
+            torch.tensor([0, 1], dtype=torch.int64),
+            HEADER,
+            torch.tensor([10, 11, 12], dtype=torch.int64),  # turn a: [5:8)
+            torch.tensor([60, 61], dtype=torch.int64),
+            HEADER,
+            torch.tensor([20, 21], dtype=torch.int64),  # turn b: [13:15)
+            torch.tensor([98, 99], dtype=torch.int64),
+        ]
+    )
+    hinted = [HintedTurn(0, 5, 8, "a"), HintedTurn(1, 13, 15, "b")]
+    hints = [torch.tensor([70], dtype=torch.int64), torch.tensor([71], dtype=torch.int64)]
+
+    seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, hints, 100, HEADER, after_header=True)
+
+    assert fallbacks == 0
+    expected = torch.cat(
+        [prompt, response[:5], hints[0], response[5:8], prompt, response[:13], hints[1], response[13:15]]
+    )
+    assert torch.equal(seq, expected)
+    _spans_map_back(seq, meta, response, hinted)
+
+
 # --- trace weights -----------------------------------------------------------------------
 
 

@@ -29,3 +29,8 @@ chat_template_kwargs: {}
 # steps; the first 8 tokens hold 35% of the hinted turn's KL and as much of its hint-specific
 # part. 0 scores the whole turn.
 skip_first_tokens: 0
+
+# Where the hint goes: "user" is a user turn before the hinted turn; "thought" opens the hinted
+# turn itself, right after its header (the start of its thinking when thinking is on), as the
+# agent's own words in their own paragraph.
+turn_hint_voice: user

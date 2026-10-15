@@ -235,8 +235,11 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     params = inspect.signature(TurnHintTeacher.__init__).parameters
     trainer_provided = {"self", "tokenizer", "max_prefix_len", "apply_chat_template_kwargs", "success_reward_threshold"}
     assert set(options) - {"_target_"} == set(params) - trainer_provided
-    assert set(options) == {"_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens"}
+    assert set(options) == {
+        "_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens", "turn_hint_voice"
+    }
     assert options["chat_template_kwargs"] == {} and options["skip_first_tokens"] == 0
+    assert options["turn_hint_voice"] == "user"
 
     teacher = make_teacher(
         SelfDistillationConfig(teacher=turn_hints_options(chat_template_kwargs={"enable_thinking": False})),
@@ -261,6 +264,30 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     for bad in (-1, 2.5, True):
         with pytest.raises(ValueError, match="skip_first_tokens"):
             build(skip_first_tokens=bad)
+    with pytest.raises(ValueError, match="turn_hint_voice"):
+        build(turn_hint_voice="assistant")
+
+
+def test_turn_hint_teacher_thought_voice_opens_the_hinted_turn():
+    """A thought is the template's text alone, stripped, in its own paragraph: right after the hinted
+    turn's header (for the first turn, after the prompt's tail), never a user turn; the masks and
+    the scored spans are the user voice's."""
+    tok = ToyTokenizer()
+
+    def build(**overrides):
+        teacher = make_teacher(SelfDistillationConfig(teacher=turn_hints_options(**overrides)), tok,
+                               max_prefix_len=4096)
+        extra = [{"turn_spans": SPANS, "turn_hints": [[0, " h0 "], [1, "h1"]]}]
+        return teacher.build(_inputs(extra, ["a"], [0.0], [None]))
+
+    user, thought = build(turn_hint_template="{hint}"), build(turn_hint_template="{hint}", turn_hint_voice="thought")
+    start1, end1 = SPANS[1][1], SPANS[1][2]
+    expected = torch.cat([PROMPT, ids("h0\n\n"), RESPONSE[: len(TURN0)], PROMPT, RESPONSE[:start1], ids("h1\n\n"),
+                          RESPONSE[start1:end1]])
+    assert torch.equal(thought.fields["teacher_input_ids"][0], expected)
+    assert thought.metrics["self_distillation/hint_injection_fallbacks"] == 0
+    for key in ("self_distillation_mask", "loss_mask"):
+        assert torch.equal(thought.fields[key][0], user.fields[key][0])
 
 
 def test_turn_hint_teacher_leaves_the_start_of_each_hinted_turn_unscored():

@@ -20,6 +20,9 @@ class TurnHintBatch(TeacherBatch):
     hinted_per_row: list[list[HintedTurn]]
 
 
+_VOICES = ("user", "thought")
+
+
 def _validate_hint_template(name: str, template: str) -> None:
     try:
         template.format(hint="")
@@ -43,9 +46,11 @@ class TurnHintTeacher(SDPOTeacher):
     options are ``uni_agent/conf/sdpo_teacher/turn_hints.yaml``: ``turn_hint_template``
     (``{hint}`` is the only placeholder) and ``chat_template_kwargs`` (the rollout's
     ``apply_chat_template`` kwargs, so the header and hint fragments match the rollout tokens;
-    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here), and
-    ``skip_first_tokens`` (the start of each hinted turn left out of the distillation mask). Every
-    hint the reflector shipped is spliced; its ``max_selected_turns`` is the one cap.
+    the trainer's ``apply_chat_template_kwargs`` is the dataset's and is not used here),
+    ``skip_first_tokens`` (the start of each hinted turn left out of the distillation mask) and
+    ``turn_hint_voice`` (``user``: the hint is a user turn before the hinted turn; ``thought``: it
+    opens the hinted turn after its header, as the agent's own words). Every hint the reflector
+    shipped is spliced; its ``max_selected_turns`` is the one cap.
     """
 
     needs_prompts = True
@@ -60,6 +65,7 @@ class TurnHintTeacher(SDPOTeacher):
         turn_hint_template: str,
         chat_template_kwargs: Optional[dict] = None,
         skip_first_tokens: int = 0,
+        turn_hint_voice: str = "user",
     ):
         super().__init__(
             tokenizer,
@@ -70,7 +76,10 @@ class TurnHintTeacher(SDPOTeacher):
         _validate_hint_template("turn_hint_template", turn_hint_template)
         if isinstance(skip_first_tokens, bool) or not isinstance(skip_first_tokens, int) or skip_first_tokens < 0:
             raise ValueError(f"skip_first_tokens must be a non-negative int, got {skip_first_tokens!r}")
+        if turn_hint_voice not in _VOICES:
+            raise ValueError(f"turn_hint_voice must be one of {_VOICES}, got {turn_hint_voice!r}")
         self.skip_first_tokens = skip_first_tokens
+        self.turn_hint_voice = turn_hint_voice
         self.turn_hint_template = turn_hint_template
         self.template_kwargs = dict(chat_template_kwargs or {})
         self.header_ids = torch.tensor(
@@ -78,10 +87,13 @@ class TurnHintTeacher(SDPOTeacher):
         )
 
     def hint_ids(self, hint: HintedTurn) -> torch.Tensor:
-        return torch.tensor(
-            hint_user_turn_ids(self.tokenizer, self.turn_hint_template.format(hint=hint.text), self.template_kwargs),
-            dtype=torch.int64,
-        )
+        text = self.turn_hint_template.format(hint=hint.text)
+        if self.turn_hint_voice == "thought":
+            # its own paragraph, a blank line before what the agent wrote
+            ids = self.tokenizer.encode(text.strip() + "\n\n", add_special_tokens=False)
+        else:
+            ids = hint_user_turn_ids(self.tokenizer, text, self.template_kwargs)
+        return torch.tensor(ids, dtype=torch.int64)
 
     def build(self, inputs: TeacherInputs) -> TurnHintBatch:
         from verl.utils.debug_breakpoints import should_break
@@ -107,6 +119,7 @@ class TurnHintTeacher(SDPOTeacher):
                     [self.hint_ids(hint) for hint in hinted],
                     self.max_prefix_len,
                     self.header_ids,
+                    after_header=self.turn_hint_voice == "thought",
                 )
                 hint_fallbacks += fallbacks
                 mask_row = turn_token_mask(response_ids.shape[0], spans, self.skip_first_tokens)
