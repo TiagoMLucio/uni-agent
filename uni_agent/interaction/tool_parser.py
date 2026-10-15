@@ -340,6 +340,14 @@ class SweStarXMLToolParser(XMLToolParser):
     def _get_function_calls(self, model_output: str) -> list[str]:
         return self.tool_call_function_regex.findall(model_output)
 
+    def _parse_xml_function_call(
+        self, function_call_str: str, tools: list[OpenAIFunctionToolSchema]
+    ) -> OpenAIFunctionToolCall:
+        # their finish(message, task_completed) ends the episode as our submit() does
+        if function_call_str.partition(">")[0] == "finish" and not any(t.function.name == "finish" for t in tools):
+            function_call_str = "submit>"
+        return super()._parse_xml_function_call(function_call_str, tools)
+
     def extract_tool_calls(
         self, model_output: str, tools: list[OpenAIFunctionToolSchema]
     ) -> tuple[str, list[OpenAIFunctionToolCall]]:

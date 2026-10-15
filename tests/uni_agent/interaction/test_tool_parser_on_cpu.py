@@ -108,6 +108,28 @@ def test_swestar_closed_function_parses():
     assert calls[0].function.arguments["new_str"] == "x = 2"
 
 
+def test_swestar_finish_is_submit():
+    submit = OpenAIFunctionToolSchema(
+        type="function",
+        function=OpenAIFunctionSchema(
+            name="submit",
+            description="submit",
+            parameters=OpenAIFunctionParametersSchema(type="object", properties={}, required=[]),
+        ),
+    )
+    call = (
+        "Done.\n\n<function=finish>\n<parameter=message>\nFixed it.\n</parameter>\n"
+        "<parameter=task_completed>true</parameter>\n</function>"
+    )
+    content, calls = SweStarXMLToolParser().extract_tool_calls(call, [*TOOLS, submit])
+    assert content == "Done.\n\n"
+    assert [c.function.name for c in calls] == ["submit"] and calls[0].function.arguments == {}
+    with pytest.raises(FunctionCallFormatError, match="'finish' is not defined"):
+        XMLToolParser().extract_tool_calls(
+            f"<tool_call>\n{call[call.index('<function') :]}\n</tool_call>", [*TOOLS, submit]
+        )
+
+
 def test_hermes_unclosed_raises():
     cut = '<tool_call>\n{"name": "str_replace_editor", "arguments": {"command": "vi'
     with pytest.raises(FunctionCallFormatError, match="Unclosed tool call"):
