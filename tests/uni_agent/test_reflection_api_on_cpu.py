@@ -55,8 +55,9 @@ class RateLimitError(APIStatusError):
 seen_clients = []
 #: a reply that never comes
 STALL = object()
-#: the ChatGPT plan's requests (a client whose key is the plan's access token)
+#: the ChatGPT plan's requests (a client whose key is a plan's access token), and which plan's token each used
 plan_seen = []
+plan_keys = []
 
 
 def plan_usage():
@@ -113,7 +114,10 @@ def fake_openai(replies, seen, plan=()):
     class AsyncOpenAI:
         def __init__(self, **kwargs):
             seen_clients.append(kwargs)
-            self.responses = PlanResponses() if kwargs.get("api_key") == "plan-token" else Responses()
+            on_plan = str(kwargs.get("api_key")).startswith("plan-token")
+            if on_plan:
+                plan_keys.append(kwargs["api_key"])
+            self.responses = PlanResponses() if on_plan else Responses()
             self.chat = types.SimpleNamespace(completions=Completions())
 
         async def __aenter__(self):
@@ -130,6 +134,7 @@ def reflect(monkeypatch, replies, turns=TURNS, feedback="1 failed", agent_patch=
             policy=None, raises=None, plan=(), reflector=None, **over):
     seen = []
     plan_seen.clear()
+    plan_keys.clear()
     monkeypatch.setitem(sys.modules, "openai", fake_openai(replies, seen, plan))
     cfg = ApiReflector.Config(**{
         "name": "openai", "model": "gpt-6-luna", "enabled": True,
@@ -352,8 +357,9 @@ def test_unseen_names():
 def plan(monkeypatch):
     from uni_agent.reflection import api, chatgpt_plan
 
-    monkeypatch.setattr(chatgpt_plan, "access_token", lambda path: "plan-token")
+    monkeypatch.setattr(chatgpt_plan, "access_token", lambda path: f"plan-token:{path}")
     monkeypatch.setattr(api, "PLAN_BUSY_WAIT_S", 0.0)
+    monkeypatch.setattr(api, "_PLAN_REST", {})
     monkeypatch.setattr(api.random, "uniform", lambda a, b: 0.0)
     return {"plan_credentials": "/creds/chatgpt_plan.json", "sampling": {"service_tier": "flex"}}
 
@@ -370,28 +376,56 @@ def test_the_plan_serves_the_call_in_its_required_form(monkeypatch, plan):
     assert metrics["reflect_input_tokens"] == 500
 
 
-def test_a_spent_plan_hands_the_rest_of_the_run_to_the_api_on_flex(monkeypatch, plan):
+def test_a_spent_plan_rests_and_the_api_serves_on_flex(monkeypatch, plan):
+    from uni_agent.reflection import api
     spent = RateLimitError("weekly cap", code="subscription_sharing_usage_limit_exceeded")
     hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[spent], **plan)
-    assert hints == {1: "api"} and len(plan_seen) == 1 and seen[0]["service_tier"] == "flex" and r._plan_off
-    hints, seen, r = reflect(monkeypatch, [answer((2, "api again"))], plan=[answer((1, "plan"))], reflector=r, **plan)
-    assert hints == {2: "api again"} and plan_seen == []
+    assert hints == {1: "api"} and len(plan_seen) == 1 and seen[0]["service_tier"] == "flex"
+    assert r.call_metrics()["reflect_plan_fallbacks"] == 1 and "/creds/chatgpt_plan.json" in api._PLAN_REST
+    # the next rollout's reflector skips the resting plan
+    hints, seen, r = reflect(monkeypatch, [answer((2, "api again"))], plan=[answer((1, "plan"))], **plan)
+    assert hints == {2: "api again"} and plan_seen == [] and r.call_metrics()["reflect_plan_fallbacks"] == 1
+
+
+def test_a_rested_plan_is_tried_again(monkeypatch, plan):
+    from uni_agent.reflection import api
+    monkeypatch.setattr(api, "PLAN_REST_S", 0.0)
+    spent = RateLimitError("weekly cap", code="subscription_sharing_usage_limit_exceeded")
+    hints, _, _ = reflect(monkeypatch, [answer((1, "api"))], plan=[spent], **plan)
+    assert hints == {1: "api"}
+    hints, seen, _ = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))], **plan)
+    assert hints == {1: "plan"} and seen == []
+
+
+def test_plans_are_tried_in_order_before_the_api(monkeypatch, plan):
+    spent = RateLimitError("5-hour cap", code="subscription_sharing_usage_limit_exceeded")
+    plans = {**plan, "plan_credentials": ["/creds/main.json", "/creds/spare.json"]}
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[spent, answer((1, "spare"))], **plans)
+    assert hints == {1: "spare"} and seen == []
+    assert plan_keys == ["plan-token:/creds/main.json", "plan-token:/creds/spare.json"]
+    m = r.call_metrics()
+    assert m["reflect_plan_calls"] == 1 and m["reflect_plan_backup_calls"] == 1 and m["reflect_plan_fallbacks"] == 0
+    # the main plan rests: the next rollout goes straight to the spare, then to the API once that is spent too
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[spent], **plans)
+    assert hints == {1: "api"} and plan_keys == ["plan-token:/creds/spare.json"]
     assert r.call_metrics()["reflect_plan_fallbacks"] == 1
 
 
 @pytest.mark.parametrize("failure", [("failed", "subscription_sharing_usage_limit_exceeded"),
                                      RateLimitError("", code="subscription_sharing_invalid_user")])
-def test_a_refused_plan_turns_off_whether_the_request_or_the_stream_says_so(monkeypatch, plan, failure):
-    hints, _, r = reflect(monkeypatch, [answer((1, "api"))], plan=[failure], **plan)
-    assert hints == {1: "api"} and r._plan_off
+def test_a_refused_plan_rests_whether_the_request_or_the_stream_says_so(monkeypatch, plan, failure):
+    from uni_agent.reflection import api
+    hints, _, _ = reflect(monkeypatch, [answer((1, "api"))], plan=[failure], **plan)
+    assert hints == {1: "api"} and "/creds/chatgpt_plan.json" in api._PLAN_REST
 
 
 def test_a_busy_plan_is_retried_before_the_api_serves(monkeypatch, plan):
+    from uni_agent.reflection import api
     busy = APIStatusError("busy", 503, "subscription_sharing_usage_unavailable")
     hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[busy, answer((1, "plan"))], **plan)
-    assert hints == {1: "plan"} and len(plan_seen) == 2 and seen == [] and not r._plan_off
+    assert hints == {1: "plan"} and len(plan_seen) == 2 and seen == [] and not api._PLAN_REST
     hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[busy], **plan)
-    assert hints == {1: "api"} and len(plan_seen) == 3 and not r._plan_off
+    assert hints == {1: "api"} and len(plan_seen) == 3 and not api._PLAN_REST
 
 
 def test_a_refused_answer_schema_is_dropped_once(monkeypatch, plan):
@@ -407,15 +441,15 @@ def test_a_context_error_from_the_plan_moves_down_the_ladder(monkeypatch, plan):
     assert r.call_metrics()["reflect_plan_fallbacks"] == 0
 
 
-def test_a_refused_refresh_turns_the_plan_off(monkeypatch, plan):
-    from uni_agent.reflection import chatgpt_plan
+def test_a_refused_refresh_rests_the_plan(monkeypatch, plan):
+    from uni_agent.reflection import api, chatgpt_plan
 
     def refused(path):
         raise chatgpt_plan.PlanUnavailable("token endpoint refused (400): invalid_grant")
 
     monkeypatch.setattr(chatgpt_plan, "access_token", refused)
     hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))], **plan)
-    assert hints == {1: "api"} and plan_seen == [] and r._plan_off
+    assert hints == {1: "api"} and plan_seen == [] and "/creds/chatgpt_plan.json" in api._PLAN_REST
 
 
 def test_plan_calls_need_the_responses_api():

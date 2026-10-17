@@ -45,12 +45,16 @@ SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
 UNSAFE = re.compile(r"<\|[^<>|\n]*\|>|</?(?:tool_call|tool_response|think)>|[\ud800-\udfff]")
 #: token use per call, summed over the trajectory's calls
 USAGE = ("reflect_input_tokens", "reflect_cached_tokens", "reflect_output_tokens", "reflect_reasoning_tokens")
-#: ChatGPT plan errors: a spent allowance or a refused user ends plan calls for the run; a busy service is retried
+#: ChatGPT plan errors: a spent allowance or a refused user rests that plan for PLAN_REST_S; a busy service is retried
 PLAN_OFF = frozenset({"subscription_sharing_usage_limit_exceeded", "subscription_sharing_user_not_eligible",
                       "subscription_sharing_invalid_user", "subscription_sharing_route_not_supported"})
 PLAN_BUSY = frozenset({"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable"})
 PLAN_TRIES = 3
 PLAN_BUSY_WAIT_S = 20.0
+#: how long a plan that refused rests before this process tries it again: an allowance frees up over hours
+PLAN_REST_S = 900.0
+#: credentials file -> monotonic time its rest ends; shared by the process's reflectors (one per rollout)
+_PLAN_REST: dict[str, float] = {}
 
 #: the chat template's special tokens, which a turn's raw response still carries
 SPECIAL = re.compile(r"<\|[^<>|\n]*\|>")
@@ -126,9 +130,14 @@ class ApiReflectionConfig(BaseReflectionConfig):
     #: extra request parameters: a Chat Completions endpoint's recommended sampling, or the Responses API's
     #: service_tier (flex bills half and may queue; its capacity 429s are waited out like rate limits)
     sampling: dict = {}
-    #: a ChatGPT plan credentials file (chatgpt_plan login): calls go to the user's plan, and to the API key
-    #: with ``sampling`` when the plan cannot serve them
-    plan_credentials: str | None = None
+    #: ChatGPT plan credentials files (chatgpt_plan login), tried in order: a call goes to the first plan that serves
+    #: it, and to the API key with ``sampling`` when none can
+    plan_credentials: str | list[str] | None = None
+
+    @property
+    def plan_files(self) -> list[str]:
+        plans = self.plan_credentials
+        return [] if not plans else [plans] if isinstance(plans, str) else list(plans)
 
     @model_validator(mode="after")
     def _check_calls(self):
@@ -153,8 +162,6 @@ class ApiReflector(AbstractReflector):
     a context error from the endpoint moves on to the next step all the same."""
 
     Config: ClassVar[type[BaseReflectionConfig]] = ApiReflectionConfig
-    #: set once the plan's allowance is spent or its sign-in refused; the API key serves the rest of the run
-    _plan_off: bool = False
     #: dropped if the plan refuses the strict answer schema; the parser reads the JSON from the text alone
     _plan_schema: bool = True
 
@@ -234,10 +241,15 @@ class ApiReflector(AbstractReflector):
         cfg = self.config
         if cfg.base_url is None:
             name, schema = SCHEMAS[parse]
-            if cfg.plan_credentials and not self._plan_off:
-                served = await self._plan_request(messages, name, schema)
-                if served is not None:
-                    return served
+            if cfg.plan_files:
+                for i, path in enumerate(cfg.plan_files):
+                    if _PLAN_REST.get(path, 0.0) > time.monotonic():
+                        continue
+                    served = await self._plan_request(path, messages, name, schema)
+                    if served is not None:
+                        self._counts["reflect_plan_backup_calls"] += i > 0
+                        return served
+                self._counts["reflect_plan_fallbacks"] += 1
             response = await self._create(
                 client.responses.create, rate_limit_error,
                 model=cfg.model, instructions=messages[0]["content"], input=messages[1]["content"],
@@ -268,16 +280,21 @@ class ApiReflector(AbstractReflector):
         choice = response.choices[0]
         return choice.message.content or "", self._tally(usage), choice.finish_reason
 
-    async def _plan_request(self, messages, name, schema) -> tuple[str, dict, str] | None:
-        """One call on the user's ChatGPT plan, in the form that path requires (streamed, not stored, no output
-        cap); None when the plan cannot serve it, so the API key does. A context error goes back to the ladder."""
+    def _rest(self, path: str, why) -> None:
+        _PLAN_REST[path] = time.monotonic() + PLAN_REST_S
+        self.logger.warning(f"ChatGPT plan {os.path.basename(path)} rests {PLAN_REST_S / 60:.0f} min ({why}); the next "
+                            "plan or the API key serves until then")
+
+    async def _plan_request(self, path, messages, name, schema) -> tuple[str, dict, str] | None:
+        """One call on the ChatGPT plan whose credentials are at ``path``, in the form that path requires (streamed,
+        not stored, no output cap); None when it cannot serve it. A context error goes back to the ladder."""
         from openai import APIStatusError, AsyncOpenAI, BadRequestError
 
         cfg = self.config
         for attempt in range(PLAN_TRIES):
             code = None
             try:
-                token = await asyncio.to_thread(chatgpt_plan.access_token, cfg.plan_credentials)
+                token = await asyncio.to_thread(chatgpt_plan.access_token, path)
                 body = {"model": cfg.model, "instructions": messages[0]["content"],
                         "input": [{"role": "user", "content": messages[1]["content"]}],
                         "reasoning": {"effort": cfg.reasoning_effort}, "store": False, "stream": True}
@@ -307,8 +324,7 @@ class ApiReflector(AbstractReflector):
                 self._counts["reflect_plan_calls"] += 1
                 return text or final.output_text or "", self._tally(usage), final.status
             except chatgpt_plan.PlanUnavailable as exc:
-                self._plan_off = True
-                self.logger.warning(f"ChatGPT plan unavailable for the rest of the run, using the API key: {exc}")
+                self._rest(path, exc)
                 break
             except BadRequestError as exc:
                 if "context" in str(exc).lower():
@@ -317,7 +333,7 @@ class ApiReflector(AbstractReflector):
                     self._plan_schema = False
                     self.logger.warning(f"ChatGPT plan refused the answer schema ({exc.param}); asking without it")
                     continue
-                self.logger.warning(f"ChatGPT plan call refused, the API key serves this one: {exc}")
+                self.logger.warning(f"ChatGPT plan call refused, the next plan or the API key serves this one: {exc}")
                 code = exc.code
                 break
             except APIStatusError as exc:
@@ -326,13 +342,11 @@ class ApiReflector(AbstractReflector):
             except Exception as exc:
                 self.logger.warning(f"ChatGPT plan call failed: {exc!r}")
             if code in PLAN_OFF:
-                self._plan_off = True
-                self.logger.warning(f"ChatGPT plan off for the rest of the run ({code}); the API key serves it")
+                self._rest(path, code)
                 break
             if code not in PLAN_BUSY or attempt + 1 == PLAN_TRIES:
                 break
             await asyncio.sleep(PLAN_BUSY_WAIT_S + random.uniform(0.0, 10.0))
-        self._counts["reflect_plan_fallbacks"] += 1
         return None
 
     async def _create(self, create, rate_limit_error, **request):
@@ -356,7 +370,7 @@ class ApiReflector(AbstractReflector):
     def call_metrics(self) -> dict[str, float]:
         return {**super().call_metrics(), **{key: float(self._counts[key]) for key in (
             *USAGE, "reflect_leaky_hints", "reflect_rate_limited", "reflect_unsafe_hints", "reflect_plan_calls",
-            "reflect_plan_fallbacks")}}
+            "reflect_plan_backup_calls", "reflect_plan_fallbacks")}}
 
     def _tally(self, usage: dict[str, int]) -> dict[str, int]:
         for key, value in usage.items():
