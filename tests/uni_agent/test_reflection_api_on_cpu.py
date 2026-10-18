@@ -154,8 +154,9 @@ def test_best_turn_first_and_render(monkeypatch):
     assert hints == {2: "later"}
     user = seen[0]["input"]
     assert user.startswith("rows are dropped|0-2|")
-    assert '<turn n="1">\n<tool_output>\ndef parse_row(x): ...\n</tool_output>' in user
-    assert "<agent_called>\nbash\n$ cat a.py\n</agent_called>" in user
+    assert "### Turn 0\nLet me look.\n<tool_call>\n<function=execute_bash>" in user
+    assert "### Output of turn 0\ndef parse_row(x): ...\n\n### Turn 1\nparse_row looks fine." in user
+    assert user.count("### Turn ") == 3 and "### Output of turn 2\n(no tool call)" in user
     assert seen[0]["model"] == "gpt-6-luna" and seen[0]["reasoning"] == {"effort": "high"}
     metrics = r.call_metrics()
     assert metrics["reflect_input_tokens"] == 100 and metrics["reflect_reasoning_tokens"] == 30
@@ -200,7 +201,7 @@ def test_context_error_moves_to_the_next_step(monkeypatch):
     assert r.call_metrics()["reflect_over_budget"] == 1
 
 
-def test_response_cut_keeps_the_agents_words():
+def test_response_cut_keeps_the_reasoning_and_the_agents_words():
     cfg = ApiReflector.Config(name="openai", model="gpt-6-luna",
                               calls=[{"id": "luna", "system": "sys", "parse": "hints", "user": "{turns}"}])
     response = ("<think>" + "t" * 5_000 + "</think>I will write the module.\n<tool_call>\n"
@@ -208,9 +209,27 @@ def test_response_cut_keeps_the_agents_words():
                 "/testbed/a.py\n</parameter>\n<parameter=file_text>\n" + "y" * 10_000 + "\n</parameter>\n"
                 "</function>\n</tool_call>")
     out = ApiReflector(Policy(), cfg)._render_attempt([{"step": 0, "response": response, "tools": []}], None, 3_800)
-    assert "I will write the module." in out and "t" * 100 not in out
-    assert "str_replace_editor create /testbed/a.py\n<file_text>" in out and "chars elided" in out
-    assert len(out) < 3_800
+    thought, _, rest = out.partition("</think>")
+    assert "t" * 5_000 in thought and "chars elided" not in thought
+    assert "I will write the module." in rest and "<function=str_replace_editor>" in rest and "chars elided" in rest
+    assert len(rest) < 3_900
+
+
+def test_reasoning_cut_off_by_the_token_limit_stays_whole():
+    cfg = ApiReflector.Config(name="openai", model="gpt-6-luna",
+                              calls=[{"id": "luna", "system": "sys", "parse": "hints", "user": "{turns}"}])
+    out = ApiReflector(Policy(), cfg)._render_attempt([{"step": 1, "response": "r" * 5_000, "tools": []}], None, 1_000)
+    assert "r" * 5_000 in out and "chars elided" not in out
+
+
+def test_turn_is_rendered_as_generated():
+    cfg = ApiReflector.Config(name="openai", model="gpt-6-luna",
+                              calls=[{"id": "luna", "system": "sys", "parse": "hints", "user": "{turns}"}])
+    turns = [{"step": 3, "response": "Check the parser.</think>\nI will read it.<|im_end|>", "tools": [{"observation": "x"}]},
+             {"step": 4, "response": "No reasoning here.", "tools": []}]
+    out = ApiReflector(Policy(), cfg)._render_attempt(turns, None, None)
+    assert out == ("### Turn 3\n<think>\nCheck the parser.</think>\nI will read it.\n\n### Output of turn 3\nx\n\n"
+                   "### Turn 4\nNo reasoning here.\n\n### Output of turn 4\n(no tool call)")
 
 
 def turn_hint(turn, hint):

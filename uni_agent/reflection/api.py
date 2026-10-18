@@ -4,9 +4,8 @@ OpenAI-compatible Chat Completions endpoint (``base_url``).
 One call per failed trace. The prompt is a labeling brief answered as a JSON object under a fixed
 schema: the v4 brief grades every turn and names the best ones, which become the hints in the
 model's order (``parse: hints``); the protocol brief names one turn and its hint (``parse:
-turn_hint``). The trajectory is rendered in the tagged form those briefs were measured on: each
-turn shows the tool output the agent saw right before writing it, then what the agent wrote and
-the tool it called.
+turn_hint``). The trajectory is rendered turn by turn as the agent generated it (its reasoning,
+any text and its tool call), each turn followed by the output of its call.
 """
 
 import asyncio
@@ -19,7 +18,8 @@ from typing import ClassVar
 from pydantic import model_validator
 
 from uni_agent.reflection import chatgpt_plan
-from uni_agent.reflection.base import OVER_BUDGET, AbstractReflector, BaseReflectionConfig, ReflectionFailed
+from uni_agent.reflection.base import (OVER_BUDGET, AbstractReflector, BaseReflectionConfig, ReflectionFailed,
+                                      neutralised_atomic)
 from uni_agent.reflection.facts import patch_view
 from uni_agent.reflection.pipeline import CallSpec, PipelineReflectionConfig, _fields
 from uni_agent.reflection.registry import register_reflector
@@ -52,8 +52,9 @@ PLAN_BUSY = frozenset({"subscription_sharing_usage_unavailable", "subscription_s
 PLAN_TRIES = 3
 PLAN_BUSY_WAIT_S = 20.0
 
-CALL = re.compile(r"<function=(\w+)>(.*?)</function>", re.S)
-PARAM = re.compile(r"<parameter=(\w+)>\n?(.*?)\n?</parameter>", re.S)
+#: the chat template's special tokens, which a turn's raw response still carries
+SPECIAL = re.compile(r"<\|[^<>|\n]*\|>")
+CALL_MARKERS = ("<tool_call>", neutralised_atomic("<tool_call>"))
 ISSUE = re.compile(r"<issue_description>(.*?)</issue_description>", re.S)
 #: what a hint may cite by name: every identifier in backticks, and bare dotted paths, snake_case, CamelCase
 QUOTED = re.compile(r"`([^`\n]+)`")
@@ -89,23 +90,11 @@ def fence(text: str, lang: str = "") -> str:
     return f"{ticks}{lang}\n{text.rstrip()}\n{ticks}"
 
 
-def own_part(response: str) -> str:
-    """What the agent wrote and the tool it called, in a neutral form (raw call markup invites the reader to continue it)."""
-    match = CALL.search(response)
-    fn, p = (match.group(1), dict(PARAM.findall(match.group(2)))) if match else (None, {})
-    if fn == "str_replace_editor":
-        head = f"str_replace_editor {p.get('command', '')} {p.get('path', '')}" + (
-            f" {p['view_range']}" if p.get("view_range") else "")
-        call = "\n".join([head] + [f"<{k}>\n{p[k]}\n</{k}>"
-                                   for k in ("old_str", "new_str", "file_text", "insert_line") if p.get(k)])
-    elif fn == "execute_bash":
-        call = f"bash\n$ {p.get('command', '')}"
-    elif fn:
-        call = fn + "".join(f" {k}={v}" for k, v in p.items())
-    else:
-        call = "(no tool call)"
-    text = response.split("</think>")[-1].split("<tool_call>")[0].strip()
-    return (f"<agent_wrote>\n{text}\n</agent_wrote>\n" if text else "") + f"<agent_called>\n{call}\n</agent_called>"
+def raw_turn(response: str) -> str:
+    """The turn as the agent generated it: the special tokens dropped, and the reasoning's opening
+    tag, which the chat template writes into the prompt, put back."""
+    raw = SPECIAL.sub("", response).strip()
+    return "<think>\n" + raw if "</think>" in raw and not raw.startswith("<think>") else raw
 
 
 def unseen_names(hint: str, seen: str) -> list[str]:
@@ -407,14 +396,20 @@ class ApiReflector(AbstractReflector):
         return hints, leaks
 
     def _render_attempt(self, turns: list[dict], obs_cap: int | None, resp_cap: int | None) -> str:
-        parts, previous = [], None
+        parts = []
         for turn in turns:
-            shown = (f"<tool_output>\n{self._clip(previous, obs_cap)}\n</tool_output>\n" if previous is not None else "")
-            # the cut counts what the reader is shown: the reply after its reasoning
-            own = own_part(self._clip_response(turn["response"].split("</think>")[-1], resp_cap))
-            parts.append(f'<turn n="{turn["step"]}">\n{shown}{own}\n</turn>')
-            previous = "\n".join(t["observation"] or "" for t in turn["tools"])
+            output = "\n".join(t["observation"] or "" for t in turn["tools"]) if turn["tools"] else "(no tool call)"
+            parts.append(f"### Turn {turn['step']}\n{self._clip_turn(raw_turn(turn['response']), resp_cap)}\n\n"
+                         f"### Output of turn {turn['step']}\n{self._clip(output, obs_cap)}")
         return "\n\n".join(parts)
+
+    def _clip_turn(self, raw: str, cap: int | None) -> str:
+        """The reasoning stays whole; ``cap`` cuts only the reply after it, as ``_clip_response`` cuts a reply.
+        A turn with neither a closed reasoning nor a call is reasoning cut off by the turn's token limit."""
+        thought, sep, rest = raw.partition("</think>")
+        if sep:
+            return thought + sep + self._clip_response(rest, cap)
+        return self._clip_response(raw, cap) if any(m in raw for m in CALL_MARKERS) else raw
 
 
 register_langfuse_op("ApiReflector.reflect_trajectory", name="reflection", as_type="evaluator")
