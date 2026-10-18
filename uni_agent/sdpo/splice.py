@@ -70,6 +70,19 @@ def _splice(
     return pieces, sub_rows, fallbacks
 
 
+def _no_note(
+    base_prefix: torch.Tensor, response_ids: torch.Tensor, hinted_turns: list[HintedTurn]
+) -> tuple[list[torch.Tensor], list[SubRow]]:
+    """The sub-row of each hinted turn with nothing spliced in: the trajectory up to the turn's end."""
+    pieces, sub_rows = [], []
+    for hint in hinted_turns:
+        body = [response_ids[: hint.start], response_ids[hint.start : hint.end]]
+        row, sub_row = _sub_row(base_prefix, body, scored=1, span=(hint.start, hint.end))
+        pieces.append(row)
+        sub_rows.append(sub_row)
+    return pieces, sub_rows
+
+
 def build_spliced_teacher_row(
     prompt_ids: torch.Tensor,
     response_ids: torch.Tensor,
@@ -78,7 +91,8 @@ def build_spliced_teacher_row(
     max_prefix_len: int,
     header_ids: torch.Tensor,
     after_header: bool = False,
-    contrast_ids: Optional[torch.Tensor] = None,
+    contrast_ids: Optional[torch.Tensor | list[torch.Tensor]] = None,
+    anchor: bool = False,
 ) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
     """One teacher sub-row per hinted turn, concatenated into a single row.
 
@@ -92,27 +106,36 @@ def build_spliced_teacher_row(
     state it could not reach: it would see its own earlier advice followed by the student
     ignoring it.
 
-    With ``contrast_ids``, one more sub-row per hinted turn follows them: the same sub-row with
-    those tokens in place of the hint.
+    With ``contrast_ids`` (one tensor for every hinted turn, or one per hinted turn), one more
+    sub-row per hinted turn follows them: the same sub-row with those tokens in place of the hint.
+    With ``anchor`` too, a third sub-row per hinted turn follows those: the same turn with no note
+    spliced at all.
 
     The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, the packed
     meta (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements
     and the (start, end) spans for the distillation mask (== the meta spans).
     """
+    if anchor and contrast_ids is None:
+        raise ValueError("a no-note anchor sub-row only anchors a contrast: pass contrast_ids")
     base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
     pieces, sub_rows, fallbacks = _splice(
         base_prefix, response_ids, hinted_turns, hint_ids_list, header_ids, after_header
     )
     contrast_rows: list[SubRow] = []
+    anchor_rows: list[SubRow] = []
     if contrast_ids is not None:
+        per_turn = contrast_ids if isinstance(contrast_ids, list) else [contrast_ids] * len(hinted_turns)
         contrast_pieces, contrast_rows, _ = _splice(
-            base_prefix, response_ids, hinted_turns, [contrast_ids] * len(hinted_turns), header_ids, after_header
+            base_prefix, response_ids, hinted_turns, per_turn, header_ids, after_header
         )
         pieces += contrast_pieces
+        if anchor:
+            anchor_pieces, anchor_rows = _no_note(base_prefix, response_ids, hinted_turns)
+            pieces += anchor_pieces
 
     return (
         torch.cat(pieces),
-        pack(sub_rows, contrast_rows),
+        pack(sub_rows, contrast_rows, anchor_rows),
         fallbacks,
         [(sub_row.start, sub_row.end) for sub_row in sub_rows],
     )

@@ -237,10 +237,11 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     assert set(options) - {"_target_"} == set(params) - trainer_provided
     assert set(options) == {
         "_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens", "turn_hint_voice",
-        "contrast_hint",
+        "contrast_hint", "contrast_anchor", "contrast_source",
     }
     assert options["chat_template_kwargs"] == {} and options["skip_first_tokens"] == 0
     assert options["turn_hint_voice"] == "user" and options["contrast_hint"] is None
+    assert options["contrast_anchor"] == "student" and options["contrast_source"] == "text"
 
     teacher = make_teacher(
         SelfDistillationConfig(teacher=turn_hints_options(chat_template_kwargs={"enable_thinking": False})),
@@ -270,6 +271,13 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     for bad in ("", "  ", 5):
         with pytest.raises(ValueError, match="contrast_hint"):
             build(contrast_hint=bad)
+    with pytest.raises(ValueError, match="contrast_anchor"):
+        build(contrast_hint="Continue.", contrast_anchor="hint")
+    with pytest.raises(ValueError, match="contrast_source"):
+        build(contrast_hint="Continue.", contrast_source="batch")
+    for overrides in (dict(contrast_anchor="teacher"), dict(contrast_source="other_row")):
+        with pytest.raises(ValueError, match="set contrast_hint"):
+            build(**overrides)
 
 
 def test_turn_hint_teacher_thought_voice_opens_the_hinted_turn():
@@ -369,6 +377,97 @@ def test_contrast_hint_adds_the_hint_subrows_with_only_the_text_swapped(voice, t
         for row in range(3):
             assert torch.equal(contrast.fields[key][row], plain.fields[key][row])
     assert contrast.metrics == plain.metrics and contrast.hinted_per_row == plain.hinted_per_row
+
+
+def _contrast_texts(out, row, plain_seq_len):
+    """The decoded contrast sub-rows of one built row, after its hint sub-rows."""
+    meta = out.fields["teacher_seq_meta"][row].tolist()
+    seq = out.fields["teacher_input_ids"][row]
+    texts, at = [], plain_seq_len
+    for contrast_row in unpack(meta, contrast=True):
+        texts.append(_text(seq[at : at + contrast_row.total_len]))
+        at += contrast_row.total_len
+    return texts
+
+
+def _hinted_seq_len(out, row):
+    return sum(sub_row.total_len for sub_row in unpack(out.fields["teacher_seq_meta"][row].tolist()))
+
+
+def test_contrast_anchor_teacher_adds_the_no_note_subrows():
+    """``contrast_anchor: teacher`` ships, after the contrast sub-rows, each hinted turn once more with no
+    note: the prompt and the response up to the turn's end. The rest is the contrast teacher's."""
+    tok = ToyTokenizer()
+    extra = [
+        {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]},
+        {"turn_spans": SPANS, "turn_hints": []},
+    ]
+
+    def build(**overrides):
+        options = turn_hints_options(contrast_hint="Continue.", **overrides)
+        teacher = make_teacher(SelfDistillationConfig(distillation_topk=100, teacher=options), tok, max_prefix_len=4096)
+        return teacher, teacher.build(_inputs(extra, ["a", "b"], [0.0] * 2, [None] * 2))
+
+    contrast_teacher, contrast = build()
+    anchor_teacher, anchored = build(contrast_anchor="teacher")
+    assert anchor_teacher.anchors and not contrast_teacher.anchors
+
+    meta = anchored.fields["teacher_seq_meta"][0].tolist()
+    contrast_meta = contrast.fields["teacher_seq_meta"][0].tolist()
+    assert unpack(meta) == unpack(contrast_meta) and unpack(meta, contrast=True) == unpack(contrast_meta, contrast=True)
+    seq, contrast_seq = anchored.fields["teacher_input_ids"][0], contrast.fields["teacher_input_ids"][0]
+    assert torch.equal(seq[: contrast_seq.shape[0]], contrast_seq)
+    at = contrast_seq.shape[0]
+    for hint, anchor_row in zip(anchored.hinted_per_row[0], unpack(meta, anchor=True), strict=True):
+        assert _text(seq[at : at + anchor_row.total_len]) == _text(PROMPT) + _text(RESPONSE[: hint.end])
+        assert (anchor_row.start, anchor_row.end) == (hint.start, hint.end)
+        at += anchor_row.total_len
+    assert at == seq.shape[0]
+
+    assert anchored.fields["teacher_seq_meta"][1].tolist() == DEGENERATE_META
+    for key in ("self_distillation_mask", "loss_mask"):
+        for row in range(2):
+            assert torch.equal(anchored.fields[key][row], contrast.fields[key][row])
+    assert anchored.metrics == contrast.metrics
+
+
+def test_other_row_contrast_is_the_next_other_tasks_hint():
+    """``contrast_source: other_row`` takes, per hinted turn, the hint of the next hinted row (wrapping) whose
+    task differs, cycling its hints; a batch with no other task's hint falls back to ``contrast_hint``."""
+    tok = ToyTokenizer()
+
+    def build(extra, uids, **overrides):
+        options = turn_hints_options(contrast_hint="Continue.", contrast_source="other_row", **overrides)
+        teacher = make_teacher(SelfDistillationConfig(distillation_topk=100, teacher=options), tok, max_prefix_len=4096)
+        plain = make_teacher(SelfDistillationConfig(teacher=turn_hints_options()), tok, max_prefix_len=4096)
+        inputs = _inputs(extra, uids, [0.0] * len(uids), [None] * len(uids))
+        return teacher.build(inputs), plain.build(inputs)
+
+    extra = [
+        {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]},
+        {"turn_spans": SPANS, "turn_hints": [[1, "h2"]]},
+        {"turn_spans": SPANS, "turn_hints": []},
+        {"turn_spans": SPANS, "turn_hints": [[0, "h3"]]},
+    ]
+    out, plain = build(extra, ["a", "a", "b", "c"])
+    # a's rows skip each other and the un-hinted b row, reaching c; c wraps round to a's first row
+    expected = {0: ["h3", "h3"], 1: ["h3"], 3: ["h0"]}
+    for row, others in expected.items():
+        texts = _contrast_texts(out, row, _hinted_seq_len(plain, row))
+        assert len(texts) == len(others)
+        for text, other, hint in zip(texts, others, plain.hinted_per_row[row], strict=True):
+            assert f"<user>Note: {other}</>" in text and f"<user>Note: {hint.text}</>" not in text
+    assert out.fields["teacher_seq_meta"][2].tolist() == DEGENERATE_META
+    assert out.metrics["self_distillation/contrast_source_fallbacks"] == 0
+    for key in ("self_distillation_mask", "loss_mask"):
+        for row in range(4):
+            assert torch.equal(out.fields[key][row], plain.fields[key][row])
+
+    same_task, _ = build(extra[:2], ["a", "a"])
+    assert same_task.metrics["self_distillation/contrast_source_fallbacks"] == 3
+    for row in (0, 1):
+        for text in _contrast_texts(same_task, row, _hinted_seq_len(same_task, row)):
+            assert "<user>Note: Continue.</>" in text
 
 
 def test_contrast_hint_null_is_the_hint_only_teacher_bit_for_bit():

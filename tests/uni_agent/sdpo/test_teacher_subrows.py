@@ -6,6 +6,7 @@ carries are checked directly.
 Runs under pytest, or as ``python tests/uni_agent/sdpo/test_teacher_subrows.py``.
 """
 
+import pytest
 import torch
 
 from uni_agent.sdpo.hints import HintedTurn
@@ -168,6 +169,58 @@ def test_contrast_subrow_is_the_hint_subrow_with_only_the_hint_swapped():
             torch.testing.assert_close(
                 body[contrast_row.body_start : contrast_row.body_start + end - start], RESPONSE_WITH_HEADERS[start:end]
             )
+
+
+PLACEMENTS = [
+    (False, [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")], PROMPT),
+    (True, [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")], PROMPT),
+    (False, [HintedTurn(1, 0, 4, "a"), HintedTurn(5, 24, 28, "b")], torch.cat([PROMPT, HEADER])),
+    (True, [HintedTurn(1, 0, 4, "a"), HintedTurn(5, 24, 28, "b")], torch.cat([PROMPT, HEADER])),
+]
+
+
+@pytest.mark.parametrize("after_header, hinted, prompt", PLACEMENTS)
+def test_anchor_subrow_is_the_turn_with_no_note(after_header, hinted, prompt):
+    """With ``anchor`` a third sub-row per hinted turn follows the contrast ones: the prompt and the
+    response up to the turn's end with nothing spliced, scored on the same span."""
+    hints, contrast = [_hint(900), _hint(901)], _hint(800, length=5)
+    contrast_seq, contrast_meta, contrast_fallbacks, contrast_spans = build_spliced_teacher_row(
+        prompt, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, after_header, contrast_ids=contrast
+    )
+    seq, meta, fallbacks, spans = build_spliced_teacher_row(
+        prompt, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, after_header, contrast_ids=contrast, anchor=True
+    )
+    assert (fallbacks, spans) == (contrast_fallbacks, contrast_spans)
+    assert unpack(meta) == unpack(contrast_meta)
+    assert unpack(meta, contrast=True) == unpack(contrast_meta, contrast=True)
+    assert len(meta) == 1 + 5 * 3 * len(hinted)
+    torch.testing.assert_close(seq[: contrast_seq.shape[0]], contrast_seq)
+
+    anchor_rows = unpack(meta, anchor=True)
+    anchor_subs = _split(seq[contrast_seq.shape[0] :], anchor_rows)
+    for hint, sub, row in zip(hinted, anchor_subs, anchor_rows, strict=True):
+        assert sub == torch.cat([prompt, RESPONSE_WITH_HEADERS[: hint.end]]).tolist()
+        assert (row.start, row.end, row.body_start, row.body_len) == (hint.start, hint.end, hint.start, hint.end)
+    assert sum(row.total_len for row in anchor_rows) == seq.shape[0] - contrast_seq.shape[0]
+
+
+def test_an_anchor_needs_a_contrast():
+    hinted = [HintedTurn(3, 12, 16, "a")]
+    with pytest.raises(ValueError, match="contrast_ids"):
+        build_spliced_teacher_row(PROMPT, RESPONSE_WITH_HEADERS, hinted, [_hint(900)], 64, HEADER, anchor=True)
+
+
+def test_contrast_ids_may_differ_per_hinted_turn():
+    hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
+    hints, per_turn = [_hint(900), _hint(901)], [_hint(800, length=5), _hint(801, length=2)]
+    plain_seq, plain_meta, _, _ = build_spliced_teacher_row(PROMPT, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER)
+    seq, meta, _, _ = build_spliced_teacher_row(
+        PROMPT, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, contrast_ids=per_turn
+    )
+    hint_subs = _split(plain_seq, unpack(plain_meta))
+    contrast_subs = _split(seq[plain_seq.shape[0] :], unpack(meta, contrast=True))
+    for value, hint_sub, contrast_sub, contrast in zip((900, 901), hint_subs, contrast_subs, per_turn, strict=True):
+        assert contrast_sub == _swap(hint_sub, value, contrast)
 
 
 def test_contrast_leaves_the_students_spans_and_keep_positions_alone():

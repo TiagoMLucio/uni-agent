@@ -37,3 +37,9 @@ turn_hint_voice: user
 
 # Contrast teacher's hint text (same template and voice): target = student + hint teacher - contrast teacher.
 contrast_hint: null
+
+# What the contrast's shift is added to: "student", or "teacher" (the teacher on the turn with no note, a fixed point).
+contrast_anchor: student
+
+# The contrast's text: "text" (contrast_hint) or "other_row" (another task's hint in the batch, else contrast_hint).
+contrast_source: text
