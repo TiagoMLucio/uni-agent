@@ -21,6 +21,8 @@ from uni_agent.reflection.registry import register_reflector
 from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
 TURNS_MARKER = "FINAL_TURNS_JSON:"
+#: the answers only the api reflector parses
+API_PARSES = frozenset({"turn_hint", "placement", "note", "check"})
 
 TRACE_FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns",
                          "candidates", "delta"})
@@ -64,8 +66,9 @@ class CallSpec(BaseModel):
     system: str
     user: str
     per: Literal["trace", "turn"] = "trace"
-    #: ``turn_hint`` is the api reflector's answer naming one turn and its hint
-    parse: Literal["text", "turns", "hints", "turn_hint"] = "text"
+    #: ``turn_hint`` is the api reflector's answer naming one turn and its hint; ``placement`` then
+    #: ``note`` or ``check`` are its two calls, the first naming the turn, the second writing its hint
+    parse: Literal["text", "turns", "hints", "turn_hint", "placement", "note", "check"] = "text"
     #: ``delete_only`` refuses a reply that introduces a word the draft did not have. The stage
     #: sees the draft, which was written with the patch, so an unconstrained rewrite can restate
     #: privileged content the stage itself never saw.
@@ -91,8 +94,8 @@ class PipelineReflectionConfig(BaseReflectionConfig):
             unknown = _fields(call.user) - allowed
             if unknown:
                 raise ValueError(f"call {call.id!r} references fields it cannot be given: {sorted(unknown)}")
-            if call.parse == "turn_hint":
-                raise ValueError(f"call {call.id!r}: parse=turn_hint is the api reflector's answer")
+            if call.parse in API_PARSES:
+                raise ValueError(f"call {call.id!r}: parse={call.parse} is the api reflector's answer")
             if call.per == "turn" and call.parse == "turns":
                 raise ValueError(f"call {call.id!r}: a per-turn call cannot select the turns")
             if call.edit == "delete_only" and call.parse != "hints":

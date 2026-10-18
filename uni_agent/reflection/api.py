@@ -20,13 +20,15 @@ from pydantic import model_validator
 from uni_agent.reflection import chatgpt_plan
 from uni_agent.reflection.base import (OVER_BUDGET, AbstractReflector, BaseReflectionConfig, ReflectionFailed,
                                       neutralised_atomic)
-from uni_agent.reflection.facts import patch_view
+from uni_agent.reflection.facts import attempt_facts, patch_view
 from uni_agent.reflection.pipeline import CallSpec, PipelineReflectionConfig, _fields
 from uni_agent.reflection.registry import register_reflector
 from uni_agent.tracing import register_langfuse_op, rollout_trace_op, rollout_trace_span
 
 #: the fields a brief may name; {first} and {last} are the attempt's turn range
-FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns", "first", "last"})
+FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns", "first", "last", "facts"})
+#: the fields the writer may name: only the turns before the placed one, and the placement's diagnosis
+WRITER_FIELDS = frozenset({"task", "turn", "turns_before", "mistake", "type", "type_rule", "seen_before", "gold"})
 #: a high-effort read of a 150-turn trace takes minutes
 TIMEOUT_S = 1200.0
 #: the client's own retries, with backoff, on transient server errors
@@ -86,7 +88,30 @@ ANSWER_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["
 TURN_HINT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["problem", "turn", "evidence", "hint"],
                     "properties": {"problem": {"type": "string"}, "turn": {"type": "integer"},
                                    "evidence": {"type": "string"}, "hint": {"type": "string"}}}
-SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA)}
+#: what the note says for each type of mistake; the writer reads only its own type's line
+TYPE_RULES = {
+    "wrong conclusion": "what the agent already saw that does not fit its conclusion.",
+    "incomplete fix": "the other place or case, and what it does now.",
+    "weak check": "one case its check misses, or what the result it just read may show, and what to compare with.",
+    "broke working code": "that this code may already be correct, and why.",
+    "wrong place": "another place to look, with the reason taken from what it saw.",
+    "process": "a different way forward, based on what it saw.",
+}
+_STR = {"type": "string"}
+_TURN_OR_NULL = {"type": ["integer", "null"]}
+PLACEMENT_SCHEMA = {"type": "object", "additionalProperties": False,
+                    "required": ["mistake", "type", "statements", "turn", "quote", "seen_before", "later_turn",
+                                 "later_quote", "later_evidence", "no_note_reason"],
+                    "properties": {"mistake": _STR, "type": {"type": "string", "enum": list(TYPE_RULES)},
+                                   "statements": {"type": "array", "items": {"type": "integer"}},
+                                   "turn": _TURN_OR_NULL, "quote": _STR, "seen_before": _STR,
+                                   "later_turn": _TURN_OR_NULL, "later_quote": _STR, "later_evidence": _STR,
+                                   "no_note_reason": _STR}}
+NOTE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["note", "check"],
+               "properties": {"note": _STR, "check": _STR}}
+SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA),
+           "placement": ("hint_placement", PLACEMENT_SCHEMA), "note": ("hint_note", NOTE_SCHEMA),
+           "check": ("hint_note", NOTE_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -141,15 +166,23 @@ class ApiReflectionConfig(BaseReflectionConfig):
 
     @model_validator(mode="after")
     def _check_calls(self):
-        if len(self.calls) != 1:
-            raise ValueError("the api reflector makes exactly one call per trace")
+        parses = [call.parse for call in self.calls]
+        if len(parses) == 2:
+            if parses[0] != "placement" or parses[1] not in ("note", "check"):
+                raise ValueError("the api reflector's two calls are a placement, then a note or a check")
+            allowed = (FIELDS, WRITER_FIELDS)
+        elif len(parses) == 1:
+            if parses[0] not in ("hints", "turn_hint"):
+                raise ValueError("the api reflector's call parses its answer as hints or turn_hint")
+            allowed = (FIELDS,)
+        else:
+            raise ValueError("the api reflector makes one call per trace, or a placement and a writer call")
         if self.plan_credentials and self.base_url is not None:
             raise ValueError("ChatGPT plan calls go to the OpenAI Responses API: plan_credentials needs no base_url")
-        if self.calls[0].parse not in SCHEMAS:
-            raise ValueError(f"the api reflector's call parses its answer as one of {sorted(SCHEMAS)}")
-        unknown = _fields(self.calls[0].user) - FIELDS
-        if unknown:
-            raise ValueError(f"call {self.calls[0].id!r} references fields it cannot be given: {sorted(unknown)}")
+        for call, fields in zip(self.calls, allowed, strict=True):
+            unknown = _fields(call.user) - fields
+            if unknown:
+                raise ValueError(f"call {call.id!r} references fields it cannot be given: {sorted(unknown)}")
         if self.enabled:
             PipelineReflectionConfig._check_inputs(self)
         return self
@@ -172,8 +205,7 @@ class ApiReflector(AbstractReflector):
         from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
         cfg = self.config
-        call = cfg.calls[0]
-        max_tokens = call.max_output_tokens or cfg.max_output_tokens
+        first = cfg.calls[0]
         issue = ISSUE.search(task or "")
         attempt = (fence(self._clip(patch_view(agent_patch, gold), cfg.max_patch_chars), "diff") if agent_patch
                    else "(empty: no change was extracted from the attempt)")
@@ -186,55 +218,112 @@ class ApiReflector(AbstractReflector):
             "first": str(turns[0]["step"]),
             "last": str(turns[-1]["step"]),
         }
+        if "facts" in _fields(first.user):
+            values["facts"] = attempt_facts(turns, agent_patch, gold)
 
         def render_user(obs_cap, resp_cap):
-            return call.user.format(**values, turns=self._render_attempt(turns, obs_cap, resp_cap))
+            return first.user.format(**values, turns=self._render_attempt(turns, obs_cap, resp_cap))
 
         deadline = time.monotonic() + WALL_S
         async with AsyncOpenAI(api_key=os.environ.get(cfg.api_key_env), base_url=cfg.base_url,
                                timeout=TIMEOUT_S, max_retries=MAX_RETRIES) as client:
-            async for rung, obs_cap, resp_cap, messages, _, _ in self._renders(
-                call.system, render_user, max_tokens, call.id, None
-            ):
-                for draw in range(1 + cfg.redraws_per_rung):
-                    start = time.monotonic()
-                    try:
-                        with rollout_trace_span(f"reflect:{call.id}", metadata={
-                                "model": cfg.model, "obs_cap": obs_cap, "resp_cap": resp_cap}):
-                            text, usage, status = await asyncio.wait_for(
-                                self._request(client, RateLimitError, messages, max_tokens, call.parse),
-                                timeout=deadline - start)
-                    except BadRequestError as exc:
-                        if "context" not in str(exc).lower():
-                            self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
-                            await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=repr(exc))
-                            raise ReflectionFailed(f"reflection call failed: {exc!r}") from exc
-                        self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
-                        await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=OVER_BUDGET)
-                        break
-                    except asyncio.TimeoutError as exc:
-                        await self._record(call.id, None, messages, None, None, obs_cap, resp_cap,
-                                           error=f"over the {WALL_S:.0f} s wall budget")
-                        raise ReflectionFailed(f"reflection over its {WALL_S:.0f} s wall budget") from exc
-                    except Exception as exc:
+            def ask(call, render, use):
+                return self._ask(client, BadRequestError, RateLimitError, call, render, use, deadline)
+
+            if first.parse != "placement":
+                return await ask(first, render_user, lambda text: self._use_hints(text, turns, task, first.parse)) or {}
+            placed = await ask(first, render_user, lambda text: self._use_placement(text, turns))
+            if not placed or placed["turn"] is None:
+                return {}
+            writer, step = cfg.calls[1], placed["turn"]
+            before = [turn for turn in turns if turn["step"] < step]
+            filled = {"task": values["task"], "gold": values["gold"], "turn": str(step), "mistake": placed["mistake"],
+                      "type": placed["type"], "type_rule": TYPE_RULES[placed["type"]], "seen_before": placed["seen_before"]}
+
+            def render_writer(obs_cap, resp_cap):
+                return writer.user.format(**filled, turns_before=self._render_attempt(before, obs_cap, resp_cap)
+                                          or "(nothing yet)")
+
+            return await ask(writer, render_writer, lambda text: self._use_note(text, turns, task, step, writer.parse)) or {}
+
+    async def _ask(self, client, bad_request_error, rate_limit_error, call, render_user, use, deadline):
+        """One call through the render ladder. ``use`` turns a reply into its result and the fields
+        recorded with it; a falsy result is unusable and is drawn again at the same rung."""
+        cfg = self.config
+        max_tokens = call.max_output_tokens or cfg.max_output_tokens
+        async for rung, obs_cap, resp_cap, messages, _, _ in self._renders(
+            call.system, render_user, max_tokens, call.id, None
+        ):
+            for draw in range(1 + cfg.redraws_per_rung):
+                start = time.monotonic()
+                try:
+                    with rollout_trace_span(f"reflect:{call.id}", metadata={
+                            "model": cfg.model, "obs_cap": obs_cap, "resp_cap": resp_cap}):
+                        text, usage, status = await asyncio.wait_for(
+                            self._request(client, rate_limit_error, messages, max_tokens, call.parse),
+                            timeout=deadline - start)
+                except bad_request_error as exc:
+                    if "context" not in str(exc).lower():
                         self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
                         await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=repr(exc))
                         raise ReflectionFailed(f"reflection call failed: {exc!r}") from exc
-                    hints, leaks = self._hints(text, turns, task, call.parse)
-                    await self._record(call.id, None, messages, text, usage.get("input_tokens"), obs_cap, resp_cap,
-                                       draw=draw, extra={"model": cfg.model, "status": status,
-                                                         "seconds": round(time.monotonic() - start, 1),
-                                                         "usage": usage, "hints": hints, "unseen_names": leaks})
-                    if hints:
-                        self._counts["reflect_rung"] = max(self._counts["reflect_rung"], rung)
-                        self._counts["reflect_leaky_hints"] += sum(1 for step in hints if leaks.get(step))
-                        self.logger.info(f"Reflection ok: {usage} hints at {sorted(hints)}")
-                        return hints
-                    self.logger.info(f"Reflection reply unusable (draw {draw + 1}, status {status})")
-                else:
-                    # a reply the parser could not use is no reason to ask again from a smaller view
-                    return {}
+                    self.logger.info(f"Reflection render over budget (obs_cap={obs_cap}, resp_cap={resp_cap}): {exc}")
+                    await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=OVER_BUDGET)
+                    break
+                except asyncio.TimeoutError as exc:
+                    await self._record(call.id, None, messages, None, None, obs_cap, resp_cap,
+                                       error=f"over the {WALL_S:.0f} s wall budget")
+                    raise ReflectionFailed(f"reflection over its {WALL_S:.0f} s wall budget") from exc
+                except Exception as exc:
+                    self.logger.warning(f"Reflection call failed; no hints for this rollout: {exc}")
+                    await self._record(call.id, None, messages, None, None, obs_cap, resp_cap, error=repr(exc))
+                    raise ReflectionFailed(f"reflection call failed: {exc!r}") from exc
+                result, recorded = use(text)
+                await self._record(call.id, None, messages, text, usage.get("input_tokens"), obs_cap, resp_cap,
+                                   draw=draw, extra={"model": cfg.model, "status": status,
+                                                     "seconds": round(time.monotonic() - start, 1),
+                                                     "usage": usage, **recorded})
+                if result:
+                    self._counts["reflect_rung"] = max(self._counts["reflect_rung"], rung)
+                    self.logger.info(f"Reflection {call.id} ok: {usage}")
+                    return result
+                self.logger.info(f"Reflection reply unusable (draw {draw + 1}, status {status})")
+            else:
+                # a reply the parser could not use is no reason to ask again from a smaller view
+                return None
         raise ReflectionFailed("render over budget at every shrink level")
+
+    def _use_hints(self, text: str, turns: list[dict], task: str, parse: str):
+        hints, leaks = self._hints(text, turns, task, parse)
+        self._counts["reflect_leaky_hints"] += sum(1 for step in hints if leaks.get(step))
+        return hints, {"hints": hints, "unseen_names": leaks}
+
+    def _use_placement(self, text: str, turns: list[dict]):
+        """The placement, or None when its turn is not one of the attempt's; a null turn is the
+        answer that no note fits, kept as given."""
+        answer = self._extract_json_object(text, strict=False)
+        if not isinstance(answer, dict) or answer.get("type") not in TYPE_RULES:
+            return None, {"placement": answer}
+        step = answer.get("turn")
+        if step is not None and step not in {turn["step"] for turn in turns}:
+            return None, {"placement": answer}
+        fields = {key: str(answer.get(key) or "") for key in ("mistake", "type", "seen_before")}
+        return {**fields, "turn": step}, {"placement": answer}
+
+    def _use_note(self, text: str, turns: list[dict], task: str, step: int, parse: str):
+        """The writer's ``note`` or ``check`` as the hint for the placed turn."""
+        answer = self._extract_json_object(text, strict=False)
+        hint = answer.get(parse) if isinstance(answer, dict) else None
+        if not isinstance(hint, str) or not hint.strip():
+            return None, {"note": answer}
+        if UNSAFE.search(hint):
+            self._counts["reflect_unsafe_hints"] += 1
+            self.logger.warning(f"Hint for turn {step} dropped, it carries chat control text: {hint!r}")
+            return None, {"note": answer}
+        hints = {step: self._clip_diagnosis(hint.strip())}
+        leaks = self._leaks(hints, turns, task)
+        self._counts["reflect_leaky_hints"] += sum(1 for s in hints if leaks.get(s))
+        return hints, {"hints": hints, "unseen_names": leaks, "note": answer}
 
     async def _request(self, client, rate_limit_error, messages, max_tokens, parse) -> tuple[str, dict, str]:
         """One call on either API: (reply text, token use, completion status)."""
@@ -400,6 +489,10 @@ class ApiReflector(AbstractReflector):
                     self.logger.warning(f"Hint for turn {step} dropped, it carries chat control text: {hint!r}")
                     continue
                 hints[step] = self._clip_diagnosis(hint.strip())
+        return hints, self._leaks(hints, turns, task)
+
+    @staticmethod
+    def _leaks(hints: dict[int, str], turns: list[dict], task: str) -> dict[int, list[str]]:
         leaks = {}
         for step in hints:
             seen = "\n".join([task] + [turn["response"] + "\n" + "\n".join(t["observation"] or "" for t in turn["tools"])
@@ -407,7 +500,7 @@ class ApiReflector(AbstractReflector):
             names = unseen_names(hints[step], seen)
             if names:
                 leaks[step] = names
-        return hints, leaks
+        return leaks
 
     def _render_attempt(self, turns: list[dict], obs_cap: int | None, resp_cap: int | None) -> str:
         parts = []

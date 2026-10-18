@@ -456,3 +456,71 @@ def test_plan_calls_need_the_responses_api():
     with pytest.raises(ValueError, match="needs no base_url"):
         ApiReflector.Config(name="openai", model="m", base_url="https://x/v1", plan_credentials="/c.json",
                             calls=[{"id": "x", "system": "s", "user": "{turns}", "parse": "hints"}])
+
+
+PLACE = {"id": "place", "system": "sys", "parse": "placement",
+         "user": "{task}|{turns}|{facts}|{agent_patch}|{gold}|{feedback}"}
+WRITE = {"id": "write", "system": "sys", "parse": "note",
+         "user": "{turn}|{turns_before}|{mistake}|{type}|{type_rule}|{seen_before}|{task}"}
+
+
+def placement(turn, kind="incomplete fix"):
+    return json.dumps({"mistake": "the fix covers one branch", "type": kind, "statements": [] if turn is None else [turn],
+                       "turn": turn, "quote": "q", "seen_before": "turn 0 showed both branches", "later_turn": None,
+                       "later_quote": "", "later_evidence": "", "no_note_reason": "hidden" if turn is None else ""})
+
+
+def note(text="The other branch of `parse_row` may also drop rows.", check="Run it on an empty row."):
+    return json.dumps({"note": text, "check": check})
+
+
+def test_two_calls_place_then_write_from_the_turns_before(monkeypatch):
+    hints, seen, _ = reflect(monkeypatch, [placement(1), note()], calls=[PLACE, WRITE])
+    assert hints == {1: "The other branch of `parse_row` may also drop rows."} and len(seen) == 2
+    assert seen[0]["text"]["format"]["name"] == "hint_placement" and seen[1]["text"]["format"]["name"] == "hint_note"
+    writer = seen[1]["input"]
+    assert writer.startswith("1|### Turn 0\n") and "### Turn 1" not in writer and "### Turn 2" not in writer
+    assert "the fix covers one branch|incomplete fix|the other place or case, and what it does now.|turn 0 showed" in writer
+    assert "a different way forward" not in writer and "- test runs:" in seen[0]["input"]
+
+
+def test_check_version_is_the_hint(monkeypatch):
+    hints, _, _ = reflect(monkeypatch, [placement(2, "weak check"), note()], calls=[PLACE, {**WRITE, "parse": "check"}])
+    assert hints == {2: "Run it on an empty row."}
+
+
+def test_no_turn_means_no_note_and_no_writer_call(monkeypatch):
+    hints, seen, _ = reflect(monkeypatch, [placement(None), note()], calls=[PLACE, WRITE])
+    assert hints == {} and len(seen) == 1
+
+
+def test_a_turn_outside_the_attempt_is_drawn_again(monkeypatch):
+    hints, seen, _ = reflect(monkeypatch, [placement(9), placement(1), note()], calls=[PLACE, WRITE])
+    assert hints == {1: "The other branch of `parse_row` may also drop rows."} and len(seen) == 3
+
+
+def test_two_call_configs_are_checked():
+    import pytest
+
+    base = {"name": "openai", "model": "m"}
+    with pytest.raises(ValueError, match="a placement, then a note or a check"):
+        ApiReflector.Config(**base, calls=[WRITE, PLACE])
+    with pytest.raises(ValueError, match="cannot be given"):
+        ApiReflector.Config(**base, calls=[PLACE, {**WRITE, "user": "{turns}"}])
+    with pytest.raises(ValueError, match="one call per trace"):
+        ApiReflector.Config(**base, calls=[PLACE, WRITE, WRITE])
+
+
+def test_attempt_facts():
+    from uni_agent.reflection.facts import attempt_facts
+
+    turns = [{"step": 1, "tools": [{"name": "str_replace_editor", "action": "str_replace_editor view --path /testbed/a.py",
+                                    "observation": ""}]},
+             {"step": 2, "tools": [{"name": "str_replace_editor", "observation": "",
+                                    "action": "str_replace_editor str_replace --path /testbed/a.py --old_str x --new_str y"}]},
+             {"step": 3, "tools": [{"name": "execute_bash", "action": "python -m pytest tests", "observation": ""}]},
+             {"step": 4, "tools": [{"name": "submit", "action": "submit", "observation": ""}]}]
+    facts = attempt_facts(turns, "diff --git a/a.py b/a.py\n", "diff --git a/a.py b/a.py\n")
+    assert facts.splitlines() == ["- source edits (files in the final patch): a.py: turns [2]", "- test runs: turns [3]",
+                                  "- script runs: turns none", "- first turn that names each gold file: a.py: turn 1",
+                                  "- submitted at turn 4"]

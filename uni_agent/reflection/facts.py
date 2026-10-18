@@ -166,3 +166,48 @@ def patch_delta(gold: str, agent_patch: str) -> str:
             if extra else "")
     body = "\n\n".join(blocks) or "  nothing: the two agree on every line"
     return "What the working code has that this one does not:\n\n" + body + tail
+
+
+#: a shell command that writes a file
+SHELL_WRITE = re.compile(r"sed\s+-i|>\s*\S|tee\s|patch\b")
+TEST_RUN = re.compile(r"pytest|unittest|tox\b|runtests")
+SCRIPT_RUN = re.compile(r"python[\d.]*\s")
+
+
+def attempt_facts(turns: list[dict], agent_patch: str, gold: str) -> str:
+    """Where the attempt edited the files of its final patch, what it ran, when it first named
+    each file the working fix changes, and when it submitted."""
+    agent_files = re.findall(r"^diff --git a/(\S+)", agent_patch or "", re.M)
+    gold_files = re.findall(r"^diff --git a/(\S+)", gold or "", re.M)
+    edits, tests, scripts, first_named, submitted = {}, [], [], {}, None
+    for turn in turns:
+        step = turn.get("step")
+        for call in turn.get("tools") or []:
+            cmd, path, action, _ = call_facts(call)
+            name = call.get("name")
+            if name == "submit":
+                submitted = step
+            if cmd in EDIT_CMDS:
+                for f in agent_files:
+                    if (path or "").endswith(f):
+                        edits.setdefault(f, []).append(step)
+            if name == "execute_bash":
+                if TEST_RUN.search(action):
+                    tests.append(step)
+                elif SCRIPT_RUN.search(action):
+                    scripts.append(step)
+                for f in agent_files:
+                    if f in action and SHELL_WRITE.search(action):
+                        edits.setdefault(f, []).append(step)
+            for g in gold_files:
+                if g not in first_named and (g in action or g.rsplit("/", 1)[-1] in action):
+                    first_named[g] = step
+    return "\n".join([
+        "- source edits (files in the final patch): "
+        + ("; ".join(f"{f}: turns {sorted(set(v))}" for f, v in edits.items()) or "none"),
+        f"- test runs: turns {tests or 'none'}",
+        f"- script runs: turns {scripts or 'none'}",
+        "- first turn that names each gold file: "
+        + ("; ".join(f"{g}: turn {v}" for g, v in first_named.items()) or "none"),
+        f"- submitted at turn {submitted}" if submitted is not None else "- never submitted",
+    ])
