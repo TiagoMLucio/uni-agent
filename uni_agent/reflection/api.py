@@ -156,7 +156,7 @@ class ApiReflectionConfig(BaseReflectionConfig):
     #: service_tier (flex bills half and may queue; its capacity 429s are waited out like rate limits)
     sampling: dict = {}
     #: ChatGPT plan credentials files (chatgpt_plan login), tried in order: a call goes to the first plan that serves
-    #: it, and to the API key with ``sampling`` when none can
+    #: it and waits when none can; with plans set the API key is never used
     plan_credentials: str | list[str] | None = None
 
     @property
@@ -330,7 +330,9 @@ class ApiReflector(AbstractReflector):
         cfg = self.config
         if cfg.base_url is None:
             name, schema = SCHEMAS[parse]
-            if cfg.plan_files:
+            # with plans configured the API key is never used: when every plan rests or refuses, the call waits for
+            # one, bounded by the reflection's wall budget
+            while cfg.plan_files:
                 for i, path in enumerate(cfg.plan_files):
                     if _PLAN_REST.get(path, 0.0) > time.monotonic():
                         continue
@@ -338,7 +340,9 @@ class ApiReflector(AbstractReflector):
                     if served is not None:
                         self._counts["reflect_plan_backup_calls"] += i > 0
                         return served
-                self._counts["reflect_plan_fallbacks"] += 1
+                self._counts["reflect_plan_waits"] += 1
+                first_free = min(_PLAN_REST.get(path, 0.0) for path in cfg.plan_files)
+                await asyncio.sleep(max(first_free - time.monotonic(), PLAN_BUSY_WAIT_S))
             response = await self._create(
                 client.responses.create, rate_limit_error,
                 model=cfg.model, instructions=messages[0]["content"], input=messages[1]["content"],
@@ -372,7 +376,7 @@ class ApiReflector(AbstractReflector):
     def _rest(self, path: str, why) -> None:
         _PLAN_REST[path] = time.monotonic() + PLAN_REST_S
         self.logger.warning(f"ChatGPT plan {os.path.basename(path)} rests {PLAN_REST_S / 60:.0f} min ({why}); the next "
-                            "plan or the API key serves until then")
+                            "plan serves until then, or the call waits")
 
     async def _plan_request(self, path, messages, name, schema) -> tuple[str, dict, str] | None:
         """One call on the ChatGPT plan whose credentials are at ``path``, in the form that path requires (streamed,
@@ -459,7 +463,7 @@ class ApiReflector(AbstractReflector):
     def call_metrics(self) -> dict[str, float]:
         return {**super().call_metrics(), **{key: float(self._counts[key]) for key in (
             *USAGE, "reflect_leaky_hints", "reflect_rate_limited", "reflect_unsafe_hints", "reflect_plan_calls",
-            "reflect_plan_backup_calls", "reflect_plan_fallbacks")}}
+            "reflect_plan_backup_calls", "reflect_plan_fallbacks", "reflect_plan_waits")}}
 
     def _tally(self, usage: dict[str, int]) -> dict[str, int]:
         for key, value in usage.items():
