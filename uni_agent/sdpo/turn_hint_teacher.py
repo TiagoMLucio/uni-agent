@@ -37,11 +37,11 @@ def _validate_hint_template(name: str, template: str) -> None:
 
 
 class TurnHintTeacher(SDPOTeacher):
-    """Supervision is hints-only: a sample carrying reflection hints ships one spliced teacher
-    sequence (each hint inserted before its turn, ``teacher_seq_meta`` mapping the scored spans
-    back to the response grid) and a per-token distillation mask over those spans. Un-hinted
-    samples are not trained at all: a degenerate 2-token teacher row (1-token body, ``DEGENERATE_META``)
-    with a zero mask, scored only so that dp-group collectives stay in lockstep.
+    """Supervision is hints-only: a sample carrying reflection hints ships its trajectory once with
+    every hint as a note (``teacher_seq_meta`` placing each before its turn and mapping the scored
+    spans back to the response grid) and a per-token distillation mask over those spans. Un-hinted
+    samples are not trained at all: a degenerate 2-token teacher row (``DEGENERATE_META``) with a
+    zero mask, scored only so that dp-group collectives stay in lockstep.
 
     ``max_prefix_len`` caps the spliced prefix, which is the student's real prompt (segment
     rows reach ~24k): the student's own prompt budget, not the reprompt one. The keyword

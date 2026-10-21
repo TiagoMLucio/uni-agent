@@ -26,7 +26,7 @@ from uni_agent.sdpo.turn_hint_teacher import TurnHintBatch
 from verl.trainer import main_ppo_sync
 from verl.trainer.ppo.sdpo import TeacherInputs, make_teacher
 from verl.trainer.ppo.sdpo.batch import trace_weights
-from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, unpack
+from verl.trainer.ppo.sdpo.teacher_meta import DEGENERATE_META, sub_row_ids, unpack, unpack_row
 from verl.workers.config.actor import SelfDistillationConfig
 
 VERL_CONFIG_DIR = Path(verl.__file__).parent / "trainer" / "config"
@@ -296,7 +296,8 @@ def test_turn_hint_teacher_thought_voice_opens_the_hinted_turn():
     start1, end1 = SPANS[1][1], SPANS[1][2]
     expected = torch.cat([PROMPT, ids("h0\n\n"), RESPONSE[: len(TURN0)], PROMPT, RESPONSE[:start1], ids("h1\n\n"),
                           RESPONSE[start1:end1]])
-    assert torch.equal(thought.fields["teacher_input_ids"][0], expected)
+    subs = _sub_ids(thought.fields["teacher_input_ids"][0], thought.fields["teacher_seq_meta"][0].tolist())
+    assert torch.equal(torch.cat(subs), expected)
     assert thought.metrics["self_distillation/hint_injection_fallbacks"] == 0
     for key in ("self_distillation_mask", "loss_mask"):
         assert torch.equal(thought.fields[key][0], user.fields[key][0])
@@ -360,16 +361,18 @@ def test_contrast_hint_adds_the_hint_subrows_with_only_the_text_swapped(voice, t
         assert hint_rows == unpack(plain_meta) and unpack(plain_meta, contrast=True) == []
         assert torch.equal(seq[: plain_seq.shape[0]], plain_seq), "the hint sub-rows are the hint-only teacher's"
 
-        hint_at, contrast_at = 0, plain_seq.shape[0]
-        for hint, hint_row, contrast_row in zip(plain.hinted_per_row[row], hint_rows, contrast_rows, strict=True):
-            hint_sub = _text(plain_seq[hint_at : hint_at + hint_row.total_len])
-            contrast_sub = _text(seq[contrast_at : contrast_at + contrast_row.total_len])
+        assert _sub_texts(seq, meta) == _sub_texts(plain_seq, plain_meta)
+        for hint, hint_sub, contrast_sub, hint_row, contrast_row in zip(
+            plain.hinted_per_row[row],
+            _sub_texts(plain_seq, plain_meta),
+            _sub_texts(seq, meta, contrast=True),
+            hint_rows,
+            contrast_rows,
+            strict=True,
+        ):
             assert contrast_sub == hint_sub.replace(spliced(hint.text), spliced("Continue."))
             assert spliced(hint.text) in hint_sub and spliced("Continue.") in contrast_sub
             assert (contrast_row.start, contrast_row.end) == (hint_row.start, hint_row.end)
-            hint_at += hint_row.total_len
-            contrast_at += contrast_row.total_len
-        assert contrast_at == seq.shape[0]
 
     assert contrast.fields["teacher_seq_meta"][1].tolist() == DEGENERATE_META
     assert torch.equal(contrast.fields["teacher_input_ids"][1], plain.fields["teacher_input_ids"][1])
@@ -379,19 +382,20 @@ def test_contrast_hint_adds_the_hint_subrows_with_only_the_text_swapped(voice, t
     assert contrast.metrics == plain.metrics and contrast.hinted_per_row == plain.hinted_per_row
 
 
-def _contrast_texts(out, row, plain_seq_len):
-    """The decoded contrast sub-rows of one built row, after its hint sub-rows."""
-    meta = out.fields["teacher_seq_meta"][row].tolist()
-    seq = out.fields["teacher_input_ids"][row]
-    texts, at = [], plain_seq_len
-    for contrast_row in unpack(meta, contrast=True):
-        texts.append(_text(seq[at : at + contrast_row.total_len]))
-        at += contrast_row.total_len
-    return texts
+def _sub_ids(seq, meta, contrast=False, anchor=False):
+    """The whole sequences one group of a shipped row's sub-rows stands for."""
+    base, offset, noted = unpack_row(seq, meta)
+    return [sub_row_ids(base, offset, sub) for sub in noted if (sub.contrast, sub.anchor) == (contrast, anchor)]
 
 
-def _hinted_seq_len(out, row):
-    return sum(sub_row.total_len for sub_row in unpack(out.fields["teacher_seq_meta"][row].tolist()))
+def _sub_texts(seq, meta, contrast=False, anchor=False):
+    """The decoded whole sequences one group of a shipped row's sub-rows stands for."""
+    return [_text(sub) for sub in _sub_ids(seq, meta, contrast, anchor)]
+
+
+def _contrast_texts(out, row):
+    """The decoded contrast sub-rows of one built row."""
+    return _sub_texts(out.fields["teacher_input_ids"][row], out.fields["teacher_seq_meta"][row].tolist(), contrast=True)
 
 
 def test_contrast_anchor_teacher_adds_the_no_note_subrows():
@@ -416,13 +420,13 @@ def test_contrast_anchor_teacher_adds_the_no_note_subrows():
     contrast_meta = contrast.fields["teacher_seq_meta"][0].tolist()
     assert unpack(meta) == unpack(contrast_meta) and unpack(meta, contrast=True) == unpack(contrast_meta, contrast=True)
     seq, contrast_seq = anchored.fields["teacher_input_ids"][0], contrast.fields["teacher_input_ids"][0]
-    assert torch.equal(seq[: contrast_seq.shape[0]], contrast_seq)
-    at = contrast_seq.shape[0]
-    for hint, anchor_row in zip(anchored.hinted_per_row[0], unpack(meta, anchor=True), strict=True):
-        assert _text(seq[at : at + anchor_row.total_len]) == _text(PROMPT) + _text(RESPONSE[: hint.end])
+    # no note: the anchors add sub-rows to the meta and nothing to the tokens
+    assert torch.equal(seq, contrast_seq)
+    for hint, anchor_row, text in zip(
+        anchored.hinted_per_row[0], unpack(meta, anchor=True), _sub_texts(seq, meta, anchor=True), strict=True
+    ):
+        assert text == _text(PROMPT) + _text(RESPONSE[: hint.end])
         assert (anchor_row.start, anchor_row.end) == (hint.start, hint.end)
-        at += anchor_row.total_len
-    assert at == seq.shape[0]
 
     assert anchored.fields["teacher_seq_meta"][1].tolist() == DEGENERATE_META
     for key in ("self_distillation_mask", "loss_mask"):
@@ -453,7 +457,7 @@ def test_other_row_contrast_is_the_next_other_tasks_hint():
     # a's rows skip each other and the un-hinted b row, reaching c; c wraps round to a's first row
     expected = {0: ["h3", "h3"], 1: ["h3"], 3: ["h0"]}
     for row, others in expected.items():
-        texts = _contrast_texts(out, row, _hinted_seq_len(plain, row))
+        texts = _contrast_texts(out, row)
         assert len(texts) == len(others)
         for text, other, hint in zip(texts, others, plain.hinted_per_row[row], strict=True):
             assert f"<user>Note: {other}</>" in text and f"<user>Note: {hint.text}</>" not in text
@@ -466,13 +470,13 @@ def test_other_row_contrast_is_the_next_other_tasks_hint():
     same_task, _ = build(extra[:2], ["a", "a"])
     assert same_task.metrics["self_distillation/contrast_source_fallbacks"] == 3
     for row in (0, 1):
-        for text in _contrast_texts(same_task, row, _hinted_seq_len(same_task, row)):
+        for text in _contrast_texts(same_task, row):
             assert "<user>Note: Continue.</>" in text
 
 
 def test_contrast_hint_null_is_the_hint_only_teacher_bit_for_bit():
     """The default builds exactly what the splice builds without a contrast: one sub-row per hint, the
-    meta five ints per sub-row."""
+    meta four ints per sub-row after its two-int head."""
     tok = ToyTokenizer()
     teacher = make_teacher(SelfDistillationConfig(teacher=turn_hints_options()), tok, max_prefix_len=4096)
     extra = [{"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]}]
@@ -482,7 +486,7 @@ def test_contrast_hint_null_is_the_hint_only_teacher_bit_for_bit():
     hint_ids = [teacher.hint_ids(h) for h in hinted]
     seq, meta, _, _ = build_spliced_teacher_row(PROMPT, RESPONSE, hinted, hint_ids, 4096, header)
     assert torch.equal(out.fields["teacher_input_ids"][0], seq)
-    assert out.fields["teacher_seq_meta"][0].tolist() == meta and len(meta) == 1 + 5 * 2
+    assert out.fields["teacher_seq_meta"][0].tolist() == meta and len(meta) == 2 + 4 * 2
     assert teacher.contrast_ids is None and not teacher.contrasts
 
 

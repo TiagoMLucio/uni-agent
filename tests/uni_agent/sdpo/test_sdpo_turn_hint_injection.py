@@ -1,6 +1,6 @@
 """User-turn hint insertion in build_spliced_teacher_row: the hint lands before the turn's
-assistant header, with a bare-splice fallback when the header isn't where expected. Meta must
-keep mapping each span's verbatim tokens on the body grid."""
+assistant header, with a bare-splice fallback when the header isn't where expected. Each sub-row
+the row stands for must end on its span's verbatim tokens."""
 
 import pytest
 import torch
@@ -8,23 +8,24 @@ import torch
 from uni_agent.sdpo.hints import HintedTurn
 from uni_agent.sdpo.splice import build_spliced_teacher_row
 from verl.trainer.ppo.sdpo.batch import trace_weights
+from verl.trainer.ppo.sdpo.teacher_meta import sub_row_ids, unpack_row
 
 HEADER = torch.tensor([90, 91, 92], dtype=torch.int64)
 
 
+def _subs(seq, meta):
+    """The whole sequence each sub-row of the shipped row stands for."""
+    base, offset, noted = unpack_row(seq, meta)
+    return [sub_row_ids(base, offset, sub) for sub in noted]
+
+
 def _spans_map_back(seq, meta, response_ids, hinted_turns):
-    """meta is [n_sub, (total_len, body_len, body_start, start, end) per sub-row]; each
-    scored span must reproduce the student's tokens verbatim on the sub-row grid."""
-    n_sub, rest = meta[0], meta[1:]
-    assert n_sub == len(hinted_turns) and len(rest) == 5 * n_sub
-    offset = 0
-    for j in range(0, len(rest), 5):
-        total, body_len, body_start, start, end = rest[j : j + 5]
-        prefix_len = total - body_len
-        span = seq[offset + prefix_len + body_start : offset + prefix_len + body_start + (end - start)]
-        assert torch.equal(span, response_ids[start:end]), f"span [{start},{end}) corrupted"
-        offset += total
-    assert offset == seq.shape[0]
+    """Each sub-row ends on its scored span, which must reproduce the student's tokens verbatim."""
+    subs = _subs(seq, meta)
+    assert meta[0] == len(hinted_turns) == len(subs)
+    for sub, hint in zip(subs, hinted_turns, strict=True):
+        span = sub[sub.shape[0] - (hint.end - hint.start) :]
+        assert torch.equal(span, response_ids[hint.start : hint.end]), f"span [{hint.start},{hint.end}) corrupted"
 
 
 def test_hint_inserted_before_assistant_header():
@@ -38,7 +39,7 @@ def test_hint_inserted_before_assistant_header():
 
     assert fallbacks == 0
     expected = torch.cat([prompt, response[:9], hint, response[9:16]])
-    assert torch.equal(seq, expected), "hint must sit before the assistant header, not after it"
+    assert torch.equal(torch.cat(_subs(seq, meta)), expected), "hint must sit before the assistant header, not after it"
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -52,8 +53,8 @@ def test_first_turn_hint_joins_prompt_tail():
 
     assert fallbacks == 0
     expected = torch.cat([prompt[:-3], hint, HEADER, response])
-    assert torch.equal(seq, expected)
-    assert meta == [1, seq.shape[0], 4, 0, 0, 4], "hint in the prefix must not count toward the body"
+    assert torch.equal(torch.cat(_subs(seq, meta)), expected)
+    assert meta == [1, 8, 5, 2, 0, 4], "the hint goes before the prompt's header tail"
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -67,7 +68,7 @@ def test_missing_header_falls_back_to_bare_splice():
 
     assert fallbacks == 1
     expected = torch.cat([prompt, response[:7], hint, response[7:10]])
-    assert torch.equal(seq, expected)
+    assert torch.equal(torch.cat(_subs(seq, meta)), expected)
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -93,7 +94,8 @@ def test_cumulative_hints_and_truncation_after_last_span():
     expected = torch.cat(
         [prompt, response[:2], hints[0], response[2:8], prompt, response[:10], hints[1], response[10:15]]
     )
-    assert torch.equal(seq, expected), "one sub-row per hint, each cut after its own span"
+    assert torch.equal(torch.cat(_subs(seq, meta)), expected), "one sub-row per hint, each cut after its own span"
+    assert torch.equal(seq, torch.cat([prompt, response[:15], *hints])), "the trajectory ships once"
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -107,7 +109,9 @@ def test_thought_opens_the_turn_after_its_header():
 
     assert fallbacks == 0
     expected = torch.cat([prompt, response[:12], hint, response[12:16]])
-    assert torch.equal(seq, expected), "a thought sits after the assistant header, before what the agent wrote"
+    assert torch.equal(torch.cat(_subs(seq, meta)), expected), (
+        "a thought sits after the assistant header, before what the agent wrote"
+    )
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -120,8 +124,8 @@ def test_first_turn_thought_follows_the_prompt_tail():
     seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER, after_header=True)
 
     assert fallbacks == 0
-    assert torch.equal(seq, torch.cat([prompt, hint, response]))
-    assert meta == [1, seq.shape[0], 4, 0, 0, 4], "the thought in the prefix must not count toward the body"
+    assert torch.equal(torch.cat(_subs(seq, meta)), torch.cat([prompt, hint, response]))
+    assert meta == [1, 8, 8, 2, 0, 4], "the thought follows the prompt's header tail"
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -134,7 +138,7 @@ def test_thought_without_its_header_falls_back_to_the_span_start():
     seq, meta, fallbacks, _ = build_spliced_teacher_row(prompt, response, hinted, [hint], 100, HEADER, after_header=True)
 
     assert fallbacks == 1
-    assert torch.equal(seq, torch.cat([prompt, response[:7], hint, response[7:10]]))
+    assert torch.equal(torch.cat(_subs(seq, meta)), torch.cat([prompt, response[:7], hint, response[7:10]]))
     _spans_map_back(seq, meta, response, hinted)
 
 
@@ -160,7 +164,7 @@ def test_cumulative_thoughts_each_open_their_own_turn():
     expected = torch.cat(
         [prompt, response[:5], hints[0], response[5:8], prompt, response[:13], hints[1], response[13:15]]
     )
-    assert torch.equal(seq, expected)
+    assert torch.equal(torch.cat(_subs(seq, meta)), expected)
     _spans_map_back(seq, meta, response, hinted)
 
 

@@ -1,4 +1,4 @@
-"""The spliced teacher row: one sub-row per hint, its meta packed by
+"""The spliced teacher row: the trajectory once and one note per sub-row, its meta packed by
 :mod:`verl.trainer.ppo.sdpo.teacher_meta`, plus the per-token mask."""
 
 from typing import Optional
@@ -11,76 +11,19 @@ from verl.trainer.ppo.sdpo.teacher_meta import SubRow, pack
 __all__ = ["build_spliced_teacher_row", "turn_token_mask"]
 
 
-def _sub_row(
-    prefix: torch.Tensor, body: list[torch.Tensor], scored: int, span: tuple[int, int]
-) -> tuple[torch.Tensor, SubRow]:
-    """Concatenate one sub-row from its prefix and ordered body pieces; ``body[scored]`` is
-    the span the teacher scores."""
-    body_len = sum(part.shape[0] for part in body)
-    body_start = sum(part.shape[0] for part in body[:scored])
-    return torch.cat([prefix, *body]), SubRow(prefix.shape[0] + body_len, body_len, body_start, *span)
-
-
-def _splice(
-    base_prefix: torch.Tensor,
-    response_ids: torch.Tensor,
-    hinted_turns: list[HintedTurn],
-    hint_ids_list: list[torch.Tensor],
-    header_ids: torch.Tensor,
-    after_header: bool,
-) -> tuple[list[torch.Tensor], list[SubRow], int]:
-    """The sub-row of each hinted turn with its own hint tokens, their meta records and the fallback count."""
-    header = header_ids.shape[0]
-    pieces: list[torch.Tensor] = []
-    sub_rows: list[SubRow] = []
-    fallbacks = 0
-
-    for hint, hint_ids in zip(hinted_turns, hint_ids_list, strict=True):
-        start, end = hint.start, hint.end
-        hint_ids = hint_ids.to(response_ids.dtype)
-        prefix = base_prefix
-        if start >= header and torch.equal(response_ids[start - header : start], header_ids):
-            insert_at = start if after_header else start - header
-        elif start == 0 and prefix.shape[0] >= header and torch.equal(prefix[-header:], header_ids):
-            # first turn: its assistant header is the prompt tail, so the hint joins the prefix
-            if after_header:
-                prefix = torch.cat([prefix, hint_ids])
-            else:
-                prefix = torch.cat([prefix[:-header], hint_ids, prefix[-header:]])
-            insert_at = None
-        else:
-            insert_at = start
-            fallbacks += 1
-
-        if insert_at is None:
-            body = [response_ids[:start], response_ids[start:end]]
-            row, sub_row = _sub_row(prefix, body, scored=1, span=(start, end))
-        else:
-            body = [
-                response_ids[:insert_at],  # untouched history, no other hints
-                hint_ids,
-                response_ids[insert_at:start],  # the turn's assistant header, empty when the hint follows it
-                response_ids[start:end],  # the span the teacher scores
-            ]
-            row, sub_row = _sub_row(prefix, body, scored=3, span=(start, end))
-
-        pieces.append(row)
-        sub_rows.append(sub_row)
-
-    return pieces, sub_rows, fallbacks
-
-
-def _no_note(
-    base_prefix: torch.Tensor, response_ids: torch.Tensor, hinted_turns: list[HintedTurn]
-) -> tuple[list[torch.Tensor], list[SubRow]]:
-    """The sub-row of each hinted turn with nothing spliced in: the trajectory up to the turn's end."""
-    pieces, sub_rows = [], []
-    for hint in hinted_turns:
-        body = [response_ids[: hint.start], response_ids[hint.start : hint.end]]
-        row, sub_row = _sub_row(base_prefix, body, scored=1, span=(hint.start, hint.end))
-        pieces.append(row)
-        sub_rows.append(sub_row)
-    return pieces, sub_rows
+def _split(
+    prompt: torch.Tensor, response_ids: torch.Tensor, start: int, header_ids: torch.Tensor, after_header: bool
+) -> tuple[int, bool]:
+    """Where a turn's note goes in the base (the prompt, then the response) and whether that is a fallback:
+    before the turn's assistant header, or with ``after_header`` right after it; at the span start when the
+    header is not where the span says."""
+    header, offset = header_ids.shape[0], prompt.shape[0]
+    if start >= header and torch.equal(response_ids[start - header : start], header_ids):
+        return offset + (start if after_header else start - header), False
+    if start == 0 and offset >= header and torch.equal(prompt[-header:], header_ids):
+        # first turn: its assistant header is the prompt tail
+        return (offset if after_header else offset - header), False
+    return offset + start, True
 
 
 def build_spliced_teacher_row(
@@ -94,7 +37,7 @@ def build_spliced_teacher_row(
     contrast_ids: Optional[torch.Tensor | list[torch.Tensor]] = None,
     anchor: bool = False,
 ) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
-    """One teacher sub-row per hinted turn, concatenated into a single row.
+    """One teacher sub-row per hinted turn, shipped as the trajectory once and each sub-row's note.
 
     Each sub-row is the trajectory up to its own turn with only its own hint spliced in,
     and truncated after the scored span. The hint goes immediately before the turn's
@@ -111,33 +54,34 @@ def build_spliced_teacher_row(
     With ``anchor`` too, a third sub-row per hinted turn follows those: the same turn with no note
     spliced at all.
 
-    The prompt is left-truncated to ``max_prefix_len``. Returns the concatenation, the packed
-    meta (see :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements
-    and the (start, end) spans for the distillation mask (== the meta spans).
+    The prompt is left-truncated to ``max_prefix_len``. Returns the base (the prompt, then the
+    response up to the last scored span) followed by every sub-row's note, the packed meta (see
+    :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements and the
+    (start, end) spans for the distillation mask (== the meta spans).
     """
     if anchor and contrast_ids is None:
         raise ValueError("a no-note anchor sub-row only anchors a contrast: pass contrast_ids")
-    base_prefix = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
-    pieces, sub_rows, fallbacks = _splice(
-        base_prefix, response_ids, hinted_turns, hint_ids_list, header_ids, after_header
-    )
-    contrast_rows: list[SubRow] = []
-    anchor_rows: list[SubRow] = []
+    prompt = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
+    placed = [_split(prompt, response_ids, hint.start, header_ids, after_header) for hint in hinted_turns]
+    notes = [ids.to(response_ids.dtype) for ids in hint_ids_list]
     if contrast_ids is not None:
-        per_turn = contrast_ids if isinstance(contrast_ids, list) else [contrast_ids] * len(hinted_turns)
-        contrast_pieces, contrast_rows, _ = _splice(
-            base_prefix, response_ids, hinted_turns, per_turn, header_ids, after_header
-        )
-        pieces += contrast_pieces
+        notes += contrast_ids if isinstance(contrast_ids, list) else [contrast_ids] * len(hinted_turns)
         if anchor:
-            anchor_pieces, anchor_rows = _no_note(base_prefix, response_ids, hinted_turns)
-            pieces += anchor_pieces
-
+            notes += [response_ids.new_zeros(0)] * len(hinted_turns)
+    turns = len(hinted_turns)
+    groups = [
+        [
+            SubRow(split, note.shape[0], hint.start, hint.end)
+            for (split, _), note, hint in zip(placed, notes[at : at + turns], hinted_turns, strict=True)
+        ]
+        for at in range(0, len(notes), turns)
+    ]
+    base = torch.cat([prompt, response_ids[: max(hint.end for hint in hinted_turns)]])
     return (
-        torch.cat(pieces),
-        pack(sub_rows, contrast_rows, anchor_rows),
-        fallbacks,
-        [(sub_row.start, sub_row.end) for sub_row in sub_rows],
+        torch.cat([base, *(note.to(base.dtype) for note in notes)]),
+        pack(prompt.shape[0], *groups),
+        sum(fallback for _, fallback in placed),
+        [(hint.start, hint.end) for hint in hinted_turns],
     )
 
 
