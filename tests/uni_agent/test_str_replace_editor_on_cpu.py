@@ -4,6 +4,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from uni_agent.tools import str_replace_editor as editor
+
 SCRIPT = Path(__file__).parents[2] / "uni_agent" / "tools" / "str_replace_editor" / "str_replace_editor"
 
 
@@ -536,3 +540,22 @@ def test_full_view_trailing_newline_is_not_a_line(tmp_path):
 def test_full_view_without_a_final_newline_is_unchanged(tmp_path):
     f = write(tmp_path, "a\nb\nc")
     assert run_view(f) == f"Here's the result of running `cat -n` on {f}:\n     1\ta\n     2\tb\n     3\tc\n\n"
+
+
+@pytest.mark.parametrize("mounted", [True, False], ids=["wheels", "pypi"])
+@pytest.mark.parametrize("pinned_fails", [False, True], ids=["py38+", "older-python"])
+def test_the_install_reads_mounted_wheels_with_no_index_and_each_install_may_fail_alone(
+    tmp_path, monkeypatch, mounted, pinned_fails
+):
+    wheels, calls = tmp_path / "wheels", tmp_path / "calls"
+    if mounted:
+        wheels.mkdir()
+    monkeypatch.setattr(editor, "WHEELS_DIR", str(wheels))
+    stub = f'#!/bin/sh\necho "$*" >> {calls}\ncase "$*" in *0.21.3) exit {int(pinned_fails)};; esac\n'
+    (tmp_path / "python").write_text(stub)
+    (tmp_path / "python").chmod(0o755)
+    command = editor.StrReplaceEditorTool().get_install_command()
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    code = subprocess.run(["bash", "-c", command], env=env).returncode
+    pip = "-m pip install" + (f" --no-index --find-links {wheels} --disable-pip-version-check" if mounted else "")
+    assert (code, calls.read_text().splitlines()) == (0, [f"{pip} tree-sitter==0.21.3", f"{pip} tree-sitter-languages"])

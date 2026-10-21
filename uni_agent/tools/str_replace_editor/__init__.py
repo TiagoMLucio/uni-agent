@@ -61,6 +61,9 @@ COMMAND_ARGUMENTS = {
     "undo_edit": (),
 }
 
+#: where a runtime may mount the wheels the installs below resolve to on each Python, then installed with no index
+WHEELS_DIR = "/opt/uni-agent/wheels"
+
 
 def _without_mentions(parts: list[str], names: list[str]) -> list[str]:
     return [part for part in parts if not any(f"`{name}`" in part for name in names)]
@@ -104,4 +107,9 @@ class StrReplaceEditorTool(AbstractTool):
         return schema
 
     def get_install_command(self) -> str:
-        return "python -m pip install 'tree-sitter==0.21.3' || true && python -m pip install 'tree-sitter-languages' || true"
+        # apart: tree-sitter 0.21.3 needs Python 3.8, and an older one still takes the newest tree-sitter-languages it can
+        def install(pip: str) -> str:
+            return f"{pip} 'tree-sitter==0.21.3' || true && {pip} 'tree-sitter-languages' || true"
+
+        offline = f"python -m pip install --no-index --find-links {WHEELS_DIR} --disable-pip-version-check"
+        return f"if [ -d {WHEELS_DIR} ]; then {install(offline)}; else {install('python -m pip install')}; fi"
