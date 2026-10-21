@@ -26,7 +26,8 @@ from uni_agent.reflection.registry import register_reflector
 from uni_agent.tracing import register_langfuse_op, rollout_trace_op, rollout_trace_span
 
 #: the fields a brief may name; {first} and {last} are the attempt's turn range
-FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns", "first", "last", "facts"})
+FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns", "first", "last", "facts",
+                    "max_selected_turns"})
 #: the fields the writer may name: only the turns before the placed one, and the placement's diagnosis
 WRITER_FIELDS = frozenset({"task", "turn", "turns_before", "mistake", "type", "type_rule", "seen_before", "gold"})
 #: a high-effort read of a 150-turn trace takes minutes
@@ -109,9 +110,17 @@ PLACEMENT_SCHEMA = {"type": "object", "additionalProperties": False,
                                    "no_note_reason": _STR}}
 NOTE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["note", "check"],
                "properties": {"note": _STR, "check": _STR}}
+_PLACED = {"mistake": _STR, "type": {"type": "string", "enum": list(TYPE_RULES)},
+           "statements": {"type": "array", "items": {"type": "integer"}}, "turn": {"type": "integer"},
+           "quote": _STR, "seen_before": _STR, "note": _STR, "check": _STR}
+#: one call places a note on each turn it chooses and writes it; the hint is each note's check
+PLACED_CHECKS_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["notes", "no_note_reason"],
+                        "properties": {"notes": {"type": "array", "items": {
+                            "type": "object", "additionalProperties": False, "required": list(_PLACED),
+                            "properties": _PLACED}}, "no_note_reason": _STR}}
 SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA),
            "placement": ("hint_placement", PLACEMENT_SCHEMA), "note": ("hint_note", NOTE_SCHEMA),
-           "check": ("hint_note", NOTE_SCHEMA)}
+           "check": ("hint_note", NOTE_SCHEMA), "placed_checks": ("hint_notes", PLACED_CHECKS_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -172,8 +181,8 @@ class ApiReflectionConfig(BaseReflectionConfig):
                 raise ValueError("the api reflector's two calls are a placement, then a note or a check")
             allowed = (FIELDS, WRITER_FIELDS)
         elif len(parses) == 1:
-            if parses[0] not in ("hints", "turn_hint"):
-                raise ValueError("the api reflector's call parses its answer as hints or turn_hint")
+            if parses[0] not in ("hints", "turn_hint", "placed_checks"):
+                raise ValueError("the api reflector's call parses its answer as hints, turn_hint or placed_checks")
             allowed = (FIELDS,)
         else:
             raise ValueError("the api reflector makes one call per trace, or a placement and a writer call")
@@ -217,6 +226,7 @@ class ApiReflector(AbstractReflector):
             "feedback": fence(feedback) if cfg.include_exec_feedback and feedback else "(not available)",
             "first": str(turns[0]["step"]),
             "last": str(turns[-1]["step"]),
+            "max_selected_turns": str(cfg.max_selected_turns),
         }
         if "facts" in _fields(first.user):
             values["facts"] = attempt_facts(turns, agent_patch, gold)
@@ -479,6 +489,10 @@ class ApiReflector(AbstractReflector):
             top = []
         elif parse == "turn_hint":
             top = [{"turn": answer.get("turn"), "hint": answer.get("hint")}]
+        elif parse == "placed_checks":
+            notes = answer.get("notes")
+            top = [{"turn": n.get("turn"), "hint": n.get("check")} for n in notes if isinstance(n, dict)] \
+                if isinstance(notes, list) else []
         else:
             top = answer.get("top")
         valid = {turn["step"] for turn in turns}

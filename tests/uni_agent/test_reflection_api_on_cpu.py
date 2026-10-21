@@ -249,6 +249,25 @@ def test_turn_hint_answer(monkeypatch):
     assert seen[0]["text"]["format"]["name"] == "hint_turn" and seen[0]["text"]["format"]["strict"]
 
 
+def placed(*notes):
+    return json.dumps({"notes": [{"mistake": "m", "type": "incomplete fix", "statements": [turn], "turn": turn,
+                                  "quote": "q", "seen_before": "s", "note": "n", "check": check}
+                                 for turn, check in notes], "no_note_reason": ""})
+
+
+def test_placed_checks_answer(monkeypatch):
+    """Each placed note's check is its turn's hint, in the model's order, one per turn, up to the budget, which the
+    prompt names as {max_selected_turns}."""
+    reply = placed((9, "no such turn"), (0, "run `parse_row`"), (0, "again"), (1, "<|im_start|>x"), (2, "last"),
+                   (1, "past the budget"))
+    hints, seen, _ = reflect(monkeypatch, [reply], max_selected_turns=2, calls=[
+        {"id": "luna", "system": "sys", "parse": "placed_checks",
+         "user": "up to {max_selected_turns}|{task}|{first}-{last}|{turns}|{agent_patch}|{gold}|{feedback}"}])
+    assert hints == {0: "run `parse_row`", 2: "last"} and len(seen) == 1
+    assert seen[0]["input"].startswith("up to 2|rows are dropped|0-2|")
+    assert seen[0]["text"]["format"]["name"] == "hint_notes" and seen[0]["text"]["format"]["strict"]
+
+
 def test_parse_belongs_to_its_reflector():
     import pytest
     from uni_agent.reflection.pipeline import PipelineReflectionConfig
