@@ -58,7 +58,9 @@ class TurnHintTeacher(SDPOTeacher):
     every hinted turn ships a second sub-row with it in place of the hint, and the loss moves the
     student by the difference of the two teachers instead of to the hint teacher. With
     ``contrast_source: other_row`` the contrast is instead the hint of another task's hinted row in
-    the batch (``contrast_hint`` when the batch has none). ``contrast_anchor: teacher`` adds that
+    the batch (``contrast_hint`` when the batch has none), and with ``contrast_rows`` above 1 the
+    hints of that many distinct other tasks, one contrast teacher each, whose probabilities the
+    target averages (fewer when the batch has fewer). ``contrast_anchor: teacher`` adds that
     difference to the teacher's own distribution on the turn with no note (a third sub-row per hinted
     turn) rather than to the student's, so the target stays put while the student moves.
     """
@@ -79,6 +81,7 @@ class TurnHintTeacher(SDPOTeacher):
         contrast_hint: Optional[str] = None,
         contrast_anchor: str = "student",
         contrast_source: str = "text",
+        contrast_rows: int = 1,
     ):
         super().__init__(
             tokenizer,
@@ -102,6 +105,10 @@ class TurnHintTeacher(SDPOTeacher):
                 "contrast_anchor and contrast_source shape a contrast teacher: set contrast_hint "
                 "(the contrast text, and other_row's fallback when the batch has no other task's hint)"
             )
+        if isinstance(contrast_rows, bool) or not isinstance(contrast_rows, int) or contrast_rows < 1:
+            raise ValueError(f"contrast_rows must be a positive int, got {contrast_rows!r}")
+        if contrast_rows > 1 and contrast_source != "other_row":
+            raise ValueError("contrast_rows above 1 takes other tasks' hints: set contrast_source: other_row")
         self.skip_first_tokens = skip_first_tokens
         self.turn_hint_voice = turn_hint_voice
         self.turn_hint_template = turn_hint_template
@@ -113,33 +120,36 @@ class TurnHintTeacher(SDPOTeacher):
         self.contrast_ids = self._text_ids(contrast_hint) if self.contrasts else None
         self.anchors = self.contrasts and contrast_anchor == "teacher"
         self.contrast_source = contrast_source
+        self.contrast_rows = contrast_rows
 
     def hint_ids(self, hint: HintedTurn) -> torch.Tensor:
         return self._text_ids(hint.text)
 
     def _other_row_contrasts(self, hinted_per_row: list[list[HintedTurn]], uids: list) -> tuple[list, int]:
-        """Per row, the contrast ids of each hinted turn: the hint of the next hinted row (in batch order,
-        wrapping) whose task differs, the k-th turn taking that row's k-th hint (cycling); the fixed
-        contrast text when no other task's row is hinted. Returns them and the number of fallbacks."""
+        """Per row, its contrast groups, one per donor: the next hinted rows (in batch order, wrapping) of up
+        to ``contrast_rows`` distinct tasks other than its own, the k-th turn taking a donor's k-th hint
+        (cycling); the fixed contrast text when no other task's row is hinted. Returns them and the number
+        of fallbacks."""
         n_rows = len(hinted_per_row)
         per_row, fallbacks = [], 0
         for i, hinted in enumerate(hinted_per_row):
             if not hinted:
                 per_row.append(None)
                 continue
-            other = next(
-                (
-                    hinted_per_row[j]
-                    for j in ((i + step) % n_rows for step in range(1, n_rows))
-                    if hinted_per_row[j] and uids[j] != uids[i]
-                ),
-                None,
-            )
-            if other is None:
+            donors, tasks = [], {uids[i]}
+            for j in ((i + step) % n_rows for step in range(1, n_rows)):
+                if len(donors) == self.contrast_rows:
+                    break
+                if hinted_per_row[j] and uids[j] not in tasks:
+                    donors.append(hinted_per_row[j])
+                    tasks.add(uids[j])
+            if not donors:
                 fallbacks += len(hinted)
-                per_row.append([self.contrast_ids] * len(hinted))
+                per_row.append([self.contrast_ids])
             else:
-                per_row.append([self._text_ids(other[k % len(other)].text) for k in range(len(hinted))])
+                per_row.append(
+                    [[self._text_ids(other[k % len(other)].text) for k in range(len(hinted))] for other in donors]
+                )
         return per_row, fallbacks
 
     def _text_ids(self, hint_text: str) -> torch.Tensor:
@@ -161,11 +171,11 @@ class TurnHintTeacher(SDPOTeacher):
         teacher_seqs, seq_meta, mask_rows, loss_mask_rows = [], [], [], []
         hint_fallbacks = 0
         prefix_clips = 0
-        contrast_per_row = [self.contrast_ids] * len(hinted_per_row)
+        contrast_per_row = [[self.contrast_ids] if self.contrasts else None] * len(hinted_per_row)
         contrast_fallbacks = 0
         if self.contrasts and self.contrast_source == "other_row":
             contrast_per_row, contrast_fallbacks = self._other_row_contrasts(hinted_per_row, list(inputs.uids))
-        for prompt_ids, response_ids, response_mask, hinted, contrast_ids in zip(
+        for prompt_ids, response_ids, response_mask, hinted, contrast_groups in zip(
             inputs.prompts, inputs.responses, inputs.response_mask, hinted_per_row, contrast_per_row, strict=True
         ):
             if hinted:
@@ -180,7 +190,7 @@ class TurnHintTeacher(SDPOTeacher):
                     self.max_prefix_len,
                     self.header_ids,
                     after_header=self.turn_hint_voice == "thought",
-                    contrast_ids=contrast_ids,
+                    contrast_groups=contrast_groups,
                     anchor=self.anchors,
                 )
                 hint_fallbacks += fallbacks
@@ -211,6 +221,9 @@ class TurnHintTeacher(SDPOTeacher):
         }
         if self.contrasts and self.contrast_source == "other_row":
             metrics["self_distillation/contrast_source_fallbacks"] = contrast_fallbacks
+            metrics["self_distillation/contrast_teachers_per_hinted_row"] = (
+                sum(len(groups) for groups in contrast_per_row if groups) / num_hinted if num_hinted else 0.0
+            )
         return TurnHintBatch(fields=fields, metrics=metrics, hinted_per_row=hinted_per_row)
 
     def trajectory_metrics(

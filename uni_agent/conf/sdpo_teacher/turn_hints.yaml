@@ -43,3 +43,6 @@ contrast_anchor: student
 
 # The contrast's text: "text" (contrast_hint) or "other_row" (another task's hint in the batch, else contrast_hint).
 contrast_source: text
+
+# With other_row, how many other tasks' hints make the contrast (their probabilities averaged); fewer when the batch has fewer.
+contrast_rows: 1

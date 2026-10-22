@@ -36,6 +36,7 @@ def build_spliced_teacher_row(
     after_header: bool = False,
     contrast_ids: Optional[torch.Tensor | list[torch.Tensor]] = None,
     anchor: bool = False,
+    contrast_groups: Optional[list[torch.Tensor | list[torch.Tensor]]] = None,
 ) -> tuple[torch.Tensor, list[int], int, list[tuple[int, int]]]:
     """One teacher sub-row per hinted turn, shipped as the trajectory once and each sub-row's note.
 
@@ -50,24 +51,27 @@ def build_spliced_teacher_row(
     ignoring it.
 
     With ``contrast_ids`` (one tensor for every hinted turn, or one per hinted turn), one more
-    sub-row per hinted turn follows them: the same sub-row with those tokens in place of the hint.
-    With ``anchor`` too, a third sub-row per hinted turn follows those: the same turn with no note
-    spliced at all.
+    sub-row per hinted turn follows them: the same sub-row with those tokens in place of the hint;
+    ``contrast_groups`` gives several such groups in order, one per contrast teacher. With ``anchor``
+    too, a last sub-row per hinted turn follows those: the same turn with no note spliced at all.
 
     The prompt is left-truncated to ``max_prefix_len``. Returns the base (the prompt, then the
     response up to the last scored span) followed by every sub-row's note, the packed meta (see
     :mod:`verl.trainer.ppo.sdpo.teacher_meta`), the number of fallback placements and the
     (start, end) spans for the distillation mask (== the meta spans).
     """
-    if anchor and contrast_ids is None:
-        raise ValueError("a no-note anchor sub-row only anchors a contrast: pass contrast_ids")
+    if contrast_ids is not None and contrast_groups is not None:
+        raise ValueError("pass contrast_ids (one contrast teacher) or contrast_groups (several), not both")
+    contrasts = [contrast_ids] if contrast_ids is not None else list(contrast_groups or [])
+    if anchor and not contrasts:
+        raise ValueError("a no-note anchor sub-row only anchors a contrast: pass contrast_ids or contrast_groups")
     prompt = prompt_ids if prompt_ids.shape[0] <= max_prefix_len else prompt_ids[-max_prefix_len:]
     placed = [_split(prompt, response_ids, hint.start, header_ids, after_header) for hint in hinted_turns]
     notes = [ids.to(response_ids.dtype) for ids in hint_ids_list]
-    if contrast_ids is not None:
-        notes += contrast_ids if isinstance(contrast_ids, list) else [contrast_ids] * len(hinted_turns)
-        if anchor:
-            notes += [response_ids.new_zeros(0)] * len(hinted_turns)
+    for group in contrasts:
+        notes += group if isinstance(group, list) else [group] * len(hinted_turns)
+    if contrasts and anchor:
+        notes += [response_ids.new_zeros(0)] * len(hinted_turns)
     turns = len(hinted_turns)
     groups = [
         [

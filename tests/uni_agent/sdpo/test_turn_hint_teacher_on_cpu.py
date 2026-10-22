@@ -237,11 +237,12 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     assert set(options) - {"_target_"} == set(params) - trainer_provided
     assert set(options) == {
         "_target_", "turn_hint_template", "chat_template_kwargs", "skip_first_tokens", "turn_hint_voice",
-        "contrast_hint", "contrast_anchor", "contrast_source",
+        "contrast_hint", "contrast_anchor", "contrast_source", "contrast_rows",
     }
     assert options["chat_template_kwargs"] == {} and options["skip_first_tokens"] == 0
     assert options["turn_hint_voice"] == "user" and options["contrast_hint"] is None
     assert options["contrast_anchor"] == "student" and options["contrast_source"] == "text"
+    assert options["contrast_rows"] == 1
 
     teacher = make_teacher(
         SelfDistillationConfig(teacher=turn_hints_options(chat_template_kwargs={"enable_thinking": False})),
@@ -278,6 +279,11 @@ def test_turn_hint_options_are_the_yaml_keys_and_validated_at_construction():
     for overrides in (dict(contrast_anchor="teacher"), dict(contrast_source="other_row")):
         with pytest.raises(ValueError, match="set contrast_hint"):
             build(**overrides)
+    for bad in (0, -1, 2.5, True):
+        with pytest.raises(ValueError, match="contrast_rows"):
+            build(contrast_hint="Continue.", contrast_source="other_row", contrast_rows=bad)
+    with pytest.raises(ValueError, match="contrast_source: other_row"):
+        build(contrast_hint="Continue.", contrast_rows=4)
 
 
 def test_turn_hint_teacher_thought_voice_opens_the_hinted_turn():
@@ -472,6 +478,54 @@ def test_other_row_contrast_is_the_next_other_tasks_hint():
     for row in (0, 1):
         for text in _contrast_texts(same_task, row):
             assert "<user>Note: Continue.</>" in text
+
+
+def test_contrast_rows_take_the_next_distinct_other_tasks_hints():
+    """``contrast_rows: 3`` ships one contrast group per donor: the next hinted rows (in batch order, wrapping)
+    of three distinct tasks other than the row's own, in that order; with fewer such tasks, as many as there
+    are. ``contrast_rows: 1`` builds the default bit for bit."""
+    tok = ToyTokenizer()
+
+    def build(extra, uids, **overrides):
+        options = turn_hints_options(contrast_hint="Continue.", contrast_source="other_row", **overrides)
+        teacher = make_teacher(SelfDistillationConfig(distillation_topk=100, teacher=options), tok, max_prefix_len=4096)
+        return teacher.build(_inputs(extra, uids, [0.0] * len(uids), [None] * len(uids)))
+
+    extra = [
+        {"turn_spans": SPANS, "turn_hints": [[0, "h0"], [1, "h1"]]},
+        {"turn_spans": SPANS, "turn_hints": [[1, "h2"]]},
+        {"turn_spans": SPANS, "turn_hints": [[0, "h3"]]},
+        {"turn_spans": SPANS, "turn_hints": []},
+        {"turn_spans": SPANS, "turn_hints": [[0, "h4"]]},
+        {"turn_spans": SPANS, "turn_hints": [[1, "h5"]]},
+    ]
+    uids = ["a", "b", "b", "c", "d", "e"]
+    out = build(extra, uids, contrast_rows=3)
+    # wire order: a donor's group covers every hinted turn before the next donor's; row 2 repeats b's task
+    expected = {
+        0: ["h2", "h2", "h4", "h4", "h5", "h5"],
+        1: ["h4", "h5", "h0"],
+        2: ["h4", "h5", "h0"],
+        4: ["h5", "h0", "h2"],
+        5: ["h0", "h2", "h4"],
+    }
+    for row, others in expected.items():
+        texts = _contrast_texts(out, row)
+        assert len(texts) == len(others)
+        for text, other in zip(texts, others, strict=True):
+            assert f"<user>Note: {other}</>" in text
+    assert out.fields["teacher_seq_meta"][3].tolist() == DEGENERATE_META
+    assert out.metrics["self_distillation/contrast_teachers_per_hinted_row"] == 3.0
+    assert out.metrics["self_distillation/contrast_source_fallbacks"] == 0
+
+    few = build(extra[:2], ["a", "b"], contrast_rows=3)
+    assert [len(_contrast_texts(few, row)) for row in (0, 1)] == [2, 1]
+    assert few.metrics["self_distillation/contrast_teachers_per_hinted_row"] == 1.0
+
+    one, default = build(extra, uids, contrast_rows=1), build(extra, uids)
+    for key in ("teacher_input_ids", "teacher_seq_meta"):
+        for row in range(len(uids)):
+            assert torch.equal(one.fields[key][row], default.fields[key][row])
 
 
 def test_contrast_hint_null_is_the_hint_only_teacher_bit_for_bit():

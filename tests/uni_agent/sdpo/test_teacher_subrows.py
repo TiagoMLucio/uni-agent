@@ -208,6 +208,37 @@ def test_an_anchor_needs_a_contrast():
         build_spliced_teacher_row(PROMPT, RESPONSE_WITH_HEADERS, hinted, [_hint(900)], 64, HEADER, anchor=True)
 
 
+def test_contrast_groups_follow_in_order_before_the_anchor():
+    """Several contrast teachers ship one group each, in order, every sub-row its hint sub-row with only the
+    note swapped; the anchor group comes after them all, and the branches flag each group."""
+    hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
+    hints = [_hint(900), _hint(901)]
+    groups = [_hint(800, length=5), [_hint(810, length=2), _hint(811, length=4)], _hint(820, length=1)]
+    plain_seq, plain_meta, _, _ = build_spliced_teacher_row(PROMPT, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER)
+    seq, meta, _, _ = build_spliced_teacher_row(
+        PROMPT, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, contrast_groups=groups, anchor=True
+    )
+    assert len(meta) == 2 + 4 * 2 * (1 + len(groups) + 1)
+    plain = _subs(plain_seq, plain_meta)
+    contrasts = _subs(seq, meta, contrast=True)
+    assert len(contrasts) == 2 * len(groups)
+    for g, group in enumerate(groups):
+        per_turn = group if isinstance(group, list) else [group, group]
+        for t, (value, contrast) in enumerate(zip((900, 901), per_turn, strict=True)):
+            assert contrasts[g * 2 + t] == _swap(plain[t], value, contrast)
+    assert _subs(seq, meta, anchor=True) == [
+        PROMPT.tolist() + RESPONSE_WITH_HEADERS[:16].tolist(),
+        PROMPT.tolist() + RESPONSE_WITH_HEADERS[:28].tolist(),
+    ]
+    branches = _branches(seq, meta, RESPONSE_WITH_HEADERS)[1]
+    assert sum(branch.span.contrast for branch in branches) == 2 * len(groups)
+    assert sum(branch.span.anchor for branch in branches) == 2
+    with pytest.raises(ValueError, match="not both"):
+        build_spliced_teacher_row(
+            PROMPT, RESPONSE_WITH_HEADERS, hinted, hints, 64, HEADER, contrast_ids=groups[0], contrast_groups=groups
+        )
+
+
 def test_contrast_ids_may_differ_per_hinted_turn():
     hinted = [HintedTurn(3, 12, 16, "a"), HintedTurn(5, 24, 28, "b")]
     hints, per_turn = [_hint(900), _hint(901)], [_hint(800, length=5), _hint(801, length=2)]
