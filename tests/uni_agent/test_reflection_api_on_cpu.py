@@ -269,16 +269,20 @@ def test_placed_checks_answer(monkeypatch):
 
 
 def test_placed_notes_answer(monkeypatch):
-    """The same call read for each placed note's note instead of its check."""
+    """A placing call that writes only the note: each note is its turn's hint, and the answer schema has no check."""
     reply = json.dumps({"notes": [{"mistake": "m", "type": "incomplete fix", "statements": [turn], "turn": turn,
-                                   "quote": "q", "seen_before": "s", "note": note, "check": f"run {note}"}
+                                   "quote": "q", "seen_before": "s", "note": note}
                                   for turn, note in ((2, "the row may be dropped"), (0, "the key may be unused"))],
                         "no_note_reason": ""})
     hints, seen, _ = reflect(monkeypatch, [reply], max_selected_turns=5, calls=[
         {"id": "luna", "system": "sys", "parse": "placed_notes",
          "user": "{task}|{turns}|{agent_patch}|{gold}|{feedback}"}])
     assert hints == {2: "the row may be dropped", 0: "the key may be unused"}
-    assert seen[0]["text"]["format"]["name"] == "hint_notes"
+    schema = seen[0]["text"]["format"]
+    assert schema["name"] == "hint_notes" and schema["strict"]
+    note_fields = schema["schema"]["properties"]["notes"]["items"]
+    assert "check" not in note_fields["properties"] and "check" not in note_fields["required"]
+    assert "note" in note_fields["required"]
 
 
 def test_parse_belongs_to_its_reflector():

@@ -69,7 +69,7 @@ class CallSpec(BaseModel):
     #: ``turn_hint`` is the api reflector's answer naming one turn and its hint; ``placement`` then
     #: ``note`` or ``check`` are its two calls, the first naming the turn, the second writing its hint;
     #: ``placed_checks`` is its one call that places notes on several turns and writes each one's check,
-    #: ``placed_notes`` the same call with each one's note as the hint
+    #: ``placed_notes`` a call that places them and writes only each note, which is the hint
     parse: Literal["text", "turns", "hints", "turn_hint", "placement", "note", "check", "placed_checks",
                    "placed_notes"] = "text"
     #: ``delete_only`` refuses a reply that introduces a word the draft did not have. The stage

@@ -118,10 +118,16 @@ PLACED_CHECKS_SCHEMA = {"type": "object", "additionalProperties": False, "requir
                         "properties": {"notes": {"type": "array", "items": {
                             "type": "object", "additionalProperties": False, "required": list(_PLACED),
                             "properties": _PLACED}}, "no_note_reason": _STR}}
+_PLACED_NOTE = {key: value for key, value in _PLACED.items() if key != "check"}
+#: the same call writing only the note, which is the hint
+PLACED_NOTES_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["notes", "no_note_reason"],
+                       "properties": {"notes": {"type": "array", "items": {
+                           "type": "object", "additionalProperties": False, "required": list(_PLACED_NOTE),
+                           "properties": _PLACED_NOTE}}, "no_note_reason": _STR}}
 SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA),
            "placement": ("hint_placement", PLACEMENT_SCHEMA), "note": ("hint_note", NOTE_SCHEMA),
            "check": ("hint_note", NOTE_SCHEMA), "placed_checks": ("hint_notes", PLACED_CHECKS_SCHEMA),
-           "placed_notes": ("hint_notes", PLACED_CHECKS_SCHEMA)}
+           "placed_notes": ("hint_notes", PLACED_NOTES_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
