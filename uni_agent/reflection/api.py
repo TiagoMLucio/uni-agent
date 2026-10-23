@@ -120,7 +120,8 @@ PLACED_CHECKS_SCHEMA = {"type": "object", "additionalProperties": False, "requir
                             "properties": _PLACED}}, "no_note_reason": _STR}}
 SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA),
            "placement": ("hint_placement", PLACEMENT_SCHEMA), "note": ("hint_note", NOTE_SCHEMA),
-           "check": ("hint_note", NOTE_SCHEMA), "placed_checks": ("hint_notes", PLACED_CHECKS_SCHEMA)}
+           "check": ("hint_note", NOTE_SCHEMA), "placed_checks": ("hint_notes", PLACED_CHECKS_SCHEMA),
+           "placed_notes": ("hint_notes", PLACED_CHECKS_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -181,8 +182,9 @@ class ApiReflectionConfig(BaseReflectionConfig):
                 raise ValueError("the api reflector's two calls are a placement, then a note or a check")
             allowed = (FIELDS, WRITER_FIELDS)
         elif len(parses) == 1:
-            if parses[0] not in ("hints", "turn_hint", "placed_checks"):
-                raise ValueError("the api reflector's call parses its answer as hints, turn_hint or placed_checks")
+            if parses[0] not in ("hints", "turn_hint", "placed_checks", "placed_notes"):
+                raise ValueError(
+                    "the api reflector's call parses its answer as hints, turn_hint, placed_checks or placed_notes")
             allowed = (FIELDS,)
         else:
             raise ValueError("the api reflector makes one call per trace, or a placement and a writer call")
@@ -489,9 +491,9 @@ class ApiReflector(AbstractReflector):
             top = []
         elif parse == "turn_hint":
             top = [{"turn": answer.get("turn"), "hint": answer.get("hint")}]
-        elif parse == "placed_checks":
-            notes = answer.get("notes")
-            top = [{"turn": n.get("turn"), "hint": n.get("check")} for n in notes if isinstance(n, dict)] \
+        elif parse in ("placed_checks", "placed_notes"):
+            notes, version = answer.get("notes"), "check" if parse == "placed_checks" else "note"
+            top = [{"turn": n.get("turn"), "hint": n.get(version)} for n in notes if isinstance(n, dict)] \
                 if isinstance(notes, list) else []
         else:
             top = answer.get("top")

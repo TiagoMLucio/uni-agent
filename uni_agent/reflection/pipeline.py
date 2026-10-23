@@ -22,7 +22,7 @@ from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
 TURNS_MARKER = "FINAL_TURNS_JSON:"
 #: the answers only the api reflector parses
-API_PARSES = frozenset({"turn_hint", "placement", "note", "check", "placed_checks"})
+API_PARSES = frozenset({"turn_hint", "placement", "note", "check", "placed_checks", "placed_notes"})
 
 TRACE_FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns",
                          "candidates", "delta"})
@@ -68,8 +68,10 @@ class CallSpec(BaseModel):
     per: Literal["trace", "turn"] = "trace"
     #: ``turn_hint`` is the api reflector's answer naming one turn and its hint; ``placement`` then
     #: ``note`` or ``check`` are its two calls, the first naming the turn, the second writing its hint;
-    #: ``placed_checks`` is its one call that places notes on several turns and writes each one's check
-    parse: Literal["text", "turns", "hints", "turn_hint", "placement", "note", "check", "placed_checks"] = "text"
+    #: ``placed_checks`` is its one call that places notes on several turns and writes each one's check,
+    #: ``placed_notes`` the same call with each one's note as the hint
+    parse: Literal["text", "turns", "hints", "turn_hint", "placement", "note", "check", "placed_checks",
+                   "placed_notes"] = "text"
     #: ``delete_only`` refuses a reply that introduces a word the draft did not have. The stage
     #: sees the draft, which was written with the patch, so an unconstrained rewrite can restate
     #: privileged content the stage itself never saw.
