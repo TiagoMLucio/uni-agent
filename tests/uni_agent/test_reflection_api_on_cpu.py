@@ -285,6 +285,24 @@ def test_placed_notes_answer(monkeypatch):
     assert "note" in note_fields["required"]
 
 
+def test_grouped_notes_answer(monkeypatch):
+    """Notes labelled by group and case: each note is its turn's hint, and the strict schema asks for the labels,
+    the quote and the evidence before the note, in that order."""
+    reply = json.dumps({"notes": [{"group": "G1", "trigger": "", "turn": turn, "quote": "q", "evidence": "e",
+                                   "note": note}
+                                  for turn, note in ((2, "run the issue's example"), (0, "read the caller first"))],
+                        "no_note_reason": ""})
+    hints, seen, _ = reflect(monkeypatch, [reply], max_selected_turns=5, calls=[
+        {"id": "luna", "system": "sys", "parse": "grouped_notes",
+         "user": "{task}|{turns}|{agent_patch}|{gold}|{feedback}"}])
+    assert hints == {2: "run the issue's example", 0: "read the caller first"}
+    schema = seen[0]["text"]["format"]
+    assert schema["name"] == "hint_notes" and schema["strict"]
+    note_fields = schema["schema"]["properties"]["notes"]["items"]
+    assert list(note_fields["properties"]) == ["group", "trigger", "turn", "quote", "evidence", "note"]
+    assert note_fields["required"] == list(note_fields["properties"])
+
+
 def test_parse_belongs_to_its_reflector():
     import pytest
     from uni_agent.reflection.pipeline import PipelineReflectionConfig

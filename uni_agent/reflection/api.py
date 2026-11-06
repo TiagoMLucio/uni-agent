@@ -124,10 +124,17 @@ PLACED_NOTES_SCHEMA = {"type": "object", "additionalProperties": False, "require
                        "properties": {"notes": {"type": "array", "items": {
                            "type": "object", "additionalProperties": False, "required": list(_PLACED_NOTE),
                            "properties": _PLACED_NOTE}}, "no_note_reason": _STR}}
+#: notes labelled by the prompt's group and case, the evidence written before the note (fields keep this order)
+_GROUPED_NOTE = {"group": _STR, "trigger": _STR, "turn": {"type": "integer"}, "quote": _STR, "evidence": _STR,
+                 "note": _STR}
+GROUPED_NOTES_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["notes", "no_note_reason"],
+                        "properties": {"notes": {"type": "array", "items": {
+                            "type": "object", "additionalProperties": False, "required": list(_GROUPED_NOTE),
+                            "properties": _GROUPED_NOTE}}, "no_note_reason": _STR}}
 SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA),
            "placement": ("hint_placement", PLACEMENT_SCHEMA), "note": ("hint_note", NOTE_SCHEMA),
            "check": ("hint_note", NOTE_SCHEMA), "placed_checks": ("hint_notes", PLACED_CHECKS_SCHEMA),
-           "placed_notes": ("hint_notes", PLACED_NOTES_SCHEMA)}
+           "placed_notes": ("hint_notes", PLACED_NOTES_SCHEMA), "grouped_notes": ("hint_notes", GROUPED_NOTES_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -188,9 +195,9 @@ class ApiReflectionConfig(BaseReflectionConfig):
                 raise ValueError("the api reflector's two calls are a placement, then a note or a check")
             allowed = (FIELDS, WRITER_FIELDS)
         elif len(parses) == 1:
-            if parses[0] not in ("hints", "turn_hint", "placed_checks", "placed_notes"):
-                raise ValueError(
-                    "the api reflector's call parses its answer as hints, turn_hint, placed_checks or placed_notes")
+            if parses[0] not in ("hints", "turn_hint", "placed_checks", "placed_notes", "grouped_notes"):
+                raise ValueError("the api reflector's call parses its answer as hints, turn_hint, placed_checks, "
+                                 "placed_notes or grouped_notes")
             allowed = (FIELDS,)
         else:
             raise ValueError("the api reflector makes one call per trace, or a placement and a writer call")
@@ -497,7 +504,7 @@ class ApiReflector(AbstractReflector):
             top = []
         elif parse == "turn_hint":
             top = [{"turn": answer.get("turn"), "hint": answer.get("hint")}]
-        elif parse in ("placed_checks", "placed_notes"):
+        elif parse in ("placed_checks", "placed_notes", "grouped_notes"):
             notes, version = answer.get("notes"), "check" if parse == "placed_checks" else "note"
             top = [{"turn": n.get("turn"), "hint": n.get(version)} for n in notes if isinstance(n, dict)] \
                 if isinstance(notes, list) else []
