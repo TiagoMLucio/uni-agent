@@ -509,6 +509,57 @@ def test_a_refused_refresh_rests_the_plan_and_the_next_serves(monkeypatch, plan)
     assert hints == {1: "spare"} and seen == [] and "/creds/main.json" in api._PLAN_REST
 
 
+def plan_folder(tmp_path, links):
+    """A plan folder whose entries link to login files in a sibling folder, plus the clutter it must skip."""
+    import os
+    logins, folder = tmp_path / "logins", tmp_path / "plans"
+    logins.mkdir(exist_ok=True)
+    folder.mkdir(exist_ok=True)
+    for entry in folder.iterdir():
+        entry.unlink()
+    for link, login in links:
+        (logins / login).write_text("{}")
+        os.symlink(logins / login, folder / link)
+    for clutter in ("x.json.lock", "y.json.tmp", "notes.txt"):
+        (folder / clutter).write_text("")
+    os.symlink(logins / "gone.json", folder / "05-broken.json")
+    return folder, logins
+
+
+def test_a_plan_folder_is_read_on_every_call_in_name_order(monkeypatch, plan, tmp_path):
+    import os
+    folder, logins = plan_folder(tmp_path, [("20-spare.json", "spare.json"), ("10-first.json", "first.json")])
+    plans = {**plan, "plan_credentials": str(folder)}
+    first, spare = os.path.realpath(logins / "first.json"), os.path.realpath(logins / "spare.json")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))], **plans)
+    assert r.config.plan_files == [first, spare]
+    assert hints == {1: "plan"} and seen == [] and plan_keys == [f"plan-token:{first}"]
+    # reordering the links changes the next call's plan, with no new config and the login files untouched
+    os.rename(folder / "20-spare.json", folder / "00-spare.json")
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))], reflector=r, **plans)
+    assert hints == {1: "plan"} and plan_keys == [f"plan-token:{spare}"]
+    assert sorted(p.name for p in logins.iterdir()) == ["first.json", "spare.json"]
+
+
+def test_an_empty_plan_folder_waits_and_never_uses_the_api(monkeypatch, plan, tmp_path):
+    import os
+
+    from uni_agent.reflection import api
+    folder, logins = plan_folder(tmp_path, [])
+    (logins / "late.json").write_text("{}")
+    sleep = asyncio.sleep
+
+    async def link_then_sleep(delay):
+        if not any(folder.glob("*-late.json")):
+            os.symlink(logins / "late.json", folder / "10-late.json")
+        await sleep(0)
+
+    monkeypatch.setattr(api.asyncio, "sleep", link_then_sleep)
+    hints, seen, r = reflect(monkeypatch, [answer((1, "api"))], plan=[answer((1, "plan"))],
+                             **{**plan, "plan_credentials": str(folder)})
+    assert hints == {1: "plan"} and seen == [] and r.call_metrics()["reflect_plan_waits"] == 1
+
+
 def test_plan_calls_need_the_responses_api():
     with pytest.raises(ValueError, match="needs no base_url"):
         ApiReflector.Config(name="openai", model="m", base_url="https://x/v1", plan_credentials="/c.json",

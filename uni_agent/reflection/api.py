@@ -179,13 +179,25 @@ class ApiReflectionConfig(BaseReflectionConfig):
     #: service_tier (flex bills half and may queue; its capacity 429s are waited out like rate limits)
     sampling: dict = {}
     #: ChatGPT plan credentials files (chatgpt_plan login), tried in order: a call goes to the first plan that serves
-    #: it and waits when none can; with plans set the API key is never used
+    #: it and waits when none can; with plans set the API key is never used. A folder is listed again on every call:
+    #: its *.json entries by name, each resolved to the login file it links to, so plans change without a restart
     plan_credentials: str | list[str] | None = None
 
     @property
     def plan_files(self) -> list[str]:
         plans = self.plan_credentials
-        return [] if not plans else [plans] if isinstance(plans, str) else list(plans)
+        out: list[str] = []
+        for entry in [] if not plans else [plans] if isinstance(plans, str) else list(plans):
+            path = os.path.expanduser(entry)
+            if not os.path.isdir(path):
+                out.append(path)
+                continue
+            for name in sorted(os.listdir(path)):
+                # *.json only: a login file's .lock and .tmp siblings are skipped, and so is a broken link
+                real = os.path.realpath(os.path.join(path, name))
+                if name.endswith(".json") and os.path.isfile(real) and real not in out:
+                    out.append(real)
+        return out
 
     @model_validator(mode="after")
     def _check_calls(self):
@@ -355,10 +367,11 @@ class ApiReflector(AbstractReflector):
         cfg = self.config
         if cfg.base_url is None:
             name, schema = SCHEMAS[parse]
-            # with plans configured the API key is never used: when every plan rests or refuses, the call waits for
-            # one, bounded by the reflection's wall budget
-            while cfg.plan_files:
-                for i, path in enumerate(cfg.plan_files):
+            # with plans configured the API key is never used: when every plan rests or refuses, or a plan folder is
+            # empty, the call waits for one, bounded by the reflection's wall budget
+            while cfg.plan_credentials:
+                plans = cfg.plan_files
+                for i, path in enumerate(plans):
                     if _PLAN_REST.get(path, 0.0) > time.monotonic():
                         continue
                     served = await self._plan_request(path, messages, name, schema)
@@ -366,7 +379,7 @@ class ApiReflector(AbstractReflector):
                         self._counts["reflect_plan_backup_calls"] += i > 0
                         return served
                 self._counts["reflect_plan_waits"] += 1
-                first_free = min(_PLAN_REST.get(path, 0.0) for path in cfg.plan_files)
+                first_free = min((_PLAN_REST.get(path, 0.0) for path in plans), default=0.0)
                 await asyncio.sleep(max(first_free - time.monotonic(), PLAN_BUSY_WAIT_S))
             response = await self._create(
                 client.responses.create, rate_limit_error,
