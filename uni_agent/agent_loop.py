@@ -23,6 +23,8 @@ from uni_agent.interaction import (
 from uni_agent.interaction.behaviour import behaviour_metrics
 from uni_agent.interaction.model import generation_timeout
 from uni_agent.reflection import build_reflection_config, load_reflector
+from uni_agent.reflection.api import MAX_DIGEST_SUCCESSES
+from uni_agent.reflection.group import TaskGroup
 from uni_agent.reward import load_reward_spec
 from uni_agent.skills import SkillsManager, SkillsManagerConfig
 from uni_agent.tracing import (
@@ -37,6 +39,11 @@ from uni_agent.tracing import (
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 from verl.experimental.agent_loop.utils import resolve_config_path
+
+#: a backstop only: every attempt writes its outcome however it ends, and a sibling may still be queued for a slot
+GROUP_WAIT_S = 3 * 3600.0
+#: how long a failure waits for the digest another attempt is writing: that call's wall budget and a margin
+DIGEST_WAIT_S = 2400.0
 
 #: Metrics under this prefix are reported per step by the trainer, which never reads their names.
 #: The prefix is the whole contract, so a new one needs no change on the training side.
@@ -279,6 +286,35 @@ def _dummy_token_id(tokenizer) -> int:
     return 0 if token_id is None else token_id
 
 
+def _turn_table(interaction_result: dict) -> tuple[list[dict], str, int]:
+    """The reflector's view of a trajectory, one entry per turn in step order, with its termination and step count.
+    The cap and stuck exits append a sentinel under the last real step's index, and a turn lives in exactly one
+    segment's spans, so the union ordered by step is the full table."""
+    trajectory = interaction_result.get("trajectory") or []
+    steps = {}
+    for step in trajectory:
+        steps.setdefault(step.step_idx, step)
+    segments = interaction_result.get("segments") or [{"rollout_cache": interaction_result["rollout_cache"]}]
+    turns = sorted(
+        (
+            {
+                "step": step_idx,
+                "tokens": end - start,
+                "response": steps[step_idx].response,
+                "tools": [
+                    {"name": r.name, "action": r.action, "observation": r.observation}
+                    for r in steps[step_idx].tool_results
+                ],
+            }
+            for segment in segments
+            for step_idx, start, end in segment["rollout_cache"].get("turn_spans") or []
+            if step_idx in steps
+        ),
+        key=lambda turn: turn["step"],
+    )
+    return turns, _termination(trajectory), len(steps)
+
+
 def _termination(trajectory) -> str:
     """Terminal status of a trajectory: the last step's abnormal exit_reason, else finished/max_turns."""
     last = trajectory[-1] if trajectory else None
@@ -308,12 +344,17 @@ class UniAgentLoop(AgentLoopBase):
         self.run_id = str(uuid.uuid4())
         self.logger = get_logger("agent-loop", run_id=self.run_id)
         self.setup_attempts = 0
+        self.group = None
+        self._group_published = False
         try:
             config_dict = self._init_rollout(sampling_params, **kwargs)
+            self.group = self._task_group(config_dict, kwargs)
         except Exception as e:
             # no sandbox exists yet, so a bad row costs its own masked row, not the step
             return [await self._failed_output("agent_loop_failed", e)]
 
+        validate = bool(kwargs.get("validate"))
+        deferred = None
         async with self._semaphore:
             setup_done = False
             try:
@@ -416,14 +457,11 @@ class UniAgentLoop(AgentLoopBase):
                     self.logger.warning("No reward spec is provided, reward score will be set to -100")
                     interaction_result["reward_score"] = -100
 
-                reflect_t0 = time.perf_counter()
-                interaction_result["turn_hints"] = await self._maybe_reflect(
-                    interaction_result, config_dict, validate=bool(kwargs.get("validate"))
-                )
-                interaction_result["metrics"]["reflect"] = time.perf_counter() - reflect_t0
-                self._record_trace_outcome(interaction_result)
-                await self._dump_interaction_result(interaction_result)
-                output = await self.convert_to_agent_output(interaction_result)
+                if self.group is None:
+                    output = await self._finish(interaction_result, config_dict, validate)
+                else:
+                    # a failure waits for its task's other attempts, which may still need this slot
+                    deferred = interaction_result
             except Exception as e:
                 if isinstance(e, EpisodeTimeoutError):
                     exit_reason = "episode_timeout"
@@ -432,6 +470,7 @@ class UniAgentLoop(AgentLoopBase):
                 else:
                     exit_reason = "agent_loop_failed"
                 output = [await self._failed_output(exit_reason, e)]
+                await self._publish_lost()
             finally:
                 try:
                     await self.env.close()
@@ -441,7 +480,43 @@ class UniAgentLoop(AgentLoopBase):
                         await asyncio.to_thread(cleanup_handlers, self.run_id)
                     except Exception as e:
                         self.logger.warning(f"could not remove the run log sink: {e!r}")
-            return output
+        if deferred is not None:
+            try:
+                add_file_handler(self.output_dir / "run.log", self.run_id)
+                output = await self._finish(deferred, config_dict, validate)
+            except Exception as e:
+                output = [await self._failed_output("agent_loop_failed", e)]
+            finally:
+                await self._publish_lost()
+                try:
+                    await asyncio.to_thread(cleanup_handlers, self.run_id)
+                except Exception as e:
+                    self.logger.warning(f"could not remove the run log sink: {e!r}")
+        return output
+
+    async def _finish(self, interaction_result: dict, config_dict: dict, validate: bool) -> list[AgentLoopOutput]:
+        """The graded trajectory's hints, trace outcome, dump and training rows."""
+        reflect_t0 = time.perf_counter()
+        interaction_result["turn_hints"] = await self._maybe_reflect(interaction_result, config_dict, validate=validate)
+        interaction_result["metrics"]["reflect"] = time.perf_counter() - reflect_t0
+        self._record_trace_outcome(interaction_result)
+        await self._dump_interaction_result(interaction_result)
+        return await self.convert_to_agent_output(interaction_result)
+
+    def _task_group(self, config_dict: dict, kwargs: dict) -> TaskGroup | None:
+        """The meeting point of this attempt's task when its reflector writes a digest; None otherwise."""
+        block = config_dict.get("reflection")
+        if not block or kwargs.get("validate"):
+            return None
+        config = build_reflection_config(block)
+        if not config.enabled or getattr(config, "digest_call", None) is None:
+            return None
+        size = int(self.config.actor_rollout_ref.rollout.n)
+        if size < 2 or not kwargs.get("uid"):
+            raise ValueError(
+                f"a digest call reads a task's other attempts: rollout.n is {size}, uid {kwargs.get('uid')!r}"
+            )
+        return TaskGroup(Path(config_dict["log_dir"]) / "groups" / str(kwargs["uid"]), size, self.run_id)
 
     async def _run_interaction(self) -> dict:
         """The turn loop under the episode's wall-clock backstop."""
@@ -646,6 +721,9 @@ class UniAgentLoop(AgentLoopBase):
             config = build_reflection_config(config_dict["reflection"])
             if not config.enabled or validate:
                 return {}
+            group = getattr(self, "group", None)
+            if group is not None:
+                await self._publish_attempt(group, interaction_result)
             if config.failed_only and interaction_result.get("reward_score"):
                 return {}
             # hinting a trajectory whose eval never ran would teach against an unknown label
@@ -662,38 +740,14 @@ class UniAgentLoop(AgentLoopBase):
                 (m.get("content", "") for m in interaction_result.get("messages") or [] if m.get("role") == "user"),
                 "",
             )
-            trajectory = interaction_result.get("trajectory") or []
-            # the cap and stuck exits append a sentinel under the last real step's index
-            steps = {}
-            for step in trajectory:
-                steps.setdefault(step.step_idx, step)
-            termination = _termination(trajectory)
+            turns, termination, n_steps = _turn_table(interaction_result)
             # the row is masked, and the reflector would wait on the same engine
             if termination in config.skip_exit_reasons or termination in ENGINE_EXITS:
                 return {}
             resolved = bool(interaction_result.get("resolved"))
             outcome = (
                 f"resolved: {resolved} | reward: {interaction_result.get('reward_score')} | "
-                f"termination: {termination} | turns: {len(steps)}"
-            )
-            segments = interaction_result.get("segments") or [{"rollout_cache": interaction_result["rollout_cache"]}]
-            # a turn lives in exactly one segment's spans: the union ordered by step is the full turn table
-            turns = sorted(
-                (
-                    {
-                        "step": step_idx,
-                        "tokens": end - start,
-                        "response": steps[step_idx].response,
-                        "tools": [
-                            {"name": r.name, "action": r.action, "observation": r.observation}
-                            for r in steps[step_idx].tool_results
-                        ],
-                    }
-                    for segment in segments
-                    for step_idx, start, end in segment["rollout_cache"].get("turn_spans") or []
-                    if step_idx in steps
-                ),
-                key=lambda turn: turn["step"],
+                f"termination: {termination} | turns: {n_steps}"
             )
             if not turns:
                 return {}
@@ -707,6 +761,9 @@ class UniAgentLoop(AgentLoopBase):
             reflector = load_reflector(
                 self.chat_model, config, run_id=self.run_id,
                 record_path=self.output_dir / "reflection.jsonl.gz", identity=self.identity)
+            extra = {}
+            if group is not None:
+                extra["digest"] = await self._group_digest(group, reflector, task, gold, metrics)
             hints = await reflector.reflect_trajectory(
                 task=task,
                 turns=turns,
@@ -714,6 +771,7 @@ class UniAgentLoop(AgentLoopBase):
                 feedback=feedback,
                 outcome=outcome,
                 agent_patch=(interaction_result.get("reward_extra_info") or {}).get("agent_patch") or "",
+                **extra,
             )
             metrics.update({AGENT_METRIC_PREFIX + k: v for k, v in reflector.call_metrics().items()})
             metrics["reflect_empty"] = float(not hints)
@@ -726,6 +784,56 @@ class UniAgentLoop(AgentLoopBase):
             if reflector is not None:
                 metrics.update({AGENT_METRIC_PREFIX + k: v for k, v in reflector.call_metrics().items()})
             return {}
+
+    async def _publish_attempt(self, group: TaskGroup, interaction_result: dict) -> None:
+        """This attempt's outcome to its task's group, a success's turn table and patch with it; a sibling would
+        otherwise wait for it until the backstop, so a failed write is logged, never raised."""
+        self._group_published = True
+        try:
+            turns, termination, _ = _turn_table(interaction_result)
+            eval_completed = (interaction_result.get("metrics") or {}).get("eval_completed", 1.0) >= 1.0
+            success = (bool(interaction_result.get("reward_score")) and eval_completed
+                       and termination not in ENGINE_EXITS and bool(turns))
+            patch = (interaction_result.get("reward_extra_info") or {}).get("agent_patch") or ""
+            await group.publish(success, {"turns": turns, "agent_patch": patch} if success else None)
+        except Exception as e:
+            self.logger.critical(f"Could not publish the attempt to its task group: {e!r}")
+            try:
+                await group.publish(success=False)
+            except Exception:
+                pass
+
+    async def _publish_lost(self) -> None:
+        """An attempt that ends before publishing its outcome counts as no success, so its siblings stop waiting."""
+        if self.group is None or self._group_published:
+            return
+        self._group_published = True
+        try:
+            await self.group.publish(success=False)
+        except Exception as e:
+            self.logger.critical(f"Could not publish the lost attempt to its task group: {e!r}")
+
+    async def _group_digest(self, group: TaskGroup, reflector, task: str, gold: str, metrics: dict) -> str | None:
+        """The digest of this failure's task once every attempt has written its outcome, written by the first failure
+        to claim it; None when no attempt succeeded or the digest could not be had."""
+        wait_t0 = time.perf_counter()
+        successes, written, complete = await group.wait(GROUP_WAIT_S)
+        metrics[AGENT_METRIC_PREFIX + "reflect_group_wait"] = time.perf_counter() - wait_t0
+        metrics[AGENT_METRIC_PREFIX + "reflect_group_complete"] = float(complete)
+        metrics[AGENT_METRIC_PREFIX + "reflect_group_successes"] = float(len(successes))
+        if not complete:
+            self.logger.warning(f"Task group incomplete after {GROUP_WAIT_S:.0f} s: {written} of {group.size} attempts")
+        digest = None
+        if successes:
+            async def write() -> str:
+                attempts = await group.attempts(successes[:MAX_DIGEST_SUCCESSES])
+                return await reflector.write_digest(task=task, gold=gold, successes=attempts)
+
+            digest, error, wrote = await group.digest(write, DIGEST_WAIT_S)
+            if error:
+                self.logger.warning(f"Task digest {'not written' if wrote else 'not read'}: {error}")
+        metrics[AGENT_METRIC_PREFIX + "reflect_digest"] = float(bool(digest))
+        return digest
 
     async def _build_empty_agent_output(self, exit_reason: str, metrics: dict | None = None) -> AgentLoopOutput:
         self.chat_model.set_tools_schemas(self.tools_manager.tools_schemas)

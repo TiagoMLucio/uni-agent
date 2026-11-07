@@ -1,8 +1,9 @@
 """A reflector served by a hosted model instead of the policy: the OpenAI Responses API, or any
 OpenAI-compatible Chat Completions endpoint (``base_url``).
 
-One call per failed trace. The prompt is a labeling brief answered as a JSON object under a fixed
-schema: the v4 brief grades every turn and names the best ones, which become the hints in the
+One call per failed trace, after an optional digest call per task (``per: task``) that summarizes how up to three
+of the task's successful attempts succeeded, for every failure's call to read as ``{digest}``. The prompt is a
+labeling brief answered as a JSON object under a fixed schema: the v4 brief grades every turn and names the best ones, which become the hints in the
 model's order (``parse: hints``); the protocol brief names one turn and its hint (``parse:
 turn_hint``). The trajectory is rendered turn by turn as the agent generated it (its reasoning,
 any text and its tool call), each turn followed by the output of its call.
@@ -28,6 +29,12 @@ from uni_agent.tracing import register_langfuse_op, rollout_trace_op, rollout_tr
 #: the fields a brief may name; {first} and {last} are the attempt's turn range
 FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns", "first", "last", "facts",
                     "max_selected_turns"})
+#: the fields the digest call may name: the issue, the gold patch and the successful attempts it summarizes
+DIGEST_FIELDS = frozenset({"task", "gold", "successes"})
+#: the most successful attempts one digest reads; fewer when they do not fit the window together
+MAX_DIGEST_SUCCESSES = 3
+#: the ``{digest}`` of a failure whose task had no successful attempt, or whose digest could not be written
+NO_DIGEST = "(none)"
 #: the fields the writer may name: only the turns before the placed one, and the placement's diagnosis
 WRITER_FIELDS = frozenset({"task", "turn", "turns_before", "mistake", "type", "type_rule", "seen_before", "gold"})
 #: a high-effort read of a 150-turn trace takes minutes
@@ -131,10 +138,13 @@ GROUPED_NOTES_SCHEMA = {"type": "object", "additionalProperties": False, "requir
                         "properties": {"notes": {"type": "array", "items": {
                             "type": "object", "additionalProperties": False, "required": list(_GROUPED_NOTE),
                             "properties": _GROUPED_NOTE}}, "no_note_reason": _STR}}
+DIGEST_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["digest"],
+                 "properties": {"digest": _STR}}
 SCHEMAS = {"hints": ("hint_positions", ANSWER_SCHEMA), "turn_hint": ("hint_turn", TURN_HINT_SCHEMA),
            "placement": ("hint_placement", PLACEMENT_SCHEMA), "note": ("hint_note", NOTE_SCHEMA),
            "check": ("hint_note", NOTE_SCHEMA), "placed_checks": ("hint_notes", PLACED_CHECKS_SCHEMA),
-           "placed_notes": ("hint_notes", PLACED_NOTES_SCHEMA), "grouped_notes": ("hint_notes", GROUPED_NOTES_SCHEMA)}
+           "placed_notes": ("hint_notes", PLACED_NOTES_SCHEMA), "grouped_notes": ("hint_notes", GROUPED_NOTES_SCHEMA),
+           "digest": ("success_digest", DIGEST_SCHEMA)}
 
 
 def fence(text: str, lang: str = "") -> str:
@@ -199,9 +209,32 @@ class ApiReflectionConfig(BaseReflectionConfig):
                     out.append(real)
         return out
 
+    @property
+    def digest_call(self) -> CallSpec | None:
+        return next((call for call in self.calls if call.per == "task"), None)
+
+    @property
+    def trace_calls(self) -> list[CallSpec]:
+        return [call for call in self.calls if call.per != "task"]
+
     @model_validator(mode="after")
     def _check_calls(self):
-        parses = [call.parse for call in self.calls]
+        digest = self.digest_call
+        if digest is not None:
+            if self.calls[0] is not digest or sum(call.per == "task" for call in self.calls) > 1:
+                raise ValueError("the digest call is the api reflector's first call and its only per-task one")
+            if digest.parse != "digest":
+                raise ValueError(f"call {digest.id!r}: a per-task call parses its answer as digest")
+            unknown = _fields(digest.user) - DIGEST_FIELDS
+            if unknown:
+                raise ValueError(f"call {digest.id!r} references fields it cannot be given: {sorted(unknown)}")
+            if not self.failed_only:
+                raise ValueError("a digest call serves the failures' reflections: failed_only must stay on")
+            if not any("digest" in _fields(call.user) for call in self.trace_calls):
+                raise ValueError(f"call {digest.id!r} writes a digest no call names as {{digest}}")
+        parses = [call.parse for call in self.trace_calls]
+        if "digest" in parses or any(call.per != "trace" for call in self.trace_calls):
+            raise ValueError("the api reflector's calls after the digest are per-trace calls")
         if len(parses) == 2:
             if parses[0] != "placement" or parses[1] not in ("note", "check"):
                 raise ValueError("the api reflector's two calls are a placement, then a note or a check")
@@ -215,7 +248,9 @@ class ApiReflectionConfig(BaseReflectionConfig):
             raise ValueError("the api reflector makes one call per trace, or a placement and a writer call")
         if self.plan_credentials and self.base_url is not None:
             raise ValueError("ChatGPT plan calls go to the OpenAI Responses API: plan_credentials needs no base_url")
-        for call, fields in zip(self.calls, allowed, strict=True):
+        if digest is not None:
+            allowed = tuple(fields | {"digest"} for fields in allowed)
+        for call, fields in zip(self.trace_calls, allowed, strict=True):
             unknown = _fields(call.user) - fields
             if unknown:
                 raise ValueError(f"call {call.id!r} references fields it cannot be given: {sorted(unknown)}")
@@ -236,12 +271,13 @@ class ApiReflector(AbstractReflector):
 
     @rollout_trace_op
     async def reflect_trajectory(
-        self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = "", agent_patch: str = ""
+        self, task: str, turns: list[dict], gold: str, feedback: str, outcome: str = "", agent_patch: str = "",
+        digest: str | None = None,
     ) -> dict[int, str]:
         from openai import AsyncOpenAI, BadRequestError, RateLimitError
 
         cfg = self.config
-        first = cfg.calls[0]
+        first = cfg.trace_calls[0]
         issue = ISSUE.search(task or "")
         attempt = (fence(self._clip(patch_view(agent_patch, gold), cfg.max_patch_chars), "diff") if agent_patch
                    else "(empty: no change was extracted from the attempt)")
@@ -257,6 +293,8 @@ class ApiReflector(AbstractReflector):
         }
         if "facts" in _fields(first.user):
             values["facts"] = attempt_facts(turns, agent_patch, gold)
+        if "digest" in _fields(first.user):
+            values["digest"] = digest or NO_DIGEST
 
         def render_user(obs_cap, resp_cap):
             return first.user.format(**values, turns=self._render_attempt(turns, obs_cap, resp_cap))
@@ -272,7 +310,7 @@ class ApiReflector(AbstractReflector):
             placed = await ask(first, render_user, lambda text: self._use_placement(text, turns))
             if not placed or placed["turn"] is None:
                 return {}
-            writer, step = cfg.calls[1], placed["turn"]
+            writer, step = cfg.trace_calls[1], placed["turn"]
             before = [turn for turn in turns if turn["step"] < step]
             filled = {"task": values["task"], "gold": values["gold"], "turn": str(step), "mistake": placed["mistake"],
                       "type": placed["type"], "type_rule": TYPE_RULES[placed["type"]], "seen_before": placed["seen_before"]}
@@ -282,6 +320,56 @@ class ApiReflector(AbstractReflector):
                                           or "(nothing yet)")
 
             return await ask(writer, render_writer, lambda text: self._use_note(text, turns, task, step, writer.parse)) or {}
+
+    async def write_digest(self, task: str, gold: str, successes: list[dict]) -> str:
+        """The digest call over up to MAX_DIGEST_SUCCESSES successful attempts (each ``{"turns", "agent_patch"}``),
+        one fewer each time they do not fit the window together. Raises ``ReflectionFailed`` when the call fails or
+        not even one attempt fits."""
+        from openai import AsyncOpenAI, BadRequestError, RateLimitError
+
+        cfg = self.config
+        call = cfg.digest_call
+        if call is None or not successes:
+            raise ReflectionFailed("digest: no digest call, or no successful attempt to summarize")
+        issue = ISSUE.search(task or "")
+        gold = fence(self._clip(gold, cfg.max_patch_chars), "diff") if cfg.include_gold and gold else "(not available)"
+        values = {"task": issue.group(1).strip() if issue else task, "gold": gold}
+        deadline = time.monotonic() + WALL_S
+        async with AsyncOpenAI(api_key=os.environ.get(cfg.api_key_env), base_url=cfg.base_url,
+                               timeout=TIMEOUT_S, max_retries=MAX_RETRIES) as client:
+            for count in range(min(len(successes), MAX_DIGEST_SUCCESSES), 0, -1):
+                def render_user(obs_cap, resp_cap, chosen=successes[:count]):
+                    return call.user.format(**values, successes=self._render_successes(chosen, obs_cap, resp_cap))
+
+                try:
+                    text = await self._ask(client, BadRequestError, RateLimitError, call, render_user,
+                                           self._use_digest, deadline)
+                except ReflectionFailed as exc:
+                    if count > 1 and "over budget" in str(exc):
+                        continue
+                    raise
+                if not text:
+                    raise ReflectionFailed("digest: no usable reply")
+                self._counts["reflect_digest_attempts"] = count
+                return text
+        raise ReflectionFailed("digest: render over budget at every shrink level")
+
+    def _use_digest(self, text: str):
+        answer = self._extract_json_object(text, strict=False)
+        digest = answer.get("digest") if isinstance(answer, dict) else None
+        if not isinstance(digest, str) or not digest.strip():
+            return None, {"digest": answer}
+        return digest.strip(), {"digest": digest}
+
+    def _render_successes(self, successes: list[dict], obs_cap: int | None, resp_cap: int | None) -> str:
+        parts = []
+        for k, attempt in enumerate(successes, 1):
+            patch = attempt.get("agent_patch") or ""
+            patch = fence(self._clip(patch, self.config.max_patch_chars), "diff") if patch else "(empty)"
+            turns = self._render_attempt(attempt.get("turns") or [], obs_cap, resp_cap)
+            parts.append(f"<successful_attempt S{k}>\n{turns}\n\n### Final patch of S{k}\n{patch}\n"
+                         f"</successful_attempt S{k}>")
+        return "\n\n".join(parts)
 
     async def _ask(self, client, bad_request_error, rate_limit_error, call, render_user, use, deadline):
         """One call through the render ladder. ``use`` turns a reply into its result and the fields
@@ -499,9 +587,13 @@ class ApiReflector(AbstractReflector):
                 await asyncio.sleep(wait)
 
     def call_metrics(self) -> dict[str, float]:
-        return {**super().call_metrics(), **{key: float(self._counts[key]) for key in (
+        out = {**super().call_metrics(), **{key: float(self._counts[key]) for key in (
             *USAGE, "reflect_leaky_hints", "reflect_rate_limited", "reflect_unsafe_hints", "reflect_plan_calls",
             "reflect_plan_backup_calls", "reflect_plan_fallbacks", "reflect_plan_waits")}}
+        # only the trajectory that wrote its task's digest reports how many attempts it read
+        if self._counts["reflect_digest_attempts"]:
+            out["reflect_digest_attempts"] = float(self._counts["reflect_digest_attempts"])
+        return out
 
     def _tally(self, usage: dict[str, int]) -> dict[str, int]:
         for key, value in usage.items():

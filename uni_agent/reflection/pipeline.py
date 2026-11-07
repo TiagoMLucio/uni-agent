@@ -22,7 +22,8 @@ from uni_agent.tracing import register_langfuse_op, rollout_trace_op
 
 TURNS_MARKER = "FINAL_TURNS_JSON:"
 #: the answers only the api reflector parses
-API_PARSES = frozenset({"turn_hint", "placement", "note", "check", "placed_checks", "placed_notes", "grouped_notes"})
+API_PARSES = frozenset({"turn_hint", "placement", "note", "check", "placed_checks", "placed_notes", "grouped_notes",
+                        "digest"})
 
 TRACE_FIELDS = frozenset({"task", "outcome", "gold", "agent_patch", "feedback", "turns",
                          "candidates", "delta"})
@@ -65,14 +66,16 @@ class CallSpec(BaseModel):
     id: str
     system: str
     user: str
-    per: Literal["trace", "turn"] = "trace"
+    #: ``task`` is the api reflector's digest call: once per task, over its successful attempts
+    per: Literal["trace", "turn", "task"] = "trace"
     #: ``turn_hint`` is the api reflector's answer naming one turn and its hint; ``placement`` then
     #: ``note`` or ``check`` are its two calls, the first naming the turn, the second writing its hint;
     #: ``placed_checks`` is its one call that places notes on several turns and writes each one's check,
     #: ``placed_notes`` a call that places them and writes only each note, which is the hint;
-    #: ``grouped_notes`` the same with each note labelled by its prompt's group and case and the evidence before it
+    #: ``grouped_notes`` the same with each note labelled by its prompt's group and case and the evidence before it;
+    #: ``digest`` the per-task call's summary of the successful attempts
     parse: Literal["text", "turns", "hints", "turn_hint", "placement", "note", "check", "placed_checks",
-                   "placed_notes", "grouped_notes"] = "text"
+                   "placed_notes", "grouped_notes", "digest"] = "text"
     #: ``delete_only`` refuses a reply that introduces a word the draft did not have. The stage
     #: sees the draft, which was written with the patch, so an unconstrained rewrite can restate
     #: privileged content the stage itself never saw.
@@ -90,6 +93,8 @@ class PipelineReflectionConfig(BaseReflectionConfig):
         if self.calls[-1].parse != "hints":
             raise ValueError("the last call must have parse=hints, or the pipeline yields none")
         for index, call in enumerate(self.calls):
+            if call.per == "task":
+                raise ValueError(f"call {call.id!r}: per=task is the api reflector's digest call")
             allowed = set(TRACE_FIELDS)
             if index:
                 allowed.add(PREV_FIELD)
