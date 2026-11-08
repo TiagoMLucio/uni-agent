@@ -624,7 +624,7 @@ class UniAgentLoop(AgentLoopBase):
             self.setup_attempts = attempt + 1
             try:
                 async with asyncio.timeout(setup_timeout):
-                    await self.env.start()
+                    await self.env.start(network_jail=True)
 
                     # tools schemas should be visible to the model
                     # to generate correct tool call format in response.

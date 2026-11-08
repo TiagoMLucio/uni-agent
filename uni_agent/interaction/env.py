@@ -214,11 +214,13 @@ class AgentEnv:
         self.attached_at_prompt: bool = False
 
     @auto_await
-    async def start(self, max_retries: int = 5) -> None:
-        """Start the environment"""
+    async def start(self, max_retries: int = 5, network_jail: bool = False) -> None:
+        """Start the environment. ``network_jail`` fills the deployment command's ``{jail}`` with the network
+        jail (``uni_agent.deployment.netjail``); only the agent's own sandbox asks for it, never a grading one."""
 
         self.logger.info("Beginning environment startup...")
 
+        self.deployment.network_jail = network_jail
         await self.deployment.start(max_retries=max_retries)
         self.logger.info("Runtime initialized")
         # each step logs on entry: a stalled call used to leave a silent gap between

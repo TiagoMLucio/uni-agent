@@ -60,6 +60,7 @@ def test_behaviour_metrics_count_outcomes_edits_repeats_and_the_idle_tail():
         "format_errors": 1.0,
         # nothing here reached for a destructive git subcommand
         "git_refusals": 0.0,
+        "net_fetch_calls": 0.0,
         "acting_turns": 8.0,
         # turn 3 repeats turn 1's edit, turn 6 turn 5's command
         "repeated_turns": 2.0,
@@ -98,3 +99,25 @@ def test_an_edit_the_loop_never_ran_is_an_attempt_but_not_an_editor_refusal():
     assert (metrics["edit_attempts"], metrics["edit_calls_run"], metrics["edit_failures"]) == (1.0, 0.0, 0.0)
     assert metrics["tool_syntax_error"] == 1.0
     assert (metrics["source_edited"], "idle_turns_after_edit" in metrics) == (0.0, False)
+
+
+def test_net_fetch_calls_count_shell_fetches_of_code_but_not_local_urls_or_file_text():
+    fetches = [
+        "pip download cantools==0.21.0 --no-deps -d /tmp/pkg && unzip -l /tmp/pkg/*.whl",
+        "curl -s https://raw.githubusercontent.com/cantools/cantools/main/src/cantools/conversion.py",
+        'curl -s "https://api.github.com/repos/django/django/pulls" | head',
+        "wget -q https://example.org/archive.tar.gz",
+        "git clone --depth 1 https://github.com/benjaminp/six /tmp/six",
+        "python -c \"import urllib.request as u; u.urlopen('https://pypi.org/simple/six/')\"",
+    ]
+    local = [
+        "curl -s http://127.0.0.1:8000/health",
+        "python -c \"import requests; requests.get('http://localhost:5000/')\"",
+        "pytest tests/test_http.py -q",
+        "grep -rn 'url' setup.py",
+    ]
+    file_text = ("str_replace_editor create --path /testbed/fetch.py "
+                 "--file_text 'import urllib.request; urllib.request.urlopen(\"https://pypi.org\")'")
+    trajectory = [step(i + 1, call("execute_bash", action)) for i, action in enumerate(fetches + local)]
+    trajectory.append(step(len(trajectory) + 1, call("str_replace_editor", file_text, "File created successfully at: x")))
+    assert behaviour_metrics(trajectory)["net_fetch_calls"] == float(len(fetches))

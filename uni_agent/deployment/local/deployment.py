@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 import shlex
 import shutil
@@ -18,6 +19,7 @@ from swerex.exceptions import DeploymentNotStartedError
 from swerex.runtime.abstract import Command, CreateBashSessionRequest, IsAliveResponse, UploadRequest
 
 from uni_agent.async_logging import get_logger
+from uni_agent.deployment import netjail
 from uni_agent.deployment.config import LocalDeploymentConfig
 from uni_agent.deployment.remote_runtime import RemoteRuntime as LocalRuntime
 from uni_agent.deployment.remote_runtime import RemoteRuntimeConfig as LocalRuntimeConfig
@@ -167,6 +169,18 @@ def _is_running_in_container() -> bool:
 
 
 def _pick_free_port() -> int:
+    """A free port above the kernel's ephemeral range, where a jailed sandbox cannot connect to it."""
+    try:
+        first = netjail.ephemeral_range()[1] + 1
+    except (OSError, ValueError):
+        first = 65536
+    for port in random.sample(range(first, 65536), min(64, max(0, 65536 - first))):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("", port))
+            except OSError:
+                continue
+            return port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -223,6 +237,8 @@ class LocalDeployment(AbstractDeployment):
         self._stopped = False
         self.startup_timings: dict[str, float] = {}
         self._memory_guard: asyncio.Task | None = None
+        # set by the agent's own sandbox before start; a grading one keeps the network
+        self.network_jail = False
 
     memory_guard_interval = 1.0
 
@@ -352,7 +368,7 @@ class LocalDeployment(AbstractDeployment):
         return "http://127.0.0.1", published_port
 
     def _format_command(self, token: str, port: int) -> str:
-        return self._config.command.format(token=token, port=port)
+        return self._config.command.format(token=token, port=port, jail=netjail.jail_prefix() if self.network_jail else "")
 
     def _build_run_command(self, container_name: str, published_port: int, command: str) -> list[str]:
         network = self._config.network or self._get_current_container_network()

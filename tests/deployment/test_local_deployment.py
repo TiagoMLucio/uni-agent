@@ -124,6 +124,27 @@ def test_format_command_supports_token_and_port_placeholders():
     assert deployment._format_command(token="secret", port=4567) == "server --port 4567 --auth-token secret"
 
 
+def test_format_command_fills_the_network_jail_only_for_a_sandbox_that_asks():
+    deployment = LocalDeployment(
+        run_id="test",
+        type="local",
+        container_runtime="apptainer",
+        command="JPY=python3; exec {jail}server --port {port} --auth-token {token}",
+    )
+
+    assert deployment._format_command(token="t", port=1) == "JPY=python3; exec server --port 1 --auth-token t"
+    deployment.network_jail = True
+    jailed = deployment._format_command(token="t", port=1)
+    assert jailed.startswith('JPY=python3; exec "$JPY" -c "import base64;exec(base64.b64decode(')
+    assert jailed.endswith("-- server --port 1 --auth-token t")
+
+
+def test_the_server_port_is_above_the_ephemeral_range_a_jailed_sandbox_may_reach(monkeypatch):
+    monkeypatch.setattr(local_deployment.netjail, "ephemeral_range", lambda: (32768, 60999))
+
+    assert all(local_deployment._pick_free_port() > 60999 for _ in range(20))
+
+
 def test_docker_command_keeps_published_to_runtime_port_mapping():
     deployment = LocalDeployment(
         run_id="test",

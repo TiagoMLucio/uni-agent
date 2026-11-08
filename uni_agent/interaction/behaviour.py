@@ -18,6 +18,17 @@ ARG_PATH_RE = re.compile(r"--path\s+(\S+)")
 CMD_RE = re.compile(r"str_replace_editor\s+(\w+)")
 EDIT_CMDS = frozenset({"str_replace", "insert", "create"})
 
+#: A command that fetches code from the network: a package index, GitHub, or any non-local URL fetched by
+#: curl, wget, git clone, urlopen or requests.get. The sandbox's network jail refuses these.
+_LOCAL = r"(?!localhost|127\.|0\.0\.0\.0|\[::1\])"
+NET_FETCH_RE = re.compile(
+    r"pip3?\s+download|raw\.githubusercontent\.com|api\.github\.com|codeload\.github\.com"
+    r"|github\.com/[\w.-]+/[\w.-]+/(?:blob|raw|archive|tarball|zipball|pull|issues|commit)"
+    r"|files\.pythonhosted\.org|pypi\.org/(?:pypi|simple|project)"
+    rf"|\b(?:curl|wget)\b[^\n|;&]*https?://{_LOCAL}|git\s+clone\s[^\n]*https?://"
+    rf"|(?:urlopen|requests\.get)\(\s*['\"]https?://{_LOCAL}"
+)
+
 #: A refused edit prints its reason and exits 0 exactly like an applied one, so it is legible
 #: only as the absence of what an applied one prints.
 EDIT_DONE = (" has been edited. ", "File created successfully at: ")
@@ -57,6 +68,9 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
 
     ``git_refusals`` is out of ``tool_calls``: blocking ``checkout`` takes a move the policy makes
     today, so whether it fires has to be measured rather than assumed.
+
+    ``net_fetch_calls`` counts the shell calls that try to fetch code from the network, refused or not, so a
+    policy that keeps trying is visible.
     """
     steps: dict[int, StepOutput] = {}
     for step in trajectory:
@@ -65,7 +79,8 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
 
     out = dict.fromkeys(
         ("tool_calls", "edit_attempts", "edit_calls_run", "edit_failures", "format_errors",
-         "acting_turns", "repeated_turns", "source_edit_turns", "source_edited", "git_refusals"), 0
+         "acting_turns", "repeated_turns", "source_edit_turns", "source_edited", "git_refusals",
+         "net_fetch_calls"), 0
     )
     out.update({f"tool_{status}": 0 for status in get_args(ToolStatus)})
     seen: set[int] = set()
@@ -89,6 +104,8 @@ def behaviour_metrics(trajectory: list["StepOutput"]) -> dict[str, float]:
             # what the guard refused, not what merely names git (is_input keystrokes, editor file text)
             if call.status == "syntax_error" and call.observation.startswith(GIT_REFUSAL_PREFIX):
                 out["git_refusals"] += 1
+            if edit_command(call.action) is None and NET_FETCH_RE.search(call.action):
+                out["net_fetch_calls"] += 1
             if edit_command(call.action) not in EDIT_CMDS:
                 continue
             out["edit_attempts"] += 1

@@ -15,6 +15,7 @@ from swerex.exceptions import DeploymentNotStartedError
 from swerex.runtime.abstract import Command, CreateBashSessionRequest, IsAliveResponse, UploadRequest
 
 from uni_agent.async_logging import get_logger
+from uni_agent.deployment import netjail
 from uni_agent.deployment.config import SshPodmanDeploymentConfig
 from uni_agent.deployment.remote_runtime import RemoteRuntime as LocalRuntime
 from uni_agent.deployment.remote_runtime import RemoteRuntimeConfig as LocalRuntimeConfig
@@ -165,6 +166,8 @@ class SshPodmanDeployment(AbstractDeployment):
         self._local_port: int | None = None
         self._remote_port: int | None = None
         self._stopped = False
+        # set by the agent's own sandbox before start; a grading one keeps the network
+        self.network_jail = False
 
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
@@ -228,7 +231,9 @@ class SshPodmanDeployment(AbstractDeployment):
     async def start(self, max_retries: int = 5) -> None:
         token = str(uuid.uuid4())
         name = f"uni-agent-{_sanitize(self.run_id)}"
-        command = self._config.command.format(token=token, port=self._config.runtime_port)
+        command = self._config.command.format(
+            token=token, port=self._config.runtime_port, jail=netjail.jail_prefix() if self.network_jail else ""
+        )
         last_error: Exception | None = None
         for attempt in range(max_retries):
             self._stopped = False
