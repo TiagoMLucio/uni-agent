@@ -504,17 +504,19 @@ class UniAgentLoop(AgentLoopBase):
         return await self.convert_to_agent_output(interaction_result)
 
     def _task_group(self, config_dict: dict, kwargs: dict) -> TaskGroup | None:
-        """The meeting point of this attempt's task when its reflector writes a digest; None otherwise."""
+        """The meeting point of this attempt's task when its reflector writes a digest or reflects all-fail tasks only;
+        None otherwise."""
         block = config_dict.get("reflection")
         if not block or kwargs.get("validate"):
             return None
         config = build_reflection_config(block)
-        if not config.enabled or getattr(config, "digest_call", None) is None:
+        if not config.enabled or (getattr(config, "digest_call", None) is None and not config.all_fail_only):
             return None
         size = int(self.config.actor_rollout_ref.rollout.n)
         if size < 2 or not kwargs.get("uid"):
             raise ValueError(
-                f"a digest call reads a task's other attempts: rollout.n is {size}, uid {kwargs.get('uid')!r}"
+                f"a digest call or all_fail_only reads a task's other attempts: rollout.n is {size}, "
+                f"uid {kwargs.get('uid')!r}"
             )
         return TaskGroup(Path(config_dict["log_dir"]) / "groups" / str(kwargs["uid"]), size, self.run_id)
 
@@ -755,15 +757,22 @@ class UniAgentLoop(AgentLoopBase):
 
             if should_break("reflection"):
                 breakpoint()
-            # the health fractions average only over rows that carry a key, so the 0 is written too
             metrics = interaction_result.setdefault("metrics", {})
+            successes = None
+            if group is not None:
+                successes = await self._group_wait(group, metrics)
+                if config.all_fail_only:
+                    metrics[AGENT_METRIC_PREFIX + "reflect_skipped"] = float(bool(successes))
+                    if successes:
+                        return {}
+            # the health fractions average only over rows that carry a key, so the 0 is written too
             metrics["reflect_failed"] = 0.0
             reflector = load_reflector(
                 self.chat_model, config, run_id=self.run_id,
                 record_path=self.output_dir / "reflection.jsonl.gz", identity=self.identity)
             extra = {}
-            if group is not None:
-                extra["digest"] = await self._group_digest(group, reflector, task, gold, metrics)
+            if group is not None and getattr(config, "digest_call", None) is not None:
+                extra["digest"] = await self._group_digest(group, reflector, task, gold, successes, metrics)
             hints = await reflector.reflect_trajectory(
                 task=task,
                 turns=turns,
@@ -813,9 +822,8 @@ class UniAgentLoop(AgentLoopBase):
         except Exception as e:
             self.logger.critical(f"Could not publish the lost attempt to its task group: {e!r}")
 
-    async def _group_digest(self, group: TaskGroup, reflector, task: str, gold: str, metrics: dict) -> str | None:
-        """The digest of this failure's task once every attempt has written its outcome, written by the first failure
-        to claim it; None when no attempt succeeded or the digest could not be had."""
+    async def _group_wait(self, group: TaskGroup, metrics: dict) -> list:
+        """This failure's task's successes once every attempt has written its outcome, or at the backstop."""
         wait_t0 = time.perf_counter()
         successes, written, complete = await group.wait(GROUP_WAIT_S)
         metrics[AGENT_METRIC_PREFIX + "reflect_group_wait"] = time.perf_counter() - wait_t0
@@ -823,6 +831,13 @@ class UniAgentLoop(AgentLoopBase):
         metrics[AGENT_METRIC_PREFIX + "reflect_group_successes"] = float(len(successes))
         if not complete:
             self.logger.warning(f"Task group incomplete after {GROUP_WAIT_S:.0f} s: {written} of {group.size} attempts")
+        return successes
+
+    async def _group_digest(
+        self, group: TaskGroup, reflector, task: str, gold: str, successes: list, metrics: dict
+    ) -> str | None:
+        """The digest of this failure's task, written by the first failure to claim it; None when no attempt
+        succeeded or the digest could not be had."""
         digest = None
         if successes:
             async def write() -> str:

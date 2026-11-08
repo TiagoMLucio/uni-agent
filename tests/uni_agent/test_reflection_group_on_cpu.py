@@ -205,7 +205,7 @@ def attempt(tmp_path, name, reward, log, size=3):
         env=types.SimpleNamespace(privileged_context="gold"), chat_model=None, run_id=name, output_dir=tmp_path / name,
         identity={}, logger=types.SimpleNamespace(critical=print, warning=print),
         group=TaskGroup(tmp_path / "groups" / "uid", size, name), _group_published=False)
-    for method in ("_publish_attempt", "_group_digest"):
+    for method in ("_publish_attempt", "_group_wait", "_group_digest"):
         setattr(loop, method, types.MethodType(getattr(UniAgentLoop, method), loop))
     result = {
         "reward_score": reward, "resolved": bool(reward), "metrics": {},
@@ -216,13 +216,13 @@ def attempt(tmp_path, name, reward, log, size=3):
     return loop, result
 
 
-def run_group(monkeypatch, tmp_path, rewards):
+def run_group(monkeypatch, tmp_path, rewards, **over):
     from uni_agent import agent_loop
     from uni_agent.agent_loop import UniAgentLoop
 
     log = []
     monkeypatch.setattr(agent_loop, "load_reflector", lambda *a, **k: StubReflector(log))
-    block = digest_config().model_dump()
+    block = digest_config(**over).model_dump()
     attempts = [attempt(tmp_path, f"a{i}", r, log, size=len(rewards)) for i, r in enumerate(rewards)]
 
     async def go():
@@ -242,6 +242,33 @@ def test_failures_wait_for_their_task_and_read_one_digest(monkeypatch, tmp_path)
         assert failure["metrics"]["agent/reflect_group_successes"] == 1.0
         assert failure["metrics"]["agent/reflect_digest"] == 1.0
     assert "agent/reflect_digest" not in results[1]["metrics"]
+
+
+def test_all_fail_only_leaves_the_failures_of_a_task_with_a_success_unreflected(monkeypatch, tmp_path):
+    hints, results, log = run_group(monkeypatch, tmp_path, [0.0, 1.0, 0.0], all_fail_only=True)
+    assert hints == [{}, {}, {}] and log == [], "no digest and no notes for a task that has a success"
+    for failure in (results[0], results[2]):
+        assert failure["metrics"]["agent/reflect_skipped"] == 1.0
+        assert "reflect_failed" not in failure["metrics"], "a skipped failure is not counted as reflected"
+    hints, results, log = run_group(monkeypatch, tmp_path / "all_fail", [0.0, 0.0], all_fail_only=True)
+    assert hints == [{0: "a note"}] * 2 and log == [("notes", None)] * 2
+    assert all(r["metrics"]["agent/reflect_skipped"] == 0.0 for r in results)
+
+
+def test_all_fail_only_meets_its_task_without_a_digest_call_and_needs_failed_only(tmp_path):
+    from uni_agent.agent_loop import UniAgentLoop
+
+    notes_only = [dict(NOTES_CALL, user="{task}|{turns}|{gold}")]
+    loop = types.SimpleNamespace(
+        config=types.SimpleNamespace(actor_rollout_ref=types.SimpleNamespace(rollout=types.SimpleNamespace(n=8))),
+        run_id="r")
+    on = digest_config(calls=notes_only, all_fail_only=True).model_dump()
+    assert isinstance(UniAgentLoop._task_group(loop, {"reflection": on, "log_dir": str(tmp_path)}, {"uid": "u"}),
+                      TaskGroup)
+    off = digest_config(calls=notes_only).model_dump()
+    assert UniAgentLoop._task_group(loop, {"reflection": off, "log_dir": str(tmp_path)}, {"uid": "u"}) is None
+    with pytest.raises(ValueError, match="failed_only must stay on"):
+        digest_config(calls=notes_only, all_fail_only=True, failed_only=False)
 
 
 def test_a_task_with_no_success_is_reflected_without_a_digest(monkeypatch, tmp_path):

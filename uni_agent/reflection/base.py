@@ -16,7 +16,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from uni_agent.async_logging import get_logger
 from uni_agent.interaction.model import MaxTokenExceededError
@@ -74,6 +74,8 @@ class BaseReflectionConfig(BaseModel):
     name: str
     enabled: bool = False
     failed_only: bool = True
+    #: reflect a failure only when every attempt at its task failed: the task's attempts (rollout.n) are awaited first
+    all_fail_only: bool = False
     #: terminations (`stuck`, `max_step_limit`, ...) left unhinted; skips the reflector calls too
     skip_exit_reasons: list[str] = []
     #: apply_chat_template kwargs for reflector calls only; None inherits the rollout's.
@@ -106,6 +108,12 @@ class BaseReflectionConfig(BaseModel):
     shrink_ladder: list[tuple[int | None, int | None]] = [(3_800, None), (3_800, 3_800)]
     #: extra draws on the same rung when a reply is unusable, before the render shrinks
     redraws_per_rung: int = Field(default=1, ge=0)
+
+    @model_validator(mode="after")
+    def _check_all_fail_only(self):
+        if self.all_fail_only and not self.failed_only:
+            raise ValueError("all_fail_only reflects a task's failures: failed_only must stay on")
+        return self
 
 
 class AbstractReflector(ABC):
