@@ -76,7 +76,7 @@ async def check_row(row: dict, base_config: dict, validate: bool, log_dir: Path 
         record.update({
             key: result.get(key)
             for key in ("resolved", "eval_completed", "patch_apply_failed", "empty_patch", "eval_error",
-                        "eval_execution_time")
+                        "eval_execution_time", "verifier_stdout")
         })
         record["feedback"] = (result.get("reward_extra_info") or {}).get("feedback")
         if result.get("resolved"):
