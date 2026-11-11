@@ -10,7 +10,7 @@ from uni_agent.reward.diagnostic_feedback import load_capture
 SHIM = "try:\n    from {impl} import *\nexcept Exception:\n    pass\n"
 
 
-async def install_capture(env, context: dict, value_chars: int = 4096):
+async def install_capture(env, context: dict, value_chars: int = 4096, root: str = "/testbed"):
     suffix = uuid.uuid4().hex
     module = f"uniagent_feedback_{suffix}"
     # a directory of its own and no empty PYTHONPATH entry: neither /tmp nor the tests' cwd may become importable
@@ -26,7 +26,7 @@ async def install_capture(env, context: dict, value_chars: int = 4096):
         f'export PYTHONPATH="{home}${{PYTHONPATH:+:$PYTHONPATH}}"',
         f"export UNI_AGENT_FEEDBACK_PATH={shlex.quote(str(report))}",
         f"export UNI_AGENT_FEEDBACK_CONTEXT={shlex.quote(str(metadata))}",
-        "export UNI_AGENT_FEEDBACK_ROOT=/testbed",
+        f"export UNI_AGENT_FEEDBACK_ROOT={shlex.quote(root)}",
         f"export UNI_AGENT_FEEDBACK_VALUE_CHARS={value_chars}",
         f'export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} -p {module}"',
     ]
