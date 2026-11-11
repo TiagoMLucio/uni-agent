@@ -975,7 +975,10 @@ class UniAgentLoop(AgentLoopBase):
             # dropped events. Written on the training filesystem, never in the agent's sandbox.
             "identity": getattr(self, "identity", {}),
             "reward_extra_info": interaction_result.get("reward_extra_info") or {},
-            "gold_patch": getattr(self.env, "privileged_context", "") or "",
+            # the reflector's reference fix, by the same fallback
+            "gold_patch": getattr(self.env, "privileged_context", "")
+            or (getattr(getattr(self, "reward_spec", None), "metadata", None) or {}).get("patch")
+            or "",
             "turn_hints": interaction_result.get("turn_hints") or {},
         }
         # absent, not empty, on a run that did not ask for log-probs: there is nothing to say
