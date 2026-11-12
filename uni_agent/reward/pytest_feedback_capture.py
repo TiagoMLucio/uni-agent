@@ -21,6 +21,7 @@ _STAMPS = {}
 _SOURCE_HISTORY = {}
 _SENT = set()
 _ROOT = None
+_PREFIX = ""
 _FILE = None
 _VALUE_CHARS = 4096
 _ACTIVE_CONFIG = None
@@ -217,8 +218,14 @@ def pytest_configure(config):
         _emit(capture_error=f"Feedback capture disabled: {type(exc).__name__}: {exc}")
 
 
+def _node(nodeid):
+    """A nodeid named from the evaluated tree's root, as the graded test lists name it: pytest names tests from its
+    rootdir, a subdirectory when the repository keeps its pytest configuration there (tests/pytest.ini)."""
+    return f"{_PREFIX}/{nodeid}" if _PREFIX and nodeid else nodeid
+
+
 def _configure(config):
-    global _ROOT, _FILE, _VALUE_CHARS, _ACTIVE_CONFIG
+    global _ROOT, _PREFIX, _FILE, _VALUE_CHARS, _ACTIVE_CONFIG
     config_root = Path(str(getattr(config, "rootpath", getattr(config, "rootdir", Path.cwd())))).resolve()
     root = Path(os.environ.get("UNI_AGENT_FEEDBACK_ROOT", str(config_root))).resolve()
     try:
@@ -233,6 +240,8 @@ def _configure(config):
         return
     _ACTIVE_CONFIG = config
     _ROOT = root
+    prefix = config_root.relative_to(root).as_posix()
+    _PREFIX = "" if prefix == "." else prefix
     _FILE = os.environ.get("UNI_AGENT_FEEDBACK_PATH")
     _VALUE_CHARS = int(os.environ.get("UNI_AGENT_FEEDBACK_VALUE_CHARS", "4096"))
     # Full assertion details without setting CI/BUILD_NUMBER, which tests may themselves inspect.
@@ -266,7 +275,7 @@ def pytest_runtest_makereport(item, call):
         return
     try:
         event = {
-            "nodeid": item.nodeid,
+            "nodeid": _node(item.nodeid),
             "phase": report.when,
             "outcome": report.outcome,
             "xfail": getattr(report, "wasxfail", None),
@@ -300,7 +309,7 @@ def pytest_make_collect_report(collector):
     if report.failed:
         _emit(
             event={
-                "nodeid": report.nodeid,
+                "nodeid": _node(report.nodeid),
                 "phase": "collection",
                 "outcome": "failed",
                 "text": report.longreprtext,

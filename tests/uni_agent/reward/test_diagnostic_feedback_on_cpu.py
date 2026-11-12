@@ -251,6 +251,29 @@ def _run_pytest(tmp_path, plugin, extra_env=()):
     )
 
 
+def test_tests_are_named_from_the_tree_root_when_pytest_roots_in_a_subdirectory(tmp_path):
+    """The pytest configuration sits in the tests' folder: pytest roots there and names them `test_x.py::…`, where
+    the graded lists say `tests/test_x.py::…`."""
+    import json
+
+    plugin = Path(__file__).resolve().parents[3] / "uni_agent/reward/pytest_feedback_capture.py"
+    (tmp_path / "capture_plugin.py").write_text(plugin.read_text())
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "pytest.ini").write_text("[pytest]\n")
+    (tmp_path / "tests" / "test_x.py").write_text("def test_ok():\n    pass\n\n\ndef test_bad():\n    assert 1 == 2\n")
+    env = {**os.environ, "PYTHONPATH": str(tmp_path), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+           "UNI_AGENT_FEEDBACK_PATH": str(tmp_path / "events.jsonl"), "UNI_AGENT_FEEDBACK_ROOT": str(tmp_path)}
+    env.pop("PYTEST_ADDOPTS", None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-rA", "--color=no", "-p", "capture_plugin", "-p", "no:cacheprovider",
+         "tests/test_x.py"], cwd=tmp_path, env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert f"rootdir: {tmp_path / 'tests'}" in proc.stdout, proc.stdout
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert {row["event"]["nodeid"] for row in rows if "event" in row} == {"tests/test_x.py::test_ok",
+                                                                         "tests/test_x.py::test_bad"}
+
+
 def test_the_plugin_parses_on_the_oldest_task_interpreters():
     import ast
 
