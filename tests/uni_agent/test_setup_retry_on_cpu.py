@@ -12,6 +12,7 @@ import types
 import pytest
 
 from uni_agent.agent_loop import UniAgentLoop, setup_metrics
+from uni_agent.interaction.env import AgentEnv
 
 
 class FlakyEnv:
@@ -21,8 +22,11 @@ class FlakyEnv:
         self.ledger, self.fail_times, self.exc = ledger, fail_times, exc
         ledger.append("init")
 
-    async def start(self):
+    network_jail = False
+
+    async def start(self, network_jail=False):
         self.ledger.append("start")
+        self.jailed = network_jail
         if sum(1 for e in self.ledger if e == "start") <= self.fail_times:
             raise self.exc()
 
@@ -79,6 +83,24 @@ def test_transient_failure_is_retried_with_a_fresh_sandbox():
     # the broken sandbox is torn down and a new one built before retrying
     assert ledger == ["init", "start", "close", "init", "start", "install_tools", "guard_memory"], ledger
     assert loop.interaction.env is loop.env, "the interaction runs on the rebuilt sandbox"
+
+
+def test_the_sandbox_starts_jailed_only_when_its_config_asks(monkeypatch):
+    assert _run_setup([], fail_times=0, setup_retries=0).env.jailed is False
+    monkeypatch.setattr(FlakyEnv, "network_jail", True)
+    assert _run_setup([], fail_times=1, setup_retries=1).env.jailed is True, "the rebuilt sandbox is jailed too"
+
+
+def test_a_deployment_without_a_jail_refuses_a_jailed_start():
+    env = AgentEnv.__new__(AgentEnv)
+    env.deployment = types.SimpleNamespace()
+    env.logger = types.SimpleNamespace(info=lambda _m: None)
+
+    async def start():
+        await env.start(network_jail=True)
+
+    with pytest.raises(RuntimeError, match="no network jail"):
+        asyncio.run(start())
 
 
 def test_healthy_setup_does_not_retry():

@@ -163,6 +163,14 @@ class AgentEnvConfig(BaseModel):
             "the agent, so this is where task state the agent must not reach is read and destroyed."
         ),
     )
+    network_jail: bool = Field(
+        default=False,
+        description=(
+            "Serve the agent's own sandbox under the network jail (uni_agent.deployment.netjail): the internet "
+            "and fixed-port services are out of reach, a test suite's local servers are not. A grading sandbox "
+            "built from the same config never takes it."
+        ),
+    )
     tool_install_dir: Path = Field(
         default=Path("/usr/local/bin"), description="Directory where tool scripts are installed"
     )
@@ -194,6 +202,7 @@ class AgentEnv:
         self.env_variables = env_config.env_variables
         self.post_setup_cmd = env_config.post_setup_cmd
         self.privileged_setup_cmd = env_config.privileged_setup_cmd
+        self.network_jail = env_config.network_jail
         self.tool_install_dir = env_config.tool_install_dir
         # stdout of privileged_setup_cmd; read by the reflector, never sent to the agent
         self.privileged_context: str = ""
@@ -220,6 +229,8 @@ class AgentEnv:
 
         self.logger.info("Beginning environment startup...")
 
+        if network_jail and not hasattr(self.deployment, "network_jail"):
+            raise RuntimeError(f"{type(self.deployment).__name__} has no network jail: env.network_jail cannot be on")
         self.deployment.network_jail = network_jail
         await self.deployment.start(max_retries=max_retries)
         self.logger.info("Runtime initialized")
